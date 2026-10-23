@@ -22,6 +22,7 @@ import (
 	"github.com/binbinpeng123/Blink/internal/config"
 	"github.com/binbinpeng123/Blink/internal/logx"
 	"github.com/binbinpeng123/Blink/internal/s3api"
+	"github.com/binbinpeng123/Blink/internal/sigv4"
 )
 
 // shutdownTimeout 是优雅关闭的最长等待时间，超过后强杀连接。
@@ -56,7 +57,19 @@ func run(args []string, stderr io.Writer) error {
 	}
 	logger.Info("blink_config", attrs...)
 
-	srv := s3api.New(s3api.Options{Logger: logger, Region: cfg.Region})
+	// 凭据在 config.Validate 中已确保非空，这里的 Provider 必定含一组有效凭据。
+	// 单节点版本只有一组静态凭据；多租户/外部凭据源通过替换 Provider 接入。
+	provider := sigv4.NewStaticProvider(sigv4.Credentials{
+		AccessKeyID: cfg.AccessKey,
+		SecretKey:   cfg.SecretKey,
+	})
+
+	srv := s3api.New(s3api.Options{
+		Logger:       logger,
+		Region:       cfg.Region,
+		Provider:     provider,
+		MaxClockSkew: cfg.MaxClockSkew,
+	})
 
 	httpSrv := &http.Server{
 		Handler: srv.Handler(),

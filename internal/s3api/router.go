@@ -8,8 +8,10 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/binbinpeng123/Blink/internal/s3err"
+	"github.com/binbinpeng123/Blink/internal/sigv4"
 )
 
 // Options 是构造 HTTP 处理器所需的依赖。
@@ -18,12 +20,20 @@ type Options struct {
 	Logger *slog.Logger
 	// Region 用于响应中的 x-amz-bucket-region 与签名校验。
 	Region string
+	// Provider 按 Access Key 查凭据。为 nil 时**拒绝启动**而非放行 ——
+	// 让"忘配凭据"表现为明确的启动失败，而不是静默的鉴权绕过。
+	Provider sigv4.Provider
+	// MaxClockSkew 是签名时间容差，为 0 时用 15 分钟。
+	MaxClockSkew time.Duration
+	// DisableAuth 跳过签名校验，仅供本地调试与集成测试。
+	DisableAuth bool
 }
 
 // Server 承载路由与共享依赖。
 type Server struct {
 	logger *slog.Logger
 	region string
+	auth   AuthOptions
 }
 
 // New 构造 Server。logger 为 nil 时使用 slog 默认 logger，避免调用方崩溃。
@@ -32,14 +42,30 @@ func New(opt Options) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{logger: logger, region: opt.Region}
+	return &Server{
+		logger: logger,
+		region: opt.Region,
+		auth: AuthOptions{
+			Provider:     opt.Provider,
+			Region:       opt.Region,
+			MaxClockSkew: opt.MaxClockSkew,
+			Disabled:     opt.DisableAuth,
+		},
+	}
 }
 
 // Handler 返回装好全部中间件的 http.Handler。
+//
+// 中间件顺序（由外到内）：
+//
+//	withRequestContext → recoverPanic → withAuth → mux
+//
+// request_id 必须在最外层生成，否则鉴权失败的响应里没有可对照的 ID；
+// recoverPanic 必须在鉴权之前，否则签名代码里的 panic 会变成连接中断而非 500。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// 非 S3 端点，免签名。放在鉴权中间件之前注册的白名单里。
+	// 非 S3 端点，免签名，白名单见 unauthenticatedPaths。
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/readyz", handleReadyz)
 	mux.HandleFunc("/version", handleVersion)
@@ -48,17 +74,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.dispatch)
 
 	var h http.Handler = mux
-	h = withRequestContext(s.logger, h)
+	h = withAuth(s.auth, h)
 	h = recoverPanic(s.logger, h)
+	h = withRequestContext(s.logger, h)
 	return h
 }
 
 // dispatch 是 S3 请求的统一入口。
 //
-// 切片 1 只完成路径解析与"未实现"兜底：任何 S3 请求都返回
-// 501 NotImplemented，而不是泛化的 404。这样 `aws s3 ls` 会得到
-// 明确的 NotImplemented（证明路由与错误体格式正确），
-// 切片 2 接入签名校验后，改为"签名失败 403 / 签名通过再 501"。
+// 切片 2 已接入签名校验（见 withAuth）：能走到这里的请求要么签名有效，
+// 要么命中了免签白名单。本函数当前仍对全部 S3 操作返回
+// 501 NotImplemented 而非泛化 404 —— 这使 `aws s3 ls` 得到明确响应，
+// 从而把"签名校验通过"与"操作尚未实现"两件事区分开：
+// 返回 501 即证明 SigV4 链路正确，返回 403 则说明签名没对上。
+// 切片 3 起按 bucket/object 逐步替换为真实实现。
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFrom(r.Context())
 	logger := loggerFrom(r.Context(), s.logger)

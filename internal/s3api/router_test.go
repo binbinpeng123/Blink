@@ -14,9 +14,14 @@ import (
 )
 
 // newTestServer 构造使用静默 logger 的测试服务器，避免测试输出被日志淹没。
+//
+// 这里**显式关闭鉴权**：本文件测的是路由分发与免签端点自身的行为，
+// 与签名校验正交。鉴权行为由 auth_test.go 专门覆盖，两处互不干扰。
+// 若不关闭，切片 2 之后所有 S3 路由都会先被 403 拦下，
+// 这些测试将测不到 dispatch —— 那正是"把两个关注点混在一起"的后果。
 func newTestServer() http.Handler {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(Options{Logger: logger, Region: "us-east-1"}).Handler()
+	return New(Options{Logger: logger, Region: "us-east-1", DisableAuth: true}).Handler()
 }
 
 func do(t *testing.T, h http.Handler, method, target string) *httptest.ResponseRecorder {
