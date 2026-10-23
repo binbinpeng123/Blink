@@ -23,6 +23,7 @@ import (
 	"github.com/binbinpeng123/Blink/internal/logx"
 	"github.com/binbinpeng123/Blink/internal/s3api"
 	"github.com/binbinpeng123/Blink/internal/sigv4"
+	"github.com/binbinpeng123/Blink/internal/store"
 )
 
 // shutdownTimeout 是优雅关闭的最长等待时间，超过后强杀连接。
@@ -64,11 +65,27 @@ func run(args []string, stderr io.Writer) error {
 		SecretKey:   cfg.SecretKey,
 	})
 
+	// 打开存储。失败即拒绝启动 —— 与凭据缺失同样处理：
+	// "存储不可用但 HTTP 起来了"会让所有请求拿到 500，
+	// 而运维很难从一堆 500 里看出根因是数据目录挂了。
+	st, err := store.Open(store.Options{
+		Root:        cfg.DataDir,
+		FsyncPolicy: cfg.FsyncPolicy,
+	})
+	if err != nil {
+		return fmt.Errorf("打开存储失败: %w", err)
+	}
+	logger.Info("store_opened",
+		slog.String("data_dir", st.Root()),
+		slog.String("fsync_policy", cfg.FsyncPolicy),
+	)
+
 	srv := s3api.New(s3api.Options{
 		Logger:       logger,
 		Region:       cfg.Region,
 		Provider:     provider,
 		MaxClockSkew: cfg.MaxClockSkew,
+		Store:        st,
 	})
 
 	httpSrv := &http.Server{

@@ -134,17 +134,19 @@ func TestRequestIDIsUnique(t *testing.T) {
 	}
 }
 
-// TestS3RoutesReturnNotImplemented 是本切片的契约：切片 1 尚未实现任何 S3 操作，
-// 但必须返回规范的 501 NotImplemented 错误体，而不是泛化 404。
+// TestS3RoutesReturnNotImplemented 是本切片的契约：尚未实现的 S3 操作
+// 必须返回规范的 501 NotImplemented 错误体，而不是泛化 404。
+//
+// 这个清单会随切片推进而**缩短**，这是刻意的：既有的 501 断言会变成
+// 新功能的回归测试（"它确实不再返回 501 了"），删掉它们反而丢失覆盖。
+// 切片 3 已实现 GET / 与桶级 PUT/DELETE/HEAD，因此它们移出本表。
 func TestS3RoutesReturnNotImplemented(t *testing.T) {
 	h := newTestServer()
 	cases := []struct {
 		method string
 		target string
 	}{
-		{http.MethodGet, "/"},
 		{http.MethodGet, "/my-bucket"},
-		{http.MethodPut, "/my-bucket"},
 		{http.MethodGet, "/my-bucket/object.txt"},
 		{http.MethodGet, "/my-bucket/?list-type=2"},
 		{http.MethodPost, "/my-bucket/key?uploads"},
