@@ -1,0 +1,20 @@
+# 非机密配置。凭据只放在 Secret 中（见 examples/secret.example.yaml），
+# 不得写进这里 —— ConfigMap 会被普通只读权限的用户看到。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blink-config
+  namespace: blink
+  labels:
+    app.kubernetes.io/name: blink
+data:
+  # 容器内必须监听 0.0.0.0，127.0.0.1 无法被 Service 转发到。
+  BLINK_ADDR: "0.0.0.0:9000"
+  BLINK_DATA_DIR: "/var/lib/blink"
+  BLINK_REGION: "us-east-1"
+  BLINK_LOG_LEVEL: "info"
+  # always：数据与元数据都 fsync 后才返回成功，可靠性优先。
+  # 边端磁盘性能有限时可用 meta 换吞吐，但在掉电窗口上更弱。
+  BLINK_FSYNC_POLICY: "always"
+  # 读取时逐块校验会放弃 sendfile 零拷贝；模型加载场景默认关闭。
+  BLINK_VERIFY_READ: "false"

@@ -1,0 +1,21 @@
+# 数据卷。单独声明 PVC 而不是 StatefulSet 的 volumeClaimTemplates，
+# 是为了让"使用已有本地盘 / 预建 PV"和"动态供给"两种方式共用同一份清单：
+# 只需改 storageClassName 或先手工建 PV。
+#
+# 删除 StatefulSet 不会删除 PVC；数据生命周期由这份 PVC 单独管理。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: blink-data
+  namespace: blink
+  labels:
+    app.kubernetes.io/name: blink
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # K3s 内置 local-path 为默认 StorageClass；云上请改为实际 StorageClass，
+  # 例如 alicloud-disk-essd。留空则使用集群默认 StorageClass。
+  # storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi

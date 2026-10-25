@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: blink
+  namespace: blink
+  labels:
+    app.kubernetes.io/name: blink
+spec:
+  # 单节点存储：每个副本都会拿到自己的 PVC 并独立对外提供数据，
+  # 调大 replicas 只会得到若干个互不相干、数据不一致的实例。
+  # 真正的分布式模式需要独立的集群成员与复制协议（尚未实现）。
+  replicas: 1
+  serviceName: blink
+  podManagementPolicy: OrderedReady
+  # 单副本下 RollingUpdate 等价于"先停旧、再起新"，不会出现两个进程
+  # 同时写同一个 RWO 卷（Deployment 的默认滚动策略则可能重叠）。
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blink
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blink
+    spec:
+      # 服务收到 SIGTERM 后最多等 10s 让在途请求完成；必须大于它，
+      # 否则 SIGKILL 会打断正在提交的对象写入。
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        # fsGroup 让数据卷对运行用户可写；OnRootMismatch 避免每次启动
+        # 递归 chown 大目录（数据量大时这一步会显著拖慢启动）。
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: blink
+          image: blink:dev
+          # 本地构建的镜像需要 ItIfNotPresent；生产应使用不可变 tag/digest。
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            # 根文件系统只读：进程只应写数据卷，其余路径出现写入即为异常。
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: s3
+              containerPort: 9000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: blink-config
+            - secretRef:
+                name: blink-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/blink
+          # 启动探针负责"进程刚起来还没监听"的阶段；启动成功后不再运行。
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: s3
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          # /healthz 只表示进程存活，不触碰存储。
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: s3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /readyz 在磁盘满时仍返回 200（只暴露水位）：否则 K8s 会把实例
+          # 摘出 Service，连读取和删除都做不了，用户无法通过删数据自救。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: s3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            # 请求值按"轻量边缘"设置；大量并发读时主要吃页缓存，
+            # 内存上限需要按对象大小与并发数实测调整。
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: blink-data
+        # TLS（可选）：先创建 Secret，再取消下面一段的注释，并在容器
+        # env 中加入 BLINK_TLS_CERT / BLINK_TLS_KEY。证书与私钥必须成对
+        # 提供，缺一会拒绝启动（不会静默退回明文 HTTP）。
+        #
+        # - name: tls
+        #   secret:
+        #     secretName: blink-tls
+        #     defaultMode: 0400

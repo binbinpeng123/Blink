@@ -17,3 +17,4 @@ coverage.out
 # 本地凭据（绝不提交）
 .env
 *.local
+deploy/k8s/secret.yaml
