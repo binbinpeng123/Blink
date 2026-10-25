@@ -1,0 +1,19 @@
+# 本地 IDE 配置
+.idea/
+.vscode/
+
+# 构建产物
+/bin/
+/dist/
+blink
+!cmd/blink/
+
+# 本地运行数据与测试产物
+blink-data/
+*.prof
+*.test
+coverage.out
+
+# 本地凭据（绝不提交）
+.env
+*.local
