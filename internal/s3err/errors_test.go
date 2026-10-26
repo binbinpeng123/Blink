@@ -40,6 +40,8 @@ func TestTableMatchesContract(t *testing.T) {
 		CodeInsufficientStorage:          http.StatusInsufficientStorage,
 		CodeInternalError:                http.StatusInternalServerError,
 		CodeLengthRequired:               http.StatusLengthRequired,
+		CodeNoSuchCORSConfiguration:      http.StatusNotFound,
+		CodeAccessForbidden:              http.StatusForbidden,
 	}
 
 	if len(table) != len(want) {

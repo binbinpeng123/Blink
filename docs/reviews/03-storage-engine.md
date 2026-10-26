@@ -29,6 +29,7 @@
   buckets/
     <bucket>/
       bucket.json                # 创建时间
+      cors.json                  # 桶级 CORS 配置（可选；与 bucket.json 分离）
       objects/
         <sha256(key) 前 2 位>/
           <sha256(key)>/

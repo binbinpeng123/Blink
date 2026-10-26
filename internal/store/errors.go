@@ -54,6 +54,12 @@ var (
 	ErrEntityTooSmall = errors.New("store: 非末尾分片过小")
 	// ErrInvalidPartNumber 表示 partNumber 不在 1–10000 之间。
 	ErrInvalidPartNumber = errors.New("store: 分片编号不合法")
+	// ErrNoSuchCORSConfiguration 表示桶存在但没有配置 CORS。
+	//
+	// 与 ErrBucketNotFound 分开：S3 的 GetBucketCors 对这两种情况
+	// 分别返回 NoSuchCORSConfiguration 与 NoSuchBucket，客户端据此
+	// 区分"桶没建"与"桶没配跨域"。
+	ErrNoSuchCORSConfiguration = errors.New("store: 桶未配置 CORS")
 )
 
 // fsErr 把文件系统错误包装成带上下文的错误。

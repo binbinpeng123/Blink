@@ -42,6 +42,8 @@ const (
 	CodeInsufficientStorage          Code = "InsufficientStorage"
 	CodeInternalError                Code = "InternalError"
 	CodeLengthRequired               Code = "LengthRequired"
+	CodeNoSuchCORSConfiguration      Code = "NoSuchCORSConfiguration"
+	CodeAccessForbidden              Code = "AccessForbidden"
 )
 
 // Error 是一条可返回给客户端的 S3 错误。
@@ -127,6 +129,8 @@ var table = map[Code]*Error{
 	CodeInsufficientStorage:          {Code: CodeInsufficientStorage, Message: "The storage backend has insufficient free space.", HTTPStatus: http.StatusInsufficientStorage},
 	CodeInternalError:                {Code: CodeInternalError, Message: "We encountered an internal error. Please try again.", HTTPStatus: http.StatusInternalServerError},
 	CodeLengthRequired:               {Code: CodeLengthRequired, Message: "You must provide a Content-Length header.", HTTPStatus: http.StatusLengthRequired},
+	CodeNoSuchCORSConfiguration:      {Code: CodeNoSuchCORSConfiguration, Message: "The CORS configuration does not exist.", HTTPStatus: http.StatusNotFound},
+	CodeAccessForbidden:              {Code: CodeAccessForbidden, Message: "CORSResponse: This CORS request is not allowed.", HTTPStatus: http.StatusForbidden},
 }
 
 // Get 返回错误码对应的规范错误；未知错误码回落到 InternalError，避免把

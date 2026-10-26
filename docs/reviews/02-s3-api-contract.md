@@ -41,19 +41,31 @@
 
 **为什么分片上传必须纳入首个可用版本**：AWS CLI 对超过 8 MiB 的文件默认自动走分片上传，而边缘 AI 场景的头号负载正是 GB 级模型权重。若不实现，`aws s3 cp model.bin s3://models/` 会直接失败，README 中最核心的快速开始流程将跑不通。分片上传不影响 PutObject/GetObject 语义，因此拆分为独立切片以保持增量可验证。
 
+### 桶级 CORS（独立切片）
+
+| # | 方法 | 路径 | 说明 |
+| --- | --- | --- | --- |
+| 17 | `PUT` | `/{bucket}?cors` | PutBucketCORS |
+| 18 | `GET` | `/{bucket}?cors` | GetBucketCORS |
+| 19 | `DELETE` | `/{bucket}?cors` | DeleteBucketCORS |
+| 20 | `OPTIONS` | `/{bucket}`、`/{bucket}/{key}` | CORS 预检；在认证之前处理 |
+
+**为什么需要 CORS**：浏览器控制台（Blink-web）直接跨源访问 S3 端点时，带 `Authorization` 的请求必然先触发预检，而预检由浏览器发出、**不带任何凭据**。只要预检被认证中间件拦下，前端就只能退回同源代理。桶级 CORS 让浏览器可以直连，且语义与 AWS S3 一致。
+
 ## 明确不支持的接口
 
 **必须显式返回 `501 NotImplemented`，不得落到泛化的 404 或 500。**
 
 | 请求 | 响应 |
 | --- | --- |
-| `PUT /{bucket}/?acl`、`?tagging`、`?cors`、`?lifecycle`、`?encryption`、`?versioning`、`?policy`、`?replication`、`?object-lock` | `501 NotImplemented` |
+| `PUT /{bucket}/?acl`、`?tagging`、`?lifecycle`、`?encryption`、`?versioning`、`?policy`、`?replication`、`?object-lock` | `501 NotImplemented` |
 | `GET /{bucket}/?versions` | `501 NotImplemented` |
 | `POST /{bucket}?delete`（批量删除） | `501 NotImplemented` |
 | `PUT /{bucket}/{key}?acl`、`?tagging`、`?legal-hold`、`?retention` | `501 NotImplemented` |
 | `POST /{bucket}/{key}?restore`、`?select` | `501 NotImplemented` |
 | `GET /{bucket}/{key}?torrent` | `501 NotImplemented` |
 | `GET /{bucket}/{key}?partNumber=N`（分片下载） | `501 NotImplemented` |
+| `PUT`/`GET`/`DELETE /{bucket}/{key}?cors`（对象级 CORS，S3 无此语义） | `501 NotImplemented` |
 | Range 请求含多个区间（逗号分隔） | `501 NotImplemented` |
 | 任意未知查询参数组合 | `501 NotImplemented` |
 
@@ -102,6 +114,8 @@
 | `AuthorizationHeaderMalformed` | 400 | Authorization 头格式非法 |
 | `SlowDown` | 503 | 请求速率超限（保留错误码；当前版本无自动限流） |
 | `InsufficientStorage` | 507 | 磁盘空间不足，写入被拒绝 |
+| `NoSuchCORSConfiguration` | 404 | 桶存在但未配置 CORS |
+| `AccessForbidden` | 403 | CORS 预检被拒（未启用或规则不匹配） |
 | `InternalError` | 500 | 服务端内部错误 |
 
 ## 逐 API 契约要点
@@ -197,6 +211,41 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 
 上述 `MpuObjectSize` 不在必需路径上：aws-cli 的 `s3 cp` 与 `s3api` 均未发送，服务端不依赖它做校验。
 
+### 桶级 CORS `?cors` 与 OPTIONS 预检
+
+语义对齐 AWS S3（MinIO、Ceph RGW 亦同），差异只在于错误消息文本：
+
+- **作用域**：仅 `PUT`/`GET`/`DELETE /{bucket}?cors`。带 key 的 `?cors` 无 S3 语义 → `501`；桶级其它方法 → `405 MethodNotAllowed`。
+- **PUT**：请求体为 `<CORSConfiguration>`，成功 `200` 空体。非法文档 → `400 MalformedXML`，且**不落盘**（已有配置保持不变）。
+- **GET**：未配置 → `404 NoSuchCORSConfiguration`（与"桶不存在"的 `404 NoSuchBucket` 可区分）；桶不存在 → `404 NoSuchBucket`。
+- **DELETE**：成功 `204`，幂等；从未配置也返回 `204`。
+
+**文档校验**（任一不满足即 `400 MalformedXML`）：
+
+| 约束 | 取值 |
+| --- | --- |
+| 根元素 | `<CORSConfiguration>` |
+| 规则数 | 1–100 |
+| 每规则 | 至少一个 `<AllowedOrigin>` 与一个 `<AllowedMethod>` |
+| 方法 | 仅 `GET`/`PUT`/`HEAD`/`POST`/`DELETE`（大小写不敏感，归一化为大写） |
+| 通配符 | `AllowedOrigin`、`AllowedHeader` 每条至多一个 `*`，且只能作前缀或后缀 |
+| `MaxAgeSeconds` | 非负整数；未给出时响应不出现 `Access-Control-Max-Age` |
+| 请求体大小 | ≤ 64 KiB；根元素之后不得有尾随内容（拒绝拼接攻击） |
+
+**OPTIONS 预检**（在认证**之前**处理，预检请求不带 `Authorization`）：
+
+- 缺 `Origin` → `400 InvalidArgument`（`Insufficient information. Origin request header needed.`）；缺 `Access-Control-Request-Method` → `400 InvalidArgument`。
+- 桶未配置 CORS → `403 AccessForbidden`，消息 `CORSResponse: CORS is not enabled for this bucket.`
+- 无规则同时匹配 origin + method + 请求头 → `403 AccessForbidden`，消息 `CORSResponse: This CORS request is not allowed.`
+- 匹配成功 → `200` 空体，带 `Access-Control-Allow-Origin`、`Access-Control-Allow-Methods`（该规则声明的全部方法）、`Access-Control-Allow-Headers`（回显请求的头列表）、`Access-Control-Expose-Headers`、`Access-Control-Max-Age`，以及 `Vary: Origin, Access-Control-Request-Headers, Access-Control-Request-Method`。
+- 匹配顺序：按文档书写顺序，取**第一条**全匹配的规则。
+
+**实际请求**（非 OPTIONS，带 `Origin`）：命中规则时注入 `Access-Control-Allow-Origin`（匹配模式为裸 `*` 时回 `*`，否则回显 origin）、`Access-Control-Expose-Headers` 与 `Vary`；**不**注入预检专用头。未命中时静默不加头，业务结果照常返回——这与 S3 一致，浏览器会自行拦截响应。
+
+**凭据**：仅当回显具体 origin（即匹配模式不是裸 `*`）时附加 `Access-Control-Allow-Credentials: true`。裸 `*` 与凭据在浏览器中互斥，同时发送会被浏览器拒绝，因此不得无条件附加。
+
+**存储**：配置落在 `buckets/<bucket>/cors.json`，与 `bucket.json` 分离——CORS 是可变配置，混进桶元数据会让"改 CORS"与"读桶元数据"互相阻塞。删桶时随桶目录一并清除，同名桶重建后不继承旧配置。
+
 ## 对象属性语义
 
 | 属性 | 规则 |
@@ -227,6 +276,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 支持 **Presigned URL**（GET 与 PUT），`X-Amz-Expires` 范围 1–604800 秒。
 - 时钟偏移容差 **15 分钟**，超限返回 `403 RequestTimeTooSkewed` 并附 `ServerTime`。
 - 免签名端点：`/healthz`、`/readyz`、`/version`。
+- **CORS 预检（`OPTIONS`）在签名校验之前处理**：浏览器发预检时不会携带 `Authorization`，若先验签则所有跨源请求都会在预检阶段失败。这是浏览器规范要求的顺序，不是鉴权缺口——真正的 `PUT`/`GET`/`DELETE` 请求仍必须签名（回归测试 `TestCORSBypassesAuthOnlyForPreflight` 固定这一点）。
 
 ### SigV4 实现的四个易错点
 

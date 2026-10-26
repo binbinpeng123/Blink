@@ -67,6 +67,9 @@ func toS3Error(err error) *s3err.Error {
 	case errors.Is(err, store.ErrInvalidPartNumber):
 		// 02 文档的错误码表里没有专门的编号错误码，归到 InvalidArgument。
 		return s3err.New(s3err.CodeInvalidArgument).WithMessage(err.Error())
+	case errors.Is(err, store.ErrNoSuchCORSConfiguration):
+		// 桶存在但没配跨域：与"桶不存在"是两个可区分的状况。
+		return s3err.New(s3err.CodeNoSuchCORSConfiguration)
 	case errors.Is(err, store.ErrCorrupt):
 		// 损坏绝不伪装成 404：用户必须知道自己该去查盘，而不是以为对象本来就不存在。
 		return s3err.New(s3err.CodeInternalError).
