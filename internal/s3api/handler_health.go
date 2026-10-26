@@ -7,9 +7,11 @@ import (
 )
 
 // TODO(slice-3): 磁盘水位接入后，readyz 返回真实 usage/watermark 字段。
-// 在此之前 ready 恒为 true（除数据目录不可写外无其它不可用条件），
-// 而"满盘时 /readyz 是否保持 200"属已记录待确认项（docs/design/known-limitations.md），
-// 当前实现取"保持 200，仅暴露水位字段"。
+// 在此之前 ready 恒为 true（除数据目录不可写外无其它不可用条件）。
+//
+// "满盘时 /readyz 保持 200"是已确认决策：主流对象存储的健康检查只反映
+// 进程/后端可用性，容量作为独立指标监控。若满盘返回 503，Kubernetes 会
+// 摘除唯一实例，连读取与删除都无法进行，用户就失去了"删数据自救"的途径。
 
 // healthzResponse 是 /healthz 的响应体。
 type healthzResponse struct {

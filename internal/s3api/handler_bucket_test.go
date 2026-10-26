@@ -313,7 +313,7 @@ func TestToS3ErrorMapping(t *testing.T) {
 		{"桶名非法", store.ErrInvalidBucketName, s3err.CodeInvalidBucketName, http.StatusBadRequest},
 		{"key 非法", store.ErrInvalidKey, s3err.CodeInvalidArgument, http.StatusBadRequest},
 		{"数据损坏", store.ErrCorrupt, s3err.CodeInternalError, http.StatusInternalServerError},
-		{"磁盘满", syscall.ENOSPC, s3err.CodeSlowDown, http.StatusServiceUnavailable},
+		{"磁盘满", syscall.ENOSPC, s3err.CodeInsufficientStorage, http.StatusInsufficientStorage},
 		{"权限不足", fs.ErrPermission, s3err.CodeAccessDenied, http.StatusForbidden},
 		{"未知错误", errors.New("谁也想不到的错"), s3err.CodeInternalError, http.StatusInternalServerError},
 	}

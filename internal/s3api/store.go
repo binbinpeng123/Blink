@@ -72,12 +72,17 @@ func toS3Error(err error) *s3err.Error {
 		return s3err.New(s3err.CodeInternalError).
 			WithMessage("存储层数据损坏：" + err.Error())
 	case errors.Is(err, syscall.ENOSPC):
-		// 磁盘写满：用 503 SlowDown 而非 507。
+		// 磁盘写满：507 InsufficientStorage。
 		//
-		// 理由：S3 SDK 对 5xx 有内建退避重试，且 503 是 AWS 在容量压力下
-		// 的真实行为；507 语义更"准"，但客户端生态对此没有约定俗成的处理，
-		// 只会把它当成不可重试的硬错误。
-		return s3err.New(s3err.CodeSlowDown).WithMessage("磁盘空间不足。")
+		// 这是 S3 兼容实现的主流语义：MinIO 返回 507 XMinioStorageFull，
+		// Dell ECS/ObjectScale 返回 507 InsufficientStorage。
+		// AWS 的 503 SlowDown 表示**请求限流**（"Please reduce your
+		// request rate"），不是容量耗尽，继续用它会让客户端误以为
+		// "稍后重试就能成功"，从而掩盖需要运维介入的满盘故障。
+		//
+		// 507 仍是 5xx，SDK 的退避重试依然生效；但错误码明确指向
+		// "扩容或删除数据"，而不是"降低请求速率"。
+		return s3err.New(s3err.CodeInsufficientStorage).WithMessage("磁盘空间不足。")
 	case errors.Is(err, fs.ErrPermission):
 		return s3err.New(s3err.CodeAccessDenied).WithMessage("数据目录权限不足。")
 	}

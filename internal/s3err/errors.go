@@ -39,6 +39,7 @@ const (
 	CodeMissingSecurityHeader        Code = "MissingSecurityHeader"
 	CodeAuthorizationHeaderMalformed Code = "AuthorizationHeaderMalformed"
 	CodeSlowDown                     Code = "SlowDown"
+	CodeInsufficientStorage          Code = "InsufficientStorage"
 	CodeInternalError                Code = "InternalError"
 	CodeLengthRequired               Code = "LengthRequired"
 )
@@ -123,6 +124,7 @@ var table = map[Code]*Error{
 	CodeMissingSecurityHeader:        {Code: CodeMissingSecurityHeader, Message: "Your request is missing a required header.", HTTPStatus: http.StatusBadRequest},
 	CodeAuthorizationHeaderMalformed: {Code: CodeAuthorizationHeaderMalformed, Message: "The authorization header you provided is invalid.", HTTPStatus: http.StatusBadRequest},
 	CodeSlowDown:                     {Code: CodeSlowDown, Message: "Please reduce your request rate.", HTTPStatus: http.StatusServiceUnavailable},
+	CodeInsufficientStorage:          {Code: CodeInsufficientStorage, Message: "The storage backend has insufficient free space.", HTTPStatus: http.StatusInsufficientStorage},
 	CodeInternalError:                {Code: CodeInternalError, Message: "We encountered an internal error. Please try again.", HTTPStatus: http.StatusInternalServerError},
 	CodeLengthRequired:               {Code: CodeLengthRequired, Message: "You must provide a Content-Length header.", HTTPStatus: http.StatusLengthRequired},
 }

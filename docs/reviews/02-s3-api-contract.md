@@ -100,7 +100,8 @@
 | `RequestTimeTooSkewed` | 403 | 客户端时钟偏移超限 |
 | `MissingSecurityHeader` | 400 | 缺少必需的签名头 |
 | `AuthorizationHeaderMalformed` | 400 | Authorization 头格式非法 |
-| `SlowDown` | 503 | 磁盘水位超限，请降低请求速率 |
+| `SlowDown` | 503 | 请求速率超限（保留错误码；当前版本无自动限流） |
+| `InsufficientStorage` | 507 | 磁盘空间不足，写入被拒绝 |
 | `InternalError` | 500 | 服务端内部错误 |
 
 ## 逐 API 契约要点
