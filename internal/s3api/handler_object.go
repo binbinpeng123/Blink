@@ -19,6 +19,13 @@ import (
 // 一是让 `Expect: 100-continue` 的客户端不必上传完整个大对象才知道被拒，
 // 二是这些错误绝不依赖已写入的数据。
 func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) {
+	// 带 x-amz-copy-source 的 PUT 是 CopyObject，不是普通写入：
+	// 它的 Content-Length 为 0，落进下面的普通路径会用空对象覆盖目标键。
+	if r.Header.Get("x-amz-copy-source") != "" {
+		s.handleCopyObject(w, r, bucket, key, reqID)
+		return
+	}
+
 	// aws-chunked 是 SigV4 的流式签名传输：请求体是"长度头 + 数据 + 尾"的
 	// 分块框架，而不是对象的原始字节。不解帧就落盘等于把框架一起存进去 ——
 	// 存的内容是错的，但校验和、ETag 全都"看起来正常"，是最难发现的一类损坏。
