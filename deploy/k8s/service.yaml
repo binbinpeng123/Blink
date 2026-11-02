@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: blink
+  namespace: blink
+  labels:
+    app.kubernetes.io/name: blink
+spec:
+  # ClusterIP：S3 端口只应在集群内暴露。需要集群外访问时，
+  # 由运维显式创建 NodePort / LoadBalancer，或经 Ingress 转发。
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: blink
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+      protocol: TCP

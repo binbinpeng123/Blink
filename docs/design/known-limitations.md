@@ -2,7 +2,7 @@
 
 本文件记录 Blink 在开发过程中**刻意接受或无法验证**的限制。目的是避免把未验证的能力描述成已交付功能。每条限制都注明来源（设计决策或环境约束）与当前状态。
 
-最后更新：2026-10-24
+最后更新：2026-10-25
 
 ## 环境约束导致的未验证项
 
@@ -11,7 +11,8 @@
 | **MinIO Client (`mc`) 互操作未测试** | 开发环境未安装 `mc`，且当前无法安装 | 未验证。05 文档要求的 `mc` 测试标记为待补充。**不得声称通过** |
 | **真实掉电场景未测试** | macOS 无法可靠模拟掉电 | 未验证。已由故障注入覆盖"fsync 后 rename 前"关键窗口，并有 8 轮 SIGKILL 崩溃测试；**真实掉电行为未知，不得声称已测** |
 | **SIGKILL 后留下 `.tmp-*` 孤儿文件** | 临时文件必须与目标同目录（跨目录 rename 会退化为复制），启动清扫只处理 `tmp/` 目录 | 不影响正确性（孤儿文件永远不被引用），但会积累垃圾。实测：8 次 SIGKILL 留下 3 个。需运维周期清理，后续在 GC 中一并回收 |
-| **Kubernetes / K3s 实际部署未测试** | 开发环境无 `k3s`，目标开发机信息未提供 | 未验证。仅能完成 `--dry-run` 与本地镜像构建 |
+| **Kubernetes / K3s 实际部署未测试** | 开发环境无 `k3s`，当前 `kubectl` 上下文指向共享集群（不可用于实验） | 未验证。已完成 `kubectl apply --dry-run=client`、Podman 本地构建与容器冒烟（健康端点、S3 往返、重启后数据保留、`--read-only` + 256 MiB 限制下启动）；**安装、滚动升级、卸载与 `local-path` 绑定均未执行** |
+| **镜像构建依赖可访问的基础镜像仓库** | 本机 Docker Hub 不可达（`registry-1.docker.io` 超时），Podman 虚拟机可访问镜像站 | 已用 `GO_IMAGE=docker.m.daocloud.io/library/golang:1.27-alpine` 构建成功；默认仍指向 `golang:1.27-alpine` |
 | **真实硬件性能未测量** | 尚无目标边端设备 | 未验证。现有数字仅为本机回归基线 |
 | **跨平台文件系统语义差异未验证** | 仅在 macOS/APFS 上开发 | 未验证。`F_FULLFSYNC` 语义与 Linux 不同，性能与崩溃行为可能不同 |
 | **签名分块（`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`）未用真实客户端验证** | aws-cli 2.36.2 在 HTTPS 下实测只发送未签名流式载荷（`STREAMING-UNSIGNED-PAYLOAD-TRAILER`） | 签名分块已实现，并用独立 Python 实现生成的签名向量单测覆盖（含 trailer 签名）；但**没有真实客户端走过该路径，不得声称互操作已验证**。未签名流式上传（PutObject 与 UploadPart）已用 aws-cli 实测通过 |

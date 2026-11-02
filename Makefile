@@ -20,6 +20,13 @@ LDFLAGS     := -s -w \
 GOFLAGS     ?=
 GO          := go
 
+# 容器引擎：本机 Docker 守护进程未运行时可用 `make image CONTAINER=podman`。
+CONTAINER   ?= docker
+IMAGE       ?= blink:$(VERSION)
+# 构建阶段基础镜像。国内网络拉不到 Docker Hub 时可指向镜像站，例如：
+#   make image GO_IMAGE=docker.m.daocloud.io/library/golang:1.27-alpine
+GO_IMAGE    ?= golang:1.27-alpine
+
 .DEFAULT_GOAL := help
 
 .PHONY: help
@@ -76,6 +83,25 @@ check: fmt-check vet test ## 提交前的完整检查
 .PHONY: smoke
 smoke: ## 启动服务并对三个非 S3 端点做冒烟检查
 	@./scripts/health-smoke.sh
+
+.PHONY: image
+image: ## 构建容器镜像（CONTAINER=podman 可切换引擎）
+	$(CONTAINER) build -f deploy/docker/Dockerfile \
+		--build-arg GO_IMAGE=$(GO_IMAGE) \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t $(IMAGE) .
+
+.PHONY: image-run
+image-run: ## 前台运行镜像；凭据从当前环境变量传入
+	$(CONTAINER) run --rm -p 9000:9000 \
+		-e BLINK_ACCESS_KEY -e BLINK_SECRET_KEY \
+		-v blink-data:/var/lib/blink $(IMAGE)
+
+.PHONY: k8s-dry-run
+k8s-dry-run: ## 客户端校验 K8s 清单（不连接集群、不创建任何对象）
+	kubectl apply --dry-run=client -f deploy/k8s/
 
 .PHONY: clean
 clean: ## 清理构建与测试产物
