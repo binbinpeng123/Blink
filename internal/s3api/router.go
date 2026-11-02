@@ -80,10 +80,11 @@ func (s *Server) requireStore(w http.ResponseWriter, r *http.Request, reqID stri
 //
 // 中间件顺序（由外到内）：
 //
-//	withRequestContext → recoverPanic → withAuth → mux
+//	withRequestContext → recoverPanic → withCORS → withAuth → mux
 //
 // request_id 必须在最外层生成，否则鉴权失败的响应里没有可对照的 ID；
-// recoverPanic 必须在鉴权之前，否则签名代码里的 panic 会变成连接中断而非 500。
+// recoverPanic 必须在鉴权之前，否则签名代码里的 panic 会变成连接中断而非 500；
+// withCORS 必须在 withAuth 之前，因为浏览器的预检请求不携带 Authorization。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -97,6 +98,8 @@ func (s *Server) Handler() http.Handler {
 
 	var h http.Handler = mux
 	h = withAuth(s.auth, h)
+	// CORS 在鉴权之外侧：预检请求不带 Authorization，必须先于签名校验处理。
+	h = s.withCORS(h)
 	h = recoverPanic(s.logger, h)
 	h = withRequestContext(s.logger, h)
 	return h
@@ -127,6 +130,11 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 			slog.String("key", key),
 		)
 		s3err.New(s3err.CodeNotImplemented).Write(w, r, reqID)
+		return
+	}
+
+	// 桶级 CORS 子资源（?cors）同样在通用方法分派之前处理。
+	if s.dispatchCORS(w, r, bucket, key, reqID) {
 		return
 	}
 
@@ -237,7 +245,7 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 // 静默忽略等于"假装设置成功"，用户会在很久以后才发现权限没生效。
 // 见 docs/02。
 var unsupportedSubresources = map[string]bool{
-	"acl": true, "tagging": true, "cors": true, "lifecycle": true,
+	"acl": true, "tagging": true, "lifecycle": true,
 	"versioning": true, "policy": true, "replication": true, "versions": true,
 	"restore": true, "torrent": true, "encryption": true, "logging": true,
 	"notification": true, "website": true, "accelerate": true,

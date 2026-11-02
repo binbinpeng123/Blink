@@ -18,7 +18,7 @@
 
 首个实现切片（v0.1.0）的范围为 01、02、03、05 四份文档，实现分支 `feature/core-storage`。
 
-- 04 文档定稿前需要确认两个参数：满盘响应码、满盘时 `/readyz` 行为（见 `docs/design/known-limitations.md`）。
+- 满盘响应码与满盘时 `/readyz` 行为已按主流实现定稿：写入返回 `507 InsufficientStorage`，`/readyz` 保持 `200`（见 `docs/design/known-limitations.md`）。
 - 06 文档定稿前，开发环境仅使用本地测试凭据，**不得作为生产部署依据**。
 - 环境约束导致的未验证项集中记录在 [`docs/design/known-limitations.md`](../design/known-limitations.md)。
 

@@ -68,7 +68,17 @@ type Store struct {
 	// 但删除桶是运维动作，频率低到不值得为它引入失效竞态。
 	bucketsMu sync.RWMutex
 	buckets   map[string]*bucketMeta
-	locks     *keyLocker
+
+	// cors 缓存已加载的桶级 CORS 配置。
+	//
+	// 与 buckets 分开持锁：CORS 配置的读取频率比桶元数据低，但更新
+	// （PutBucketCORS）是整份替换，独立缓存让更新不必等待所有桶元数据读者。
+	// 缓存只保存成功加载的结果；未配置的桶每次仍读盘（负缓存需要额外的
+	// 失效协议，而"桶没配 CORS"是常态，读一次 ENOENT 的代价可以接受）。
+	corsMu sync.RWMutex
+	cors   map[string]*CORSConfiguration
+
+	locks *keyLocker
 }
 
 // CleanupError 返回启动时清扫失败的详情（没有失败则为 nil）。
@@ -133,6 +143,7 @@ func Open(opt Options) (*Store, error) {
 		inlineThreshold: inline,
 		verifyOnRead:    opt.VerifyOnRead,
 		buckets:         make(map[string]*bucketMeta),
+		cors:            make(map[string]*CORSConfiguration),
 		locks:           newKeyLocker(),
 	}
 
@@ -263,6 +274,7 @@ func (s *Store) DeleteBucket(name string) error {
 	// 桶的数据也已经不存在了，再让后续请求命中缓存会让"刚删掉的桶"
 	// 继续接受写入。
 	s.dropBucketMeta(name)
+	s.dropBucketCORS(name)
 	return s.fs.SyncDir(joinPath(s.root, bucketsDirName))
 }
 

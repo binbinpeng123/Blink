@@ -37,8 +37,11 @@ func TestTableMatchesContract(t *testing.T) {
 		CodeMissingSecurityHeader:        http.StatusBadRequest,
 		CodeAuthorizationHeaderMalformed: http.StatusBadRequest,
 		CodeSlowDown:                     http.StatusServiceUnavailable,
+		CodeInsufficientStorage:          http.StatusInsufficientStorage,
 		CodeInternalError:                http.StatusInternalServerError,
 		CodeLengthRequired:               http.StatusLengthRequired,
+		CodeNoSuchCORSConfiguration:      http.StatusNotFound,
+		CodeAccessForbidden:              http.StatusForbidden,
 	}
 
 	if len(table) != len(want) {

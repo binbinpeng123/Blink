@@ -32,6 +32,13 @@ const (
 	multipartDirName = "multipart"
 
 	bucketMetaFileName = "bucket.json"
+	// bucketCORSFileName 是桶级 CORS 配置，独立于 bucket.json。
+	//
+	// 不并进 bucketMeta 的理由：bucketMeta 的缓存指针是跨请求共享的，
+	// 把可变的 CORS 规则放进去就得在"更新 CORS"与"读取桶元数据"之间
+	// 再加一把锁，或者让每次读取都复制整份配置。独立文件 + 独立缓存
+	// 让两件事彻底解耦，且 DELETE 桶时随目录一起消失，无需额外清理。
+	bucketCORSFileName = "cors.json"
 	objectMetaFileName = "meta.json"
 
 	// 分片上传：multipart/<uploadId>/upload.json 保存会话（桶、key、
@@ -58,6 +65,11 @@ func (s *Store) bucketDir(bucket string) string {
 // bucketMetaPath 返回 bucket 元数据文件路径。
 func (s *Store) bucketMetaPath(bucket string) string {
 	return joinPath(s.bucketDir(bucket), bucketMetaFileName)
+}
+
+// bucketCORSPath 返回桶级 CORS 配置文件路径。
+func (s *Store) bucketCORSPath(bucket string) string {
+	return joinPath(s.bucketDir(bucket), bucketCORSFileName)
 }
 
 // casPath 返回内容的 CAS 路径：cas/<hash 前 2 位>/<hash>。
