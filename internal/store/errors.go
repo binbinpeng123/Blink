@@ -60,6 +60,23 @@ var (
 	// 分别返回 NoSuchCORSConfiguration 与 NoSuchBucket，客户端据此
 	// 区分"桶没建"与"桶没配跨域"。
 	ErrNoSuchCORSConfiguration = errors.New("store: 桶未配置 CORS")
+	// ErrStaleMeta 表示副本拒绝了一个不比现有版本更新的元数据。
+	//
+	// 这是分布式写路径的乱序保护：两个协调者并发写同一个 key 时，
+	// 网络延迟可能让旧版本后到；副本按 (obj_version, node_id) 拒绝它，
+	// 保证所有副本最终收敛到同一个版本，而不是"最后到达者获胜"。
+	ErrStaleMeta = errors.New("store: 副本元数据版本过旧")
+	// ErrUnavailable 表示后端暂时无法满足一致性要求（副本不足、法定人数不足）。
+	//
+	// 与 ErrCorrupt 严格区分：前者可以通过重试恢复，后者必须运维介入。
+	// 协议层据此返回 503 而不是 500。
+	ErrUnavailable = errors.New("store: 后端暂时不可用")
+	// ErrInvalidBlock 表示块哈希格式非法或块内容为空。
+	//
+	// 与 ErrCorrupt 分开：这是**调用方给错了参数**，不是盘上的数据坏了。
+	// CAS 路径直接用哈希的前两位做目录名，因此哈希必须先过格式校验，
+	// 否则短字符串会让路径截取 panic。
+	ErrInvalidBlock = errors.New("store: 数据块参数不合法")
 )
 
 // fsErr 把文件系统错误包装成带上下文的错误。

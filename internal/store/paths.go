@@ -50,12 +50,16 @@ const (
 	multipartPartSuffixName = ".json"
 )
 
-// formatVersion 是磁盘格式版本。
+// FormatVersion 是磁盘格式版本。
 //
 // 二进制发现磁盘版本**高于**自己时拒绝启动，而不是尝试读取：
 // 旧二进制读新格式最可能的后果是"以为对象不存在"，进而误删或误报 404 ——
 // 宁可启动失败让人立刻发现，也不要静默地给出错误答案。
-const formatVersion = 1
+//
+// 导出给集群层构造副本元数据使用；包内仍以短名 formatVersion 引用。
+const FormatVersion = 1
+
+const formatVersion = FormatVersion
 
 // bucketDir 返回 bucket 目录。
 func (s *Store) bucketDir(bucket string) string {

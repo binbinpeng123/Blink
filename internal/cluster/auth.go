@@ -46,10 +46,14 @@ var (
 	ErrBodyTooLarge = errors.New("内部请求体过大")
 )
 
-// canonicalString 是签名的规范串：method|path|time|body_hash。
+// canonicalString 是签名的规范串：method|path?query|time|body_hash。
 //
 // 四段缺一不可：不签 method/path 会让"把一个合法签名挪到另一个接口"成立；
 // 不签 body hash 会让中间人替换块内容而签名仍然有效。
+//
+// path 段包含**原始 query**（见 requestPath）：块与元数据接口的定位参数
+// 全部在 query 里，不签它意味着中间人能把"写 A 块"改成"写 B 块"、
+// 把"读 key1"改成"读 key2"，而签名依然有效。
 func canonicalString(method, path, timestamp, digest string) string {
 	return method + "|" + path + "|" + timestamp + "|" + digest
 }
@@ -134,14 +138,23 @@ func VerifyRequest(r *http.Request, secret []byte, allowed func(string) bool, no
 	return node, body, nil
 }
 
-// requestPath 返回参与签名的路径。
+// requestPath 返回参与签名的"路径 + 原始 query"。
 //
 // 用 EscapedPath 而不是 Path：Path 已被 net/http 百分号解码，
 // 两个不同的原始路径可能解码成同一个 Path，签名就会失去区分能力。
 // 根路径在部分请求中为空，统一按 "/" 处理。
+//
+// query 用 RawQuery **原样**拼接，不做排序或重新编码：签名与验签发生在
+// 同一个字符串上，只要调用方在构造请求后不再改动 URL 就一致。若对 query
+// 先解析再重排，`a=1&a=2` 这类重复键的语义会随实现漂移，反而制造
+// "签名通过但参数不同"的缝隙。
 func requestPath(r *http.Request) string {
-	if p := r.URL.EscapedPath(); p != "" {
-		return p
+	p := r.URL.EscapedPath()
+	if p == "" {
+		p = "/"
 	}
-	return "/"
+	if q := r.URL.RawQuery; q != "" {
+		return p + "?" + q
+	}
+	return p
 }

@@ -11,8 +11,13 @@ import (
 	"github.com/binbinpeng123/Blink/internal/checksum"
 )
 
-// defaultContentType 是客户端未提供 Content-Type 时的落库值（02 文档）。
-const defaultContentType = "application/octet-stream"
+// DefaultContentType 是客户端未提供 Content-Type 时的落库值（02 文档）。
+//
+// 导出给集群协调者：它构造副本 meta 时必须与单机路径落出同一个默认值，
+// 否则同一个对象经不同路径写入会有不同的 Content-Type。
+const DefaultContentType = "application/octet-stream"
+
+const defaultContentType = DefaultContentType
 
 // PutOptions 是一次 PutObject 的输入。
 //

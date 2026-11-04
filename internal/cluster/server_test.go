@@ -7,19 +7,34 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/binbinpeng123/Blink/internal/store"
 )
 
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
-	srv, err := NewServer(validConfig(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv, ts, _ := newTestServerWithStore(t)
+	return srv, ts
+}
+
+// newTestServerWithStore 额外交出内部服务绑定的本地存储，
+// 供块/元数据接口的直接调用测试使用。
+func newTestServerWithStore(t *testing.T) (*Server, *httptest.Server, *store.Store) {
+	t.Helper()
+	st, err := store.Open(store.Options{Root: filepath.Join(t.TempDir(), "data")})
+	if err != nil {
+		t.Fatalf("打开本地存储失败: %v", err)
+	}
+	srv, err := NewServer(validConfig(), st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("构造内部服务失败: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return srv, ts
+	return srv, ts, st
 }
 
 // doSigned 发送一个签名正确的请求；body 必须与实际发送的字节一致。
@@ -144,7 +159,13 @@ func TestAuthMiddlewarePassesNodeAndBody(t *testing.T) {
 func TestNewServerRejectsInvalidConfig(t *testing.T) {
 	cfg := validConfig()
 	cfg.Secret = []byte("short")
-	if _, err := NewServer(cfg, nil); err == nil {
+	if _, err := NewServer(cfg, nil, nil); err == nil {
 		t.Fatal("非法配置应被拒绝")
+	}
+}
+
+func TestNewServerRequiresStore(t *testing.T) {
+	if _, err := NewServer(validConfig(), nil, nil); err == nil {
+		t.Fatal("缺少本地存储应被拒绝")
 	}
 }

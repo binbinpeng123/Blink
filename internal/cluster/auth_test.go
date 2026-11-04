@@ -83,6 +83,26 @@ func TestVerifyRejectsTampering(t *testing.T) {
 			members: member, now: now,
 		},
 		{
+			// 块与元数据接口的定位参数全在 query 里：不签 query 的话，
+			// 中间人能把"写 A 块"改成"写 B 块"而签名仍然有效。
+			name: "query 被篡改",
+			build: func() *http.Request {
+				req := signedRequest(t, http.MethodGet, "/internal/v1/block?hash=aaaa", nil, "n1", testSecret, now)
+				req.URL.RawQuery = "hash=bbbb"
+				return req
+			},
+			members: member, now: now,
+		},
+		{
+			name: "query 被追加",
+			build: func() *http.Request {
+				req := signedRequest(t, http.MethodGet, "/internal/v1/block?hash=aaaa", nil, "n1", testSecret, now)
+				req.URL.RawQuery = "hash=aaaa&offset=0"
+				return req
+			},
+			members: member, now: now,
+		},
+		{
 			name: "方法被篡改",
 			build: func() *http.Request {
 				req := signedRequest(t, http.MethodPost, "/internal/v1/x", body, "n1", testSecret, now)

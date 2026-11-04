@@ -44,6 +44,12 @@ func toS3Error(err error) *s3err.Error {
 		return s3err.New(s3err.CodeNoSuchKey)
 	case errors.Is(err, store.ErrPreconditionFailed):
 		return s3err.New(s3err.CodePreconditionFailed)
+	case errors.Is(err, store.ErrUnavailable):
+		// 副本法定人数不足：这是一个**明确的暂时性**状态，而不是
+		// "服务端 bug"。用 503 ServiceUnavailable 让 SDK 退避重试，
+		// 同时与 SlowDown（限流）区分开 —— 后者要求降低请求速率，
+		// 前者要求等待副本恢复。
+		return s3err.New(s3err.CodeServiceUnavailable).WithMessage(err.Error())
 	case errors.Is(err, store.ErrBadDigest):
 		// BadDigest 是**数据传输损坏**的信号：客户端声明的校验和与实际
 		// 收到的内容不符。用 400 而不是 500 —— 错的不是服务端，

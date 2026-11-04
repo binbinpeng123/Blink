@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/binbinpeng123/Blink/internal/store"
 )
 
 // Health 是节点间健康检查的响应。
@@ -25,9 +27,12 @@ type Health struct {
 //
 // 它与 S3 端口分离监听：S3 端口面向客户端并可能暴露到公网，
 // 内部端口只承载节点间请求，可以单独用 NetworkPolicy 隔离。
-// 本切片只提供健康检查；块读写与元数据接口在后续切片加入。
+//
+// Server 不持有集群协调逻辑：它只把本地存储的副本引擎能力暴露成
+// 内部接口。写哪一个副本、凑多少 ack，是 Cluster 的事。
 type Server struct {
 	cfg     Config
+	store   *store.Store
 	logger  *slog.Logger
 	ring    *Ring
 	allowed map[string]struct{}
@@ -36,9 +41,15 @@ type Server struct {
 }
 
 // NewServer 构造内部服务。配置不合法时返回错误，绝不带着半配置启动。
-func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
+//
+// st 是本节点的单机存储：内部接口的所有数据操作都落在它上面，
+// 集群层不另造一套存储实现。
+func NewServer(cfg Config, st *store.Store, logger *slog.Logger) (*Server, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	if st == nil {
+		return nil, errors.New("cluster: 内部服务必须绑定本地存储")
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -57,6 +68,7 @@ func NewServer(cfg Config, logger *slog.Logger) (*Server, error) {
 
 	return &Server{
 		cfg:     cfg,
+		store:   st,
 		logger:  logger,
 		ring:    ring,
 		allowed: allowed,
@@ -76,6 +88,8 @@ func (s *Server) Ring() *Ring {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/health", s.handleHealth)
+	mux.HandleFunc(pathBlock, s.handleBlock)
+	mux.HandleFunc(pathMeta, s.handleMeta)
 	mux.HandleFunc("/", s.handleUnknown)
 	return s.withAuth(mux)
 }

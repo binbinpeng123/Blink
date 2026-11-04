@@ -128,12 +128,33 @@ func run(args []string, stderr io.Writer) error {
 		slog.Bool("verify_read", cfg.VerifyOnRead),
 	)
 
+	// 存储后端按模式二选一：
+	//   single  → *store.Store，调用路径与集群功能引入前逐字节等价；
+	//   cluster → *cluster.Cluster，把对象读写扇出到环上的副本节点。
+	// 两者都满足 store.Backend，s3api 不需要知道自己在哪种模式下运行。
+	var backend store.Backend = st
+	var internalHandler http.Handler
+	var cl *cluster.Cluster
+	if cfg.ClusterMode == config.ClusterModeCluster {
+		cc, err := cfg.ClusterConfig()
+		if err != nil {
+			return fmt.Errorf("构造集群配置失败: %w", err)
+		}
+		cl, err = cluster.New(cc, st, logger)
+		if err != nil {
+			return fmt.Errorf("构造集群后端失败: %w", err)
+		}
+		defer cl.Close()
+		backend = cl
+		internalHandler = cl.InternalHandler()
+	}
+
 	srv := s3api.New(s3api.Options{
 		Logger:       logger,
 		Region:       cfg.Region,
 		Provider:     provider,
 		MaxClockSkew: cfg.MaxClockSkew,
-		Store:        st,
+		Store:        backend,
 	})
 
 	httpSrv := &http.Server{
@@ -163,19 +184,13 @@ func run(args []string, stderr io.Writer) error {
 
 	// 内部端口只在集群模式监听。单机模式不打开 9100、不建环，
 	// 也不产生任何与集群相关的 goroutine —— 这是"零回归"的直接保证。
-	if cfg.ClusterMode == config.ClusterModeCluster {
-		internal, err := startClusterInternal(cfg, logger)
+	if internalHandler != nil {
+		internal, err := startClusterInternal(cfg, internalHandler, logger)
 		if err != nil {
 			_ = ln.Close()
 			return err
 		}
 		servers = append(servers, internal)
-		// 本切片只接入内部协议端口，跨节点复制在后续切片实现。
-		// 明确告警而不是沉默：此时 cluster 模式的数据仍然只写本节点，
-		// 运维必须知道这一点，否则会误以为副本已经生效。
-		logger.Warn("cluster_replication_incomplete",
-			slog.String("detail", "cross-node replication is not enabled in this build; S3 data stays node-local"),
-		)
 	}
 
 	// 收到 SIGINT/SIGTERM 后开始优雅关闭：停止接受新连接，
@@ -255,14 +270,10 @@ func run(args []string, stderr io.Writer) error {
 // 内部端口刻意使用明文 HTTP：它在可信内网中由 NetworkPolicy 隔离，
 // 请求本身有 HMAC 认证；为它再配一套证书会把边端部署的运维成本
 // 推高到与收益不相称的程度（08 文档）。
-func startClusterInternal(cfg config.Config, logger *slog.Logger) (serving, error) {
+func startClusterInternal(cfg config.Config, handler http.Handler, logger *slog.Logger) (serving, error) {
 	cc, err := cfg.ClusterConfig()
 	if err != nil {
 		return serving{}, fmt.Errorf("构造集群配置失败: %w", err)
-	}
-	internal, err := cluster.NewServer(cc, logger)
-	if err != nil {
-		return serving{}, err
 	}
 
 	ln, err := net.Listen("tcp", cc.InternalAddr)
@@ -282,7 +293,7 @@ func startClusterInternal(cfg config.Config, logger *slog.Logger) (serving, erro
 	return serving{
 		name: "internal",
 		srv: &http.Server{
-			Handler: internal.Handler(),
+			Handler: handler,
 			// 内部请求体较小（≤ block-size），头部超时足以挡住慢速攻击。
 			// 不设 WriteTimeout：后续切片会有流式块传输。
 			ReadHeaderTimeout: 10 * time.Second,

@@ -147,7 +147,10 @@ func (s *Store) dropBucketMeta(bucket string) {
 	delete(s.buckets, bucket)
 }
 
-// objectMeta 是对象目录下 meta.json 的内容，即 03 文档的字段表。
+// ObjectMeta 是对象目录下 meta.json 的内容，即 03 文档的字段表。
+//
+// 导出类型是集群层的需要：副本之间搬运的就是这份结构，集群模块必须能
+// 构造、比较并序列化它。单机路径的字段语义没有任何变化。
 //
 // 块描述**内嵌**在这个文件里，而不是单独的 blocks.bin：一次写入只有一个
 // 文件被 rename，因此"对象可见"与"块表完整"必然同时成立。拆成两个文件
@@ -158,7 +161,7 @@ func (s *Store) dropBucketMeta(bucket string) {
 // 按本结构约 30 MB JSON —— 超过 readFile 的 32 MiB 上限，属于已知限制
 // （见 known-limitations.md）。v1 的单次 PUT 上限是 5 GiB，约 1300 块、
 // 约 150 KB，远在安全范围内。
-type objectMeta struct {
+type ObjectMeta struct {
 	Version     int       `json:"version"`
 	Key         string    `json:"key"`
 	Size        int64     `json:"size"`
@@ -188,6 +191,10 @@ type objectMeta struct {
 	// 分布式场景判断"哪份更新"的依据，因此 v1 就开始记录。
 	ObjVersion uint64 `json:"obj_version"`
 }
+
+// objectMeta 是包内沿用的短名。用别名而不是第二个结构体：
+// 两者必须是同一个类型，否则读写路径会在编译期就被迫区分两份定义。
+type objectMeta = ObjectMeta
 
 // BlockDesc 描述对象中的一个块。
 //
