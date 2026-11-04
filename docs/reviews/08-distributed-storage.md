@@ -66,7 +66,7 @@ s3api ──► store.Backend（接口，由消费方定义）
 
 ```text
 1. 任意节点作为协调者，Ring.Replicas(key, N) 得到 N 个目标
-2. 复用 streamBlocks 流式切块（4 MiB 块，CAS 内容寻址，Stat 命中即去重）
+2. 复用 `store.StreamBlocks` 流式切块（4 MiB 块，CAS 内容寻址，Stat 命中即去重）；`OpenObject` 返回 `store.Reader` 接口，本地与集群读取器对 s3api 等价
 3. 每个块扇出到 N 个目标：本地直写；远端 POST /internal/v1/block
 4. 在途窗口 BLINK_WRITE_WINDOW=8（≈32 MiB/上传），共享 buffer pool + 全局准入背压
 5. 块全部落盘后提交 meta，携带 obj_version=HLC(now, counter, nodeID)

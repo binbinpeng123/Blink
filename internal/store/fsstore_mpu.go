@@ -176,7 +176,7 @@ type partState struct {
 	ETag       string      `json:"etag"`
 	Size       int64       `json:"size"`
 	Modified   time.Time   `json:"modified"`
-	Blocks     []blockDesc `json:"blocks"`
+	Blocks     []BlockDesc `json:"blocks"`
 	Checksum   string      `json:"checksum,omitempty"`
 	// Deduped 是本次分片里命中 CAS 的块数，仅用于观测。
 	Deduped int `json:"deduped,omitempty"`
@@ -487,7 +487,7 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 
 	blockCount := 0
 	var (
-		blocks    []blockDesc
+		blocks    []BlockDesc
 		partsCS   []checksum.PartChecksum
 		etagInput []byte
 		total     int64

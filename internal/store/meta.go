@@ -168,7 +168,7 @@ type objectMeta struct {
 	// UserMeta 原样保存 x-amz-meta-* 的值。
 	UserMeta map[string]string `json:"user_meta,omitempty"`
 	// Blocks 是**有序**块描述列表：顺序即对象内容的顺序。
-	Blocks []blockDesc `json:"blocks"`
+	Blocks []BlockDesc `json:"blocks"`
 	// Checksum 是客户端声明的对象级校验和（base64）；未声明时为空。
 	// 它是 base64 文本而非二进制，因为回传时要逐字节还原客户端的值。
 	Checksum string `json:"checksum,omitempty"`
@@ -189,11 +189,11 @@ type objectMeta struct {
 	ObjVersion uint64 `json:"obj_version"`
 }
 
-// blockDesc 描述对象中的一个块。
+// BlockDesc 描述对象中的一个块。
 //
 // Hash 既是 CAS 的定位键，也是完整性凭据：读取时重算内容哈希与它比对，
 // 就能发现"文件还在但内容变了"（03 文档的"完整性自校验"）。
-type blockDesc struct {
+type BlockDesc struct {
 	Hash   string `json:"hash"`
 	Offset int64  `json:"offset"`
 	Length int64  `json:"length"`

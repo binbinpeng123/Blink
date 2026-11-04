@@ -30,7 +30,7 @@ type Options struct {
 	DisableAuth bool
 	// Store 是存储引擎。为 nil 时所有 S3 数据操作返回
 	// 500 InternalError 而非 panic —— 见 requireStore。
-	Store *store.Store
+	Store store.Backend
 }
 
 // Server 承载路由与共享依赖。
@@ -38,7 +38,7 @@ type Server struct {
 	logger *slog.Logger
 	region string
 	auth   AuthOptions
-	store  *store.Store
+	store  store.Backend
 }
 
 // New 构造 Server。logger 为 nil 时使用 slog 默认 logger，避免调用方崩溃。

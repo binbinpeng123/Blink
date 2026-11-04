@@ -181,7 +181,7 @@ func pastCursor(key string, opt ListOptions) bool {
 // 刻意不复用 objectMeta：完整结构里的 blocks 在真实负载下可能很大
 // （4 MiB 块、64 MiB 对象就有 16 条块描述，GB 级对象上千条），而清单
 // 一条也用不到。encoding/json 对结构体里没有的字段仍然要扫描 token，
-// 但不再为每个块分配 blockDesc、也不再解转义哈希字符串 —— 对象越大，
+// 但不再为每个块分配 BlockDesc、也不再解转义哈希字符串 —— 对象越大，
 // 省下的分配与解析时间越多。
 //
 // 这不改变"目录布局是稳定契约"这一事实：字段名与 objectMeta 一致，
