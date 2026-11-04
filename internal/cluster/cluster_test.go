@@ -43,6 +43,15 @@ func (n *testNode) Close() {
 // newTestNodes 起 count 个互相认识的节点，N=3 / W=2 / R=2。
 func newTestNodes(t *testing.T, count int) []*testNode {
 	t.Helper()
+	return newTestNodesWithBlockSize(t, count, 1024)
+}
+
+// newTestNodesWithBlockSize 与 newTestNodes 相同，但可指定块大小。
+//
+// MPU 测试必须传 ≥5 MiB 的非末分片；1 KiB 块会让一次分片变成五千多次
+// 内部 HTTP 往返，测试时间与覆盖面积不成比例，因此那里改用 MiB 级块。
+func newTestNodesWithBlockSize(t *testing.T, count int, blockSize int64) []*testNode {
+	t.Helper()
 	if count < 3 {
 		t.Fatalf("集成测试至少需要 3 个节点，当前 %d", count)
 	}
@@ -65,7 +74,7 @@ func newTestNodes(t *testing.T, count int) []*testNode {
 		// 从而覆盖块切分、跨块 Range 与远端块拼装。
 		st, err := store.Open(store.Options{
 			Root:            filepath.Join(t.TempDir(), "data"),
-			BlockSize:       1024,
+			BlockSize:       blockSize,
 			InlineThreshold: -1,
 			VerifyOnRead:    true,
 		})

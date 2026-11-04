@@ -9,6 +9,9 @@
 #   - 删除后所有节点立即 404，且 LIST 不再返回该 key；
 #   - 任意节点的 LIST 结果与对象集合一致（含 prefix/delimiter）；
 #   - CORS 配置写入 1 个节点后其余节点可读；
+#   - 跨节点分片上传：建会话/传分片/列举/完成可以落在不同节点，
+#     完成后任意节点读回逐字节一致，且会话不残留；
+#   - 有进行中 MPU 的桶删除被拒，Abort 后可以删除；
 #   - 非空桶删除被拒；清空后删桶对所有节点生效；
 #   - 杀掉 1 个节点后仍可读写（W=2 / R=2 仍可满足）；
 #   - 杀掉 2 个节点后读写回 503，而不是假装对象不存在。
@@ -225,6 +228,107 @@ for i in $(seq 0 $((N - 1))); do
   GET_CORS="$(aws_at "$i" s3api get-bucket-cors --bucket "$BUCKET" \
     --query 'CORSRules[0].ID' --output text)"
   [[ "$GET_CORS" == "smoke" ]] || fail "节点 $((i + 1)) 的 CORS = ${GET_CORS}，期望 smoke"
+done
+
+# 分片上传的三个阶段刻意由不同节点协调：会话位置由 uploadId 的哈希决定，
+# 与"谁创建"无关；任何一个阶段绑死协调者都会在这里暴露。
+echo "==> 跨节点分片上传（MPU）"
+MPU_BUCKET="${BUCKET}-mpu"
+MPU_KEY="dir/mpu.bin"
+aws_at 1 s3api create-bucket --bucket "$MPU_BUCKET" >/dev/null \
+  || fail "建桶 ${MPU_BUCKET} 失败"
+
+UPLOAD_ID="$(aws_at 0 s3api create-multipart-upload --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
+  --query UploadId --output text)" || fail "节点 1 创建分片上传失败"
+[[ "$UPLOAD_ID" =~ ^[0-9a-f]{32}$ ]] || fail "uploadId 格式不符: ${UPLOAD_ID}"
+
+# 非末分片必须 ≥5 MiB；第二片不足 5 MiB 作为末分片。
+dd if=/dev/urandom of="$TMP_DIR/part1.bin" bs=1048576 count=5 2>/dev/null
+dd if=/dev/urandom of="$TMP_DIR/part2.bin" bs=1048576 count=1 2>/dev/null
+dd if=/dev/urandom bs=1 count=12345 >>"$TMP_DIR/part2.bin" 2>/dev/null
+cat "$TMP_DIR/part1.bin" "$TMP_DIR/part2.bin" >"$TMP_DIR/mpu.want"
+
+# aws-cli 的 ETag 输出自带双引号，可以直接嵌进 JSON。
+ETAG1="$(aws_at 1 s3api upload-part --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
+  --upload-id "$UPLOAD_ID" --part-number 1 --body "$TMP_DIR/part1.bin" \
+  --query ETag --output text)" || fail "节点 2 上传分片 1 失败"
+ETAG2="$(aws_at 2 s3api upload-part --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
+  --upload-id "$UPLOAD_ID" --part-number 2 --body "$TMP_DIR/part2.bin" \
+  --query ETag --output text)" || fail "节点 3 上传分片 2 失败"
+
+LIST_PARTS="$(aws_at 0 s3api list-parts --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
+  --upload-id "$UPLOAD_ID" --query 'Parts[].[PartNumber,Size]' --output text)" \
+  || fail "节点 1 列举分片失败"
+EXPECTED_PARTS="$(printf '1\t%s\n2\t%s' "$(wc -c <"$TMP_DIR/part1.bin" | tr -d ' ')" \
+  "$(wc -c <"$TMP_DIR/part2.bin" | tr -d ' ')")"
+[[ "$LIST_PARTS" == "$EXPECTED_PARTS" ]] \
+  || fail "分片列表不符\n期望:\n${EXPECTED_PARTS}\n实际:\n${LIST_PARTS}"
+
+# 会话列表必须扇形到全部节点后归并，任一节点漏答都会少一条。
+for i in $(seq 0 $((N - 1))); do
+  aws_at "$i" s3api list-multipart-uploads --bucket "$MPU_BUCKET" \
+    --query 'Uploads[].UploadId' --output text 2>/dev/null \
+    | tr '\t' '\n' | grep -qx "$UPLOAD_ID" \
+    || fail "节点 $((i + 1)) 的 list-multipart-uploads 缺少 ${UPLOAD_ID}"
+done
+
+cat >"$TMP_DIR/complete.json" <<JSON
+{"Parts":[{"ETag":${ETAG1},"PartNumber":1},{"ETag":${ETAG2},"PartNumber":2}]}
+JSON
+# 由节点 2 完成：既不是建会话的节点，也不是末分片的协调者。
+aws_at 1 s3api complete-multipart-upload --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
+  --upload-id "$UPLOAD_ID" --multipart-upload "file://$TMP_DIR/complete.json" >/dev/null \
+  || fail "Complete 失败"
+
+# S3 的多分片 ETag = md5(各分片 ETag 的原始 MD5 字节) + "-<分片数>"。
+WANT_MPU_ETAG="$({ md5 -q "$TMP_DIR/part1.bin" | xxd -r -p; md5 -q "$TMP_DIR/part2.bin" | xxd -r -p; } \
+  | md5 -q)-2"
+for i in $(seq 0 $((N - 1))); do
+  aws_at "$i" s3api get-object --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
+    "$TMP_DIR/mpu-${i}.got" >/dev/null || fail "节点 $((i + 1)) 读取 MPU 对象失败"
+  cmp -s "$TMP_DIR/mpu.want" "$TMP_DIR/mpu-${i}.got" \
+    || fail "节点 $((i + 1)) 读到的 MPU 对象内容不一致"
+  GOT_MPU_ETAG="$(aws_at "$i" s3api head-object --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
+    --query ETag --output text | tr -d '"')"
+  [[ "$GOT_MPU_ETAG" == "$WANT_MPU_ETAG" ]] \
+    || fail "节点 $((i + 1)) 的 MPU ETag=${GOT_MPU_ETAG}，期望 ${WANT_MPU_ETAG}"
+done
+
+# Complete 后会话必须消失，否则后续 create 会撞上陈旧状态。
+for i in $(seq 0 $((N - 1))); do
+  if OUT="$(aws_at "$i" s3api list-parts --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
+    --upload-id "$UPLOAD_ID" 2>&1)"; then
+    fail "节点 $((i + 1)) 在 Complete 后仍能列举已完成的分片"
+  fi
+  grep -q "NoSuchUpload" <<<"$OUT" || fail "Completed 后 list-parts 错误不是 NoSuchUpload: ${OUT}"
+done
+
+# 进行中的 MPU 让桶"非空"：非空判定必须查全部节点，而不只是本地磁盘。
+echo "==> 进行中 MPU 阻止删桶，Abort 后可删"
+UPLOAD_ID2="$(aws_at 2 s3api create-multipart-upload --bucket "$MPU_BUCKET" --key in-progress.bin \
+  --query UploadId --output text)" || fail "创建第二个会话失败"
+if OUT="$(aws_at 0 s3api delete-bucket --bucket "$MPU_BUCKET" 2>&1)"; then
+  fail "有进行中 MPU 时删桶应失败，实际成功"
+fi
+grep -q "BucketNotEmpty" <<<"$OUT" || fail "有进行中 MPU 时删桶错误不是 BucketNotEmpty: ${OUT}"
+
+aws_at 1 s3api abort-multipart-upload --bucket "$MPU_BUCKET" --key in-progress.bin \
+  --upload-id "$UPLOAD_ID2" >/dev/null || fail "Abort 失败"
+if OUT="$(aws_at 2 s3api list-parts --bucket "$MPU_BUCKET" --key in-progress.bin \
+  --upload-id "$UPLOAD_ID2" 2>&1)"; then
+  fail "Abort 后仍能列举分片"
+fi
+grep -q "NoSuchUpload" <<<"$OUT" || fail "Abort 后 list-parts 错误不是 NoSuchUpload: ${OUT}"
+
+# Abort 是集群范围的：会话清掉后桶里只剩已完成的 mpu.bin，删对象即可删桶。
+aws_at 0 s3api delete-object --bucket "$MPU_BUCKET" --key "$MPU_KEY" >/dev/null \
+  || fail "删除 MPU 对象失败"
+aws_at 2 s3api delete-bucket --bucket "$MPU_BUCKET" >/dev/null \
+  || fail "Abort 后删桶失败"
+for i in $(seq 0 $((N - 1))); do
+  if aws_at "$i" s3api head-bucket --bucket "$MPU_BUCKET" >/dev/null 2>&1; then
+    fail "节点 $((i + 1)) 删除后仍能看到桶 ${MPU_BUCKET}"
+  fi
 done
 
 echo "==> 删除后所有节点立即 404，且 LIST 消失"

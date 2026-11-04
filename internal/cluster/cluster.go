@@ -12,14 +12,16 @@ import (
 
 // Cluster 是集群模式下的存储后端。
 //
-// 它嵌入 *store.Store，分片上传（MPU）等尚未分布化的能力沿用本节点的
-// 单机实现（切片 5 替换）。以下能力由本类型覆盖：
+// 它嵌入 *store.Store：本地磁盘上的单机实现构成"本节点副本"，所有跨节点
+// 能力都在其之上做扇出与法定人数。以下方法由本类型覆盖：
 //   - 对象读写（PutObject/OpenObject/DeleteObject）：按一致性哈希扇出到
 //     N 个副本，凑 W/R 法定人数；
 //   - 桶控制面（CreateBucket/DeleteBucket/BucketExists/ListBuckets/
 //     BucketCreatedAt/CORS）：跨节点广播，规则刻意与数据面不同 ——
 //     建桶/写 CORS 只要求可达节点 ack，删桶要求全部节点可达且集群范围为空；
-//   - LIST（ListObjects）：向全部节点要整桶清单，按 key 归并后分页。
+//   - LIST（ListObjects）：向全部节点要整桶清单，按 key 归并后分页；
+//   - 分片上传（MPU，见 mpu.go）：会话按 uploadId 放到 S、块按对象放到 O，
+//     Complete 只串接块表 —— 不搬数据，成本与对象体积无关。
 //
 // 每个节点的本地存储同时扮演两个角色：
 //   - 单机实现的持有者（桶、MPU 等）；

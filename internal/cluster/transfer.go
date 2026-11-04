@@ -30,6 +30,14 @@ const (
 	pathBucketState = "/internal/v1/bucket-status"
 	pathBuckets     = "/internal/v1/buckets"
 	pathCORS        = "/internal/v1/cors"
+
+	// 分片上传（MPU）会话的四条路由。会话与数据分开搬运：
+	// upload/part/parts 只碰 multipart 目录下的小 JSON，
+	// 真正的分片数据走 pathBlock。
+	pathMPUUpload  = "/internal/v1/mpu/upload"
+	pathMPUPart    = "/internal/v1/mpu/part"
+	pathMPUParts   = "/internal/v1/mpu/parts"
+	pathMPUUploads = "/internal/v1/mpu/uploads"
 )
 
 // handleBlock 同时处理块的写入（POST）与读取（GET）。
@@ -437,6 +445,166 @@ func (s *Server) handleCORS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleMPUUpload 处理会话的读取、提交与删除。
+//
+// GET 对"没有这个会话"回 200 + found=false，理由与 handleMetaGet 相同：
+// 协调者必须把"副本没参与这次会话"与"节点不可达"分开统计，否则一次
+// 部分失败的 Create 会让后续每次 UploadPart 都看成 503。
+func (s *Server) handleMPUUpload(w http.ResponseWriter, r *http.Request) {
+	uploadID := r.URL.Query().Get("uploadId")
+	switch r.Method {
+	case http.MethodGet:
+		st, err := s.store.LoadUploadState(uploadID)
+		switch {
+		case errors.Is(err, store.ErrNoSuchUpload):
+			writeJSON(w, http.StatusOK, uploadStateResponse{})
+		case err != nil:
+			s.writeStoreError(w, "读取分片上传会话", err)
+		default:
+			writeJSON(w, http.StatusOK, uploadStateResponse{Found: true, State: st})
+		}
+	case http.MethodPut:
+		body, ok := readInternalBody(w, r, "invalid_upload_state")
+		if !ok {
+			return
+		}
+		var st store.UploadState
+		if err := json.Unmarshal(body, &st); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_upload_state", Message: "不是合法 JSON"})
+			return
+		}
+		if st.UploadID != uploadID {
+			writeJSON(w, http.StatusBadRequest, errorBody{
+				Error:   "upload_id_mismatch",
+				Message: fmt.Sprintf("state.upload_id=%q 与请求 uploadId=%q 不符", st.UploadID, uploadID),
+			})
+			return
+		}
+		if err := s.store.PutUploadState(&st); err != nil {
+			s.writeStoreError(w, "提交分片上传会话", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case http.MethodDelete:
+		found, err := s.store.DeleteUploadState(uploadID)
+		if err != nil {
+			s.writeStoreError(w, "删除分片上传会话", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"found": found})
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut+", "+http.MethodDelete)
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
+	}
+}
+
+// handleMPUPart 提交单个分片的状态（块表），不是分片数据本身。
+func (s *Server) handleMPUPart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		w.Header().Set("Allow", http.MethodPut)
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
+		return
+	}
+	q := r.URL.Query()
+	uploadID := q.Get("uploadId")
+	partNumber, err := parseIntParam(q.Get("partNumber"), 0)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_part_number", Message: err.Error()})
+		return
+	}
+
+	body, ok := readInternalBody(w, r, "invalid_part_state")
+	if !ok {
+		return
+	}
+	var ps store.PartState
+	if err := json.Unmarshal(body, &ps); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_part_state", Message: "不是合法 JSON"})
+		return
+	}
+	// body 与 query 必须一致：两者都来自同一个协调者，对不上说明请求
+	// 在传输或拼装时已经错了，此时写盘只会污染状态。
+	if int64(ps.PartNumber) != partNumber {
+		writeJSON(w, http.StatusBadRequest, errorBody{
+			Error:   "part_number_mismatch",
+			Message: fmt.Sprintf("state.part_number=%d 与请求 partNumber=%d 不符", ps.PartNumber, partNumber),
+		})
+		return
+	}
+	if err := s.store.PutPartState(uploadID, &ps); err != nil {
+		s.writeStoreError(w, "提交分片状态", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleMPUParts 返回本节点上某次会话的全部分片状态。
+//
+// 会话不在本节点时回空列表而不是 404：这不是故障，只是本节点没参与。
+// 协调者已从 S 确认会话存在，缺副本由合并逻辑自然处理。
+func (s *Server) handleMPUParts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
+		return
+	}
+	parts, err := s.store.ListPartStates(r.URL.Query().Get("uploadId"))
+	if errors.Is(err, store.ErrNoSuchUpload) {
+		writeJSON(w, http.StatusOK, partStatesResponse{})
+		return
+	}
+	if err != nil {
+		s.writeStoreError(w, "列举分片状态", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, partStatesResponse{Parts: parts})
+}
+
+// handleMPUUploads 返回本节点上属于某桶的进行中会话。
+func (s *Server) handleMPUUploads(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
+		return
+	}
+	uploads, err := s.store.ListUploadStates(r.URL.Query().Get("bucket"))
+	if err != nil {
+		s.writeStoreError(w, "列举分片上传会话", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, uploadStatesResponse{Uploads: uploads})
+}
+
+// readInternalBody 读取一个受限长度的内部请求体。
+func readInternalBody(w http.ResponseWriter, r *http.Request, code string) ([]byte, bool) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBody+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "read_failed"})
+		return nil, false
+	}
+	if len(body) > MaxRequestBody {
+		writeJSON(w, http.StatusRequestEntityTooLarge, errorBody{Error: "request_too_large", Message: code})
+		return nil, false
+	}
+	return body, true
+}
+
+// uploadStateResponse 是 GET /internal/v1/mpu/upload 的响应。
+type uploadStateResponse struct {
+	Found bool               `json:"found"`
+	State *store.UploadState `json:"state,omitempty"`
+}
+
+// partStatesResponse 是 GET /internal/v1/mpu/parts 的响应。
+type partStatesResponse struct {
+	Parts []*store.PartState `json:"parts,omitempty"`
+}
+
+// uploadStatesResponse 是 GET /internal/v1/mpu/uploads 的响应。
+type uploadStatesResponse struct {
+	Uploads []*store.UploadState `json:"uploads,omitempty"`
+}
+
 // parseIntParam 解析可选的整数 query 参数，缺省时返回 def。
 func parseIntParam(raw string, def int64) (int64, error) {
 	if raw == "" {
@@ -470,6 +638,9 @@ func parseCRC32C(raw string) (uint32, error) {
 //
 //	ErrInvalidBlock/Bucket/Key → 400  调用方参数错
 //	ErrStaleMeta              → 409  版本冲突（可继续，不是故障）
+//	ErrNoSuchUpload           → 404  会话不存在（副本没参与，不是故障）
+//	ErrInvalidPart 及其一族    → 400  分片参数错
+//	ErrPreconditionFailed     → 412  条件写不成立
 //	fs.ErrNotExist            → 404  块/副本不存在
 //	ErrCorrupt                → 500  盘上数据坏了，必须运维介入
 //	ErrUnavailable            → 503  暂时性失败，可重试
@@ -495,6 +666,20 @@ func (s *Server) writeStoreError(w http.ResponseWriter, op string, err error) {
 		// 409 而不是 400：桶非空是**当前状态**不允许删除，
 		// 协调者清空对象后重试就能成功，不是请求本身写错了。
 		writeJSON(w, http.StatusConflict, errorBody{Error: "bucket_not_empty", Message: err.Error()})
+	case errors.Is(err, store.ErrNoSuchUpload):
+		writeJSON(w, http.StatusNotFound, errorBody{Error: "no_such_upload", Message: err.Error()})
+	case errors.Is(err, store.ErrInvalidPart),
+		errors.Is(err, store.ErrInvalidPartNumber),
+		errors.Is(err, store.ErrInvalidPartOrder),
+		errors.Is(err, store.ErrEntityTooSmall),
+		errors.Is(err, store.ErrInvalidChecksum),
+		errors.Is(err, store.ErrBadDigest),
+		errors.Is(err, store.ErrIncompleteBody):
+		// 分片参数错误全部落到 400 一族：协调者会把它们原样回给客户端，
+		// 不会被误当成"节点故障"而触发重试。
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_part", Message: err.Error()})
+	case errors.Is(err, store.ErrPreconditionFailed):
+		writeJSON(w, http.StatusPreconditionFailed, errorBody{Error: "precondition_failed", Message: err.Error()})
 	case errors.Is(err, fs.ErrNotExist):
 		writeJSON(w, http.StatusNotFound, errorBody{Error: "not_found", Message: err.Error()})
 	case errors.Is(err, store.ErrCorrupt):

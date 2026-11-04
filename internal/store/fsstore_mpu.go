@@ -32,6 +32,14 @@ const (
 	multipartRetention = 7 * 24 * time.Hour
 )
 
+// 分片参数对集群层导出：集群协调者在把请求分发给远端之前要先按同一套
+// S3 契约校验编号与尺寸。复制一份常量会让两条路径在调参时分叉，
+// 让客户端在单机与集群下看到不同的错误。
+const (
+	MinPartSize   = minPartSize
+	MaxPartNumber = maxPartNumber
+)
+
 // 校验和类型。FULL_OBJECT 覆盖整个对象，COMPOSITE 覆盖"各分片校验和"。
 const (
 	ChecksumTypeFullObject = "FULL_OBJECT"
@@ -148,11 +156,11 @@ type ListMultipartUploadsResult struct {
 	NextUploadID   string
 }
 
-// uploadState 是 multipart/<uploadId>/upload.json 的内容。
+// UploadState 是 multipart/<uploadId>/upload.json 的内容。
 //
 // 与对象元数据一样是 JSON、一样整体原子替换：会话的字段很少、
 // 更新只在创建时发生一次，没有追加结构可言。
-type uploadState struct {
+type UploadState struct {
 	Version           int                `json:"version"`
 	UploadID          string             `json:"upload_id"`
 	Bucket            string             `json:"bucket"`
@@ -163,14 +171,18 @@ type uploadState struct {
 	ChecksumType      string             `json:"checksum_type,omitempty"`
 	Initiated         time.Time          `json:"initiated"`
 	NodeID            string             `json:"node_id"`
+	// Revision 在会话发生"非创建性"变更时自增（目前只有首批分片采用
+	// 校验和算法一种）。集群层用它做 LWW 比较：会话的各副本可能从
+	// 不同协调者、以不同顺序收到更新，只有更高的 Revision 才能覆盖。
+	Revision uint64 `json:"revision,omitempty"`
 }
 
-// partState 是 multipart/<uploadId>/parts/<N>.json 的内容。
+// PartState 是 multipart/<uploadId>/parts/<N>.json 的内容。
 //
 // Blocks 只记这个分片内部的块表，Offset 也是分片内偏移。Complete 时
 // 才把它们按顺序重排为全局偏移 —— 这正是创新 B：不复制一个字节，
 // 只重写一份块表。分片的大小与其块表长度必须自洽，读取时校验。
-type partState struct {
+type PartState struct {
 	Version    int         `json:"version"`
 	PartNumber int         `json:"part_number"`
 	ETag       string      `json:"etag"`
@@ -211,41 +223,368 @@ func (s *Store) CreateMultipartUpload(bucket, key string, opt CreateMultipartOpt
 	if _, err := s.loadBucketMeta(bucket); err != nil {
 		return nil, err
 	}
+	st, err := NewMultipartUploadState(bucket, key, NewUploadID(), opt, s.now(), s.nodeID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.createUploadState(st); err != nil {
+		return nil, err
+	}
+	return st.Info(), nil
+}
+
+// NewUploadID 生成一个新的上传编号（32 位小写十六进制）。
+//
+// 集群协调者必须在广播之前拿到编号：会话位置由
+// Ring.Replicas("__mpu__/"+uploadID, ...) 推导，编号是放置键的一部分。
+// 单机路径也走这里，两条路径的编号格式不会分叉。
+func NewUploadID() string { return randHex(16) }
+
+// NewMultipartUploadState 构造会话状态但不落盘。
+//
+// 与 CreateMultipartUpload 校验同一套参数，区别只在**不要求本地有桶**：
+// 集群协调者本节点不一定是会话副本，它构造好状态后广播给 S，由 S 落盘。
+// 报错类型与单机完全一致，客户端看到的仍是 InvalidBucketName/InvalidKey。
+func NewMultipartUploadState(bucket, key, uploadID string, opt CreateMultipartOptions, now time.Time, nodeID string) (*UploadState, error) {
+	if err := validateBucketName(bucket); err != nil {
+		return nil, err
+	}
+	if err := validateKey(key); err != nil {
+		return nil, err
+	}
+	if !validUploadID(uploadID) {
+		// 编号由本包生成，走到这里说明调用方传了自造的值；
+		// 按"这次上传不存在"处理，与 loadUploadState 的判定一致。
+		return nil, fmt.Errorf("%w: 非法的上传编号 %q", ErrNoSuchUpload, uploadID)
+	}
 	ct, err := normalizeChecksumType(opt.ChecksumAlgorithm, opt.ChecksumType)
 	if err != nil {
 		return nil, err
 	}
-
 	contentType := opt.ContentType
 	if contentType == "" {
 		contentType = defaultContentType
 	}
-	st := &uploadState{
+	return &UploadState{
 		Version:           formatVersion,
-		UploadID:          randHex(16),
+		UploadID:          uploadID,
 		Bucket:            bucket,
 		Key:               key,
 		ContentType:       contentType,
 		UserMeta:          opt.UserMeta,
 		ChecksumAlgorithm: opt.ChecksumAlgorithm,
 		ChecksumType:      ct,
-		Initiated:         s.now().UTC().Truncate(time.Second),
-		NodeID:            s.nodeID,
+		Initiated:         now.UTC().Truncate(time.Second),
+		NodeID:            nodeID,
+	}, nil
+}
+
+// createUploadState 把一份新会话写入本地盘。
+func (s *Store) createUploadState(st *UploadState) error {
+	return s.putUploadState(st, true)
+}
+
+// ---------------------------------------------------------------------------
+// 集群层接口：会话与分片状态的显式读写
+//
+// 单机路径上面的方法把"读写会话状态"和"业务语义"（校验分片、串接块表）
+// 绑在一起；集群协调者需要的恰好相反 —— 它要把同一份状态写到多个节点、
+// 从多处读出后自行合并。因此这里导出一组只做读写与校验的原语，让集群层
+// 复用单机的落盘格式与校验规则，而不是复制一份会漂移的实现。
+// ---------------------------------------------------------------------------
+
+// PutUploadState 把一份会话状态写入本节点（创建或更新）。
+//
+// 幂等：相同内容的重复写入允许。更新受 Revision 单调约束——更旧的
+// Revision 一律拒绝（ErrStaleMeta），避免重试把已采用的校验和算法回退。
+// 同 Revision 下不允许改写已确定的算法：分片校验和一旦按某算法算出，
+// 会话算法就不能再变，否则 Complete 无从合并。
+func (s *Store) PutUploadState(st *UploadState) error {
+	return s.putUploadState(st, false)
+}
+
+func (s *Store) putUploadState(st *UploadState, fresh bool) error {
+	if err := validateUploadState(st); err != nil {
+		return err
 	}
 
-	// 先建目录再写状态：状态文件是"会话存在"的唯一凭据，
-	// 它落盘之前客户端不可能拿到 uploadId，因此不存在"状态在但目录没建"的窗口。
+	unlock := s.locks.Lock("mpu:" + st.UploadID)
+	defer unlock()
+
+	existed := false
+	cur, err := s.loadUploadState(st.UploadID)
+	switch {
+	case err == nil:
+		existed = true
+		if cur.Revision > st.Revision {
+			return fmt.Errorf("%w: 会话 %s 的 revision %d 小于现有 %d",
+				ErrStaleMeta, st.UploadID, st.Revision, cur.Revision)
+		}
+		if cur.Revision == st.Revision && cur.ChecksumAlgorithm != "" &&
+			cur.ChecksumAlgorithm != st.ChecksumAlgorithm {
+			return fmt.Errorf("%w: 会话 %s 已确定为 %s，不能再改为 %s",
+				ErrInvalidChecksum, st.UploadID, cur.ChecksumAlgorithm, st.ChecksumAlgorithm)
+		}
+	case errors.Is(err, ErrNoSuchUpload):
+		// 新会话，或此前写入中途失败留下的空目录。
+	default:
+		return err
+	}
+
+	// 先建目录再写状态：状态文件是"会话存在"的唯一凭据，它落盘之前
+	// 客户端不可能拿到 uploadId，因此不存在"状态在但目录没建"的窗口。
 	if err := s.fs.MkdirAll(s.multipartPartsDir(st.UploadID), dirPerm); err != nil {
-		return nil, fsErr("创建分片上传目录", st.UploadID, err)
+		return fsErr("创建分片上传目录", st.UploadID, err)
 	}
 	if err := s.writeFileAtomic(s.multipartStatePath(st.UploadID), mustJSON(st)); err != nil {
-		_ = s.fs.RemoveAll(s.multipartUploadDir(st.UploadID))
-		return nil, fsErr("写入分片上传状态", st.UploadID, err)
+		// 只有确实新建时才清目录：更新失败时目录里可能有已上传的分片，
+		// 整目录删掉会把别人的分片一起毁掉。
+		if fresh && !existed {
+			_ = s.fs.RemoveAll(s.multipartUploadDir(st.UploadID))
+		}
+		return fsErr("写入分片上传状态", st.UploadID, err)
 	}
 	if err := s.fs.SyncDir(s.multipartRoot()); err != nil {
-		return nil, fsErr("同步分片上传目录", st.UploadID, err)
+		return fsErr("同步分片上传目录", st.UploadID, err)
 	}
-	return st.info(), nil
+	return nil
+}
+
+// validateUploadState 校验一份来自调用方（可能是远端节点）的会话状态。
+//
+// 远端传来的 JSON 必须先按本机规则验一遍再落盘：会话里的 bucket/key
+// 会再次拼进路径，放任非法值等于允许路径穿越。
+func validateUploadState(st *UploadState) error {
+	if st == nil {
+		return fmt.Errorf("%w: 会话状态为空", ErrCorrupt)
+	}
+	if !validUploadID(st.UploadID) {
+		return fmt.Errorf("%w: 非法的上传编号 %q", ErrNoSuchUpload, st.UploadID)
+	}
+	if err := validateBucketName(st.Bucket); err != nil {
+		return err
+	}
+	if err := validateKey(st.Key); err != nil {
+		return err
+	}
+	if st.Version != formatVersion {
+		return fmt.Errorf("%w: 会话 %s 的格式版本 %d，期望 %d",
+			ErrCorrupt, st.UploadID, st.Version, formatVersion)
+	}
+	if st.NodeID == "" {
+		return fmt.Errorf("%w: 会话 %s 缺少 node_id", ErrCorrupt, st.UploadID)
+	}
+	if st.ChecksumAlgorithm == "" {
+		if st.ChecksumType != "" {
+			return fmt.Errorf("%w: 会话 %s 声明了 checksum 类型 %q 但没有算法",
+				ErrCorrupt, st.UploadID, st.ChecksumType)
+		}
+		return nil
+	}
+	if _, ok := checksum.New(st.ChecksumAlgorithm); !ok {
+		return fmt.Errorf("%w: 会话 %s 的校验和算法 %q 未知",
+			ErrInvalidChecksum, st.UploadID, st.ChecksumAlgorithm)
+	}
+	switch st.ChecksumType {
+	case ChecksumTypeFullObject, ChecksumTypeComposite:
+		return nil
+	default:
+		return fmt.Errorf("%w: 会话 %s 的 checksum 类型 %q 未知",
+			ErrCorrupt, st.UploadID, st.ChecksumType)
+	}
+}
+
+// LoadUploadState 读取会话状态；不存在时返回 ErrNoSuchUpload。
+func (s *Store) LoadUploadState(uploadID string) (*UploadState, error) {
+	return s.loadUploadState(uploadID)
+}
+
+// DeleteUploadState 删除会话目录，返回删除前是否存在。
+//
+// 幂等：删除不存在（或编号非法）的会话不算错误。Complete/Abort 在
+// 多节点上尽力清理时，不能因为某个副本早已删掉就整体失败。
+func (s *Store) DeleteUploadState(uploadID string) (bool, error) {
+	if !validUploadID(uploadID) {
+		return false, nil
+	}
+	unlock := s.locks.Lock("mpu:" + uploadID)
+	defer unlock()
+
+	if _, err := s.loadUploadState(uploadID); err != nil {
+		if errors.Is(err, ErrNoSuchUpload) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := s.fs.RemoveAll(s.multipartUploadDir(uploadID)); err != nil {
+		return false, fsErr("删除分片上传目录", uploadID, err)
+	}
+	if err := s.fs.SyncDir(s.multipartRoot()); err != nil {
+		return false, fsErr("同步分片上传目录", uploadID, err)
+	}
+	return true, nil
+}
+
+// LoadPartState 读取分片状态；不存在时返回 ErrInvalidPart。
+func (s *Store) LoadPartState(uploadID string, partNumber int) (*PartState, error) {
+	if !validUploadID(uploadID) {
+		return nil, ErrNoSuchUpload
+	}
+	if partNumber < 1 || partNumber > maxPartNumber {
+		return nil, fmt.Errorf("%w: %d 不在 1–%d 之间",
+			ErrInvalidPartNumber, partNumber, maxPartNumber)
+	}
+	return s.loadPartState(uploadID, partNumber)
+}
+
+// PutPartState 把一份分片状态写入本节点。
+//
+// 要求会话已存在：分片状态写进一个已 Abort/Complete 的会话只会留下
+// 永远无人认领的孤儿。远端数据先过 validatePartState，块表与 Size
+// 不自洽的状态不会落盘。
+func (s *Store) PutPartState(uploadID string, ps *PartState) error {
+	if !validUploadID(uploadID) {
+		return ErrNoSuchUpload
+	}
+	if err := validatePartState(ps); err != nil {
+		return err
+	}
+
+	unlock := s.locks.Lock("mpu:" + uploadID)
+	defer unlock()
+
+	if _, err := s.loadUploadState(uploadID); err != nil {
+		return err
+	}
+	if err := s.fs.MkdirAll(s.multipartPartsDir(uploadID), dirPerm); err != nil {
+		return fsErr("创建分片目录", uploadID, err)
+	}
+	if err := s.writeFileAtomic(s.multipartPartPath(uploadID, ps.PartNumber), mustJSON(ps)); err != nil {
+		return fsErr("写入分片状态", uploadID, err)
+	}
+	return nil
+}
+
+// validatePartState 校验一份来自调用方（可能是远端节点）的分片状态。
+func validatePartState(ps *PartState) error {
+	if ps == nil {
+		return fmt.Errorf("%w: 分片状态为空", ErrCorrupt)
+	}
+	if ps.Version != formatVersion {
+		return fmt.Errorf("%w: 分片 %d 的格式版本 %d，期望 %d",
+			ErrCorrupt, ps.PartNumber, ps.Version, formatVersion)
+	}
+	if ps.PartNumber < 1 || ps.PartNumber > maxPartNumber {
+		return fmt.Errorf("%w: %d 不在 1–%d 之间",
+			ErrInvalidPartNumber, ps.PartNumber, maxPartNumber)
+	}
+	if ps.Size < 0 {
+		return fmt.Errorf("%w: 分片 %d 的大小为 %d", ErrCorrupt, ps.PartNumber, ps.Size)
+	}
+	raw, err := hex.DecodeString(ps.ETag)
+	if err != nil || len(raw) != md5.Size {
+		return fmt.Errorf("%w: 分片 %d 的 ETag %q 不是 MD5",
+			ErrCorrupt, ps.PartNumber, ps.ETag)
+	}
+	var total int64
+	for i, b := range ps.Blocks {
+		if err := validateBlockHash(b.Hash); err != nil {
+			return err
+		}
+		if b.Length <= 0 || b.Offset != total {
+			return fmt.Errorf("%w: 分片 %d 的第 %d 块偏移 %d/长度 %d 与累计 %d 不符",
+				ErrCorrupt, ps.PartNumber, i, b.Offset, b.Length, total)
+		}
+		total += b.Length
+	}
+	if total != ps.Size {
+		return fmt.Errorf("%w: 分片 %d 的块表合计 %d 字节，状态声明 %d",
+			ErrCorrupt, ps.PartNumber, total, ps.Size)
+	}
+	if ps.Deduped < 0 || ps.Deduped > len(ps.Blocks) {
+		return fmt.Errorf("%w: 分片 %d 的 deduped=%d 超出块数 %d",
+			ErrCorrupt, ps.PartNumber, ps.Deduped, len(ps.Blocks))
+	}
+	return nil
+}
+
+// ListUploadStates 返回本节点上属于指定桶的全部会话，按 (key, uploadId) 排序。
+//
+// 单个状态损坏时跳过而不是让整个列表失败：一个坏会话不应该让运维
+// 看不到其余仍然健康的上传。
+func (s *Store) ListUploadStates(bucket string) ([]*UploadState, error) {
+	if err := validateBucketName(bucket); err != nil {
+		return nil, err
+	}
+	entries, err := s.fs.ReadDir(s.multipartRoot())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fsErr("读取分片上传根目录", multipartDirName, err)
+	}
+	var out []*UploadState
+	for _, e := range entries {
+		if !e.IsDir() || !validUploadID(e.Name()) {
+			continue
+		}
+		st, err := s.loadUploadState(e.Name())
+		if err != nil {
+			if errors.Is(err, ErrNoSuchUpload) || errors.Is(err, ErrCorrupt) {
+				continue
+			}
+			return nil, err
+		}
+		if st.Bucket != bucket {
+			continue
+		}
+		out = append(out, st)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Key != out[j].Key {
+			return out[i].Key < out[j].Key
+		}
+		return out[i].UploadID < out[j].UploadID
+	})
+	return out, nil
+}
+
+// ListPartStates 返回一次上传在本节点上的全部分片状态，按编号升序。
+// 会话不存在时返回 ErrNoSuchUpload。
+func (s *Store) ListPartStates(uploadID string) ([]*PartState, error) {
+	if _, err := s.loadUploadState(uploadID); err != nil {
+		return nil, err
+	}
+	entries, err := s.fs.ReadDir(s.multipartPartsDir(uploadID))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fsErr("读取分片目录", uploadID, err)
+	}
+	numbers := make([]int, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), multipartPartSuffixName) {
+			continue
+		}
+		if n, ok := parsePartFileName(e.Name()); ok {
+			numbers = append(numbers, n)
+		}
+	}
+	sort.Ints(numbers)
+
+	out := make([]*PartState, 0, len(numbers))
+	for _, n := range numbers {
+		ps, err := s.loadPartState(uploadID, n)
+		if errors.Is(err, ErrInvalidPart) {
+			continue // 并发覆盖/删除：这一片在遍历途中没了
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ps)
+	}
+	return out, nil
 }
 
 // normalizeChecksumType 归一校验和类型，并校验组合是否合法。
@@ -279,7 +618,16 @@ func normalizeChecksumType(alg checksum.Algorithm, declared string) (string, err
 	}
 }
 
-func (st *uploadState) info() *MultipartUpload {
+// NormalizeChecksumType 是 normalizeChecksumType 的导出形式。
+//
+// 集群协调者在"首个分片声明算法"时要在本地推演同一个结果（会话的
+// ChecksumType 由算法决定），否则 Complete 时两侧对不上。
+func NormalizeChecksumType(alg checksum.Algorithm, declared string) (string, error) {
+	return normalizeChecksumType(alg, declared)
+}
+
+// Info 返回会话的对外视图（复制一份 UserMeta 的引用即可，调用方只读）。
+func (st *UploadState) Info() *MultipartUpload {
 	return &MultipartUpload{
 		UploadID:          st.UploadID,
 		Bucket:            st.Bucket,
@@ -295,7 +643,7 @@ func (st *uploadState) info() *MultipartUpload {
 // loadUploadState 读取会话状态；不存在时返回 ErrNoSuchUpload。
 //
 // 与对象元数据的取舍相同：解析失败报 ErrCorrupt，绝不回落成"不存在"。
-func (s *Store) loadUploadState(uploadID string) (*uploadState, error) {
+func (s *Store) loadUploadState(uploadID string) (*UploadState, error) {
 	if !validUploadID(uploadID) {
 		return nil, ErrNoSuchUpload
 	}
@@ -306,7 +654,7 @@ func (s *Store) loadUploadState(uploadID string) (*uploadState, error) {
 	if err != nil {
 		return nil, fsErr("读取分片上传状态", uploadID, err)
 	}
-	var st uploadState
+	var st UploadState
 	if err := json.Unmarshal(data, &st); err != nil {
 		return nil, fmt.Errorf("%w: 分片上传状态 %s 损坏: %v", ErrCorrupt, uploadID, err)
 	}
@@ -391,7 +739,7 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, body io
 			ErrBadDigest, alg, declared, res.checksum)
 	}
 
-	ps := partState{
+	ps := PartState{
 		Version:    formatVersion,
 		PartNumber: partNumber,
 		ETag:       res.etag,
@@ -423,6 +771,7 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, body io
 		}
 		cur.ChecksumAlgorithm = alg
 		cur.ChecksumType = checksumType
+		cur.Revision++
 		if err := s.writeFileAtomic(s.multipartStatePath(uploadID), mustJSON(cur)); err != nil {
 			return nil, fsErr("更新分片上传状态", uploadID, err)
 		}
@@ -441,7 +790,7 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, body io
 }
 
 // loadPartState 读取分片状态；不存在时返回 ErrInvalidPart。
-func (s *Store) loadPartState(uploadID string, partNumber int) (*partState, error) {
+func (s *Store) loadPartState(uploadID string, partNumber int) (*PartState, error) {
 	data, err := readFile(s.fs, s.multipartPartPath(uploadID, partNumber))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrInvalidPart
@@ -449,7 +798,7 @@ func (s *Store) loadPartState(uploadID string, partNumber int) (*partState, erro
 	if err != nil {
 		return nil, fsErr("读取分片状态", uploadID, err)
 	}
-	var ps partState
+	var ps PartState
 	if err := json.Unmarshal(data, &ps); err != nil {
 		return nil, fmt.Errorf("%w: 分片 %d 状态损坏: %v", ErrCorrupt, partNumber, err)
 	}
@@ -485,95 +834,12 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 		return nil, ErrNoSuchUpload
 	}
 
-	blockCount := 0
-	var (
-		blocks    []BlockDesc
-		partsCS   []checksum.PartChecksum
-		etagInput []byte
-		total     int64
-		deduped   int
-	)
-	lastNumber := 0
-	for i, p := range parts {
-		if p.PartNumber < 1 || p.PartNumber > maxPartNumber {
-			return nil, fmt.Errorf("%w: %d 不在 1–%d 之间",
-				ErrInvalidPartNumber, p.PartNumber, maxPartNumber)
-		}
-		// 严格升序：S3 不接受乱序或重复。必须在"存在性"检查之前判断，
-		// 否则乱序请求会先撞上 InvalidPart，客户端会去重传一个其实没问题的分片。
-		if p.PartNumber <= lastNumber {
-			return nil, fmt.Errorf("%w: %d 出现在 %d 之后",
-				ErrInvalidPartOrder, p.PartNumber, lastNumber)
-		}
-		lastNumber = p.PartNumber
-
-		ps, err := s.loadPartState(uploadID, p.PartNumber)
-		if err != nil {
-			return nil, err
-		}
-		if !etagMatch(ps.ETag, p.ETag) {
-			return nil, fmt.Errorf("%w: 分片 %d ETag %q 与已上传的 %s 不符",
-				ErrInvalidPart, p.PartNumber, p.ETag, ps.ETag)
-		}
-		// 非末片至少 5 MiB。最后一片不受限：对象总大小常常不是
-		// 分片尺寸的整数倍，限制它会让正常上传无法完成。
-		if i < len(parts)-1 && ps.Size < minPartSize {
-			return nil, fmt.Errorf("%w: 分片 %d 为 %d 字节，非末片至少 %d 字节",
-				ErrEntityTooSmall, p.PartNumber, ps.Size, minPartSize)
-		}
-
-		// 串接块表：只改 Offset，块内容仍在 CAS 里原样复用。
-		for _, b := range ps.Blocks {
-			b.Offset = total
-			blocks = append(blocks, b)
-			total += b.Length
-		}
-		// 分片自身的块表必须与其 Size 自洽，否则说明状态文件被改过。
-		if total < 0 {
-			return nil, fmt.Errorf("%w: 分片 %d 的块表长度溢出", ErrCorrupt, p.PartNumber)
-		}
-		deduped += ps.Deduped
-		blockCount += len(ps.Blocks)
-
-		raw, err := hex.DecodeString(ps.ETag)
-		if err != nil || len(raw) != md5.Size {
-			return nil, fmt.Errorf("%w: 分片 %d 的 ETag %q 不是 MD5",
-				ErrCorrupt, p.PartNumber, ps.ETag)
-		}
-		etagInput = append(etagInput, raw...)
-
-		if st.ChecksumAlgorithm != "" {
-			if ps.Checksum == "" {
-				return nil, fmt.Errorf("%w: 分片 %d 缺少 %s 校验和",
-					ErrCorrupt, p.PartNumber, st.ChecksumAlgorithm)
-			}
-			partsCS = append(partsCS, checksum.PartChecksum{
-				Encoded: ps.Checksum,
-				Size:    ps.Size,
-			})
-		}
+	out, err := AssembleMultipart(st, parts, func(n int) (*PartState, error) {
+		return s.loadPartState(uploadID, n)
+	}, declaredChecksum)
+	if err != nil {
+		return nil, err
 	}
-
-	var actualChecksum string
-	if st.ChecksumAlgorithm != "" {
-		var ok bool
-		if st.ChecksumType == ChecksumTypeFullObject {
-			actualChecksum, ok = checksum.MergeFullObject(st.ChecksumAlgorithm, partsCS)
-		} else {
-			actualChecksum, ok = checksum.MergeComposite(st.ChecksumAlgorithm, partsCS)
-		}
-		if !ok {
-			return nil, fmt.Errorf("%w: 无法合并 %s 校验和",
-				ErrCorrupt, st.ChecksumAlgorithm)
-		}
-		if declaredChecksum != "" && declaredChecksum != actualChecksum {
-			return nil, fmt.Errorf("%w: %s 声明 %s，实际 %s",
-				ErrBadDigest, st.ChecksumAlgorithm, declaredChecksum, actualChecksum)
-		}
-	}
-
-	sum := md5.Sum(etagInput)
-	etag := hex.EncodeToString(sum[:]) + "-" + fmt.Sprint(len(parts))
 
 	unlockKey := s.locks.Lock(bucket + "\x00" + key)
 	defer unlockKey()
@@ -593,15 +859,15 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 	meta := objectMeta{
 		Version:           formatVersion,
 		Key:               key,
-		Size:              total,
-		ETag:              etag,
+		Size:              out.Size,
+		ETag:              out.ETag,
 		ContentType:       st.ContentType,
 		Modified:          s.now().UTC().Truncate(time.Second),
 		UserMeta:          st.UserMeta,
-		Blocks:            blocks,
-		Checksum:          actualChecksum,
-		ChecksumAlgorithm: string(st.ChecksumAlgorithm),
-		ChecksumType:      st.ChecksumType,
+		Blocks:            out.Blocks,
+		Checksum:          out.Checksum,
+		ChecksumAlgorithm: string(out.ChecksumAlgorithm),
+		ChecksumType:      out.ChecksumType,
 		NodeID:            s.nodeID,
 		ObjVersion:        1,
 	}
@@ -625,18 +891,140 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 
 	return &ObjectInfo{
 		Key:               key,
-		Size:              total,
-		ETag:              etag,
+		Size:              out.Size,
+		ETag:              out.ETag,
 		Modified:          meta.Modified,
 		ContentType:       st.ContentType,
 		UserMeta:          st.UserMeta,
-		Checksum:          actualChecksum,
+		Checksum:          out.Checksum,
 		ChecksumAlgorithm: st.ChecksumAlgorithm,
 		ChecksumType:      st.ChecksumType,
-		BlockCount:        blockCount,
-		DedupedBlocks:     deduped,
+		BlockCount:        out.BlockCount,
+		DedupedBlocks:     out.Deduped,
 		Version:           meta.ObjVersion,
 	}, nil
+}
+
+// AssembledObject 是一组分片串接后的结果：只有块表与派生属性，不含数据。
+type AssembledObject struct {
+	Blocks   []BlockDesc
+	Size     int64
+	ETag     string
+	Checksum string
+	// ChecksumAlgorithm / ChecksumType 取自会话，空表示该对象没有校验和。
+	ChecksumAlgorithm checksum.Algorithm
+	ChecksumType      string
+	BlockCount        int
+	Deduped           int
+}
+
+// AssembleMultipart 校验并串接分片块表，产出对象级块表与 ETag/校验和。
+//
+// 这是 Complete 的全部"计算"部分，单机与集群共用：单机的 load 从本地
+// 读状态，集群的 load 从 S 的多个副本合并出最新状态。两条路径的
+// 校验顺序、错误类型与 ETag 算法因此不可能分叉。
+//
+// load 返回 ErrInvalidPart 表示请求引用了未上传的分片。
+func AssembleMultipart(st *UploadState, parts []CompletePart, load func(int) (*PartState, error), declaredChecksum string) (*AssembledObject, error) {
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("%w: 分片列表为空", ErrInvalidPartOrder)
+	}
+	if st == nil || load == nil {
+		return nil, fmt.Errorf("%w: 缺少会话或分片来源", ErrCorrupt)
+	}
+
+	out := &AssembledObject{
+		ChecksumAlgorithm: st.ChecksumAlgorithm,
+		ChecksumType:      st.ChecksumType,
+	}
+	var (
+		partsCS   []checksum.PartChecksum
+		etagInput []byte
+	)
+	lastNumber := 0
+	for i, p := range parts {
+		if p.PartNumber < 1 || p.PartNumber > maxPartNumber {
+			return nil, fmt.Errorf("%w: %d 不在 1–%d 之间",
+				ErrInvalidPartNumber, p.PartNumber, maxPartNumber)
+		}
+		// 严格升序：S3 不接受乱序或重复。必须在"存在性"检查之前判断，
+		// 否则乱序请求会先撞上 InvalidPart，客户端会去重传一个其实没问题的分片。
+		if p.PartNumber <= lastNumber {
+			return nil, fmt.Errorf("%w: %d 出现在 %d 之后",
+				ErrInvalidPartOrder, p.PartNumber, lastNumber)
+		}
+		lastNumber = p.PartNumber
+
+		ps, err := load(p.PartNumber)
+		if err != nil {
+			return nil, err
+		}
+		if ps == nil {
+			return nil, ErrInvalidPart
+		}
+		if !etagMatch(ps.ETag, p.ETag) {
+			return nil, fmt.Errorf("%w: 分片 %d ETag %q 与已上传的 %s 不符",
+				ErrInvalidPart, p.PartNumber, p.ETag, ps.ETag)
+		}
+		// 非末片至少 5 MiB。最后一片不受限：对象总大小常常不是
+		// 分片尺寸的整数倍，限制它会让正常上传无法完成。
+		if i < len(parts)-1 && ps.Size < minPartSize {
+			return nil, fmt.Errorf("%w: 分片 %d 为 %d 字节，非末片至少 %d 字节",
+				ErrEntityTooSmall, p.PartNumber, ps.Size, minPartSize)
+		}
+
+		// 串接块表：只改 Offset，块内容仍在 CAS 里原样复用。
+		for _, b := range ps.Blocks {
+			b.Offset = out.Size
+			out.Blocks = append(out.Blocks, b)
+			out.Size += b.Length
+		}
+		// 分片自身的块表必须与其 Size 自洽，否则说明状态文件被改过。
+		if out.Size < 0 {
+			return nil, fmt.Errorf("%w: 分片 %d 的块表长度溢出", ErrCorrupt, p.PartNumber)
+		}
+		out.Deduped += ps.Deduped
+		out.BlockCount += len(ps.Blocks)
+
+		raw, err := hex.DecodeString(ps.ETag)
+		if err != nil || len(raw) != md5.Size {
+			return nil, fmt.Errorf("%w: 分片 %d 的 ETag %q 不是 MD5",
+				ErrCorrupt, p.PartNumber, ps.ETag)
+		}
+		etagInput = append(etagInput, raw...)
+
+		if st.ChecksumAlgorithm != "" {
+			if ps.Checksum == "" {
+				return nil, fmt.Errorf("%w: 分片 %d 缺少 %s 校验和",
+					ErrCorrupt, p.PartNumber, st.ChecksumAlgorithm)
+			}
+			partsCS = append(partsCS, checksum.PartChecksum{
+				Encoded: ps.Checksum,
+				Size:    ps.Size,
+			})
+		}
+	}
+
+	if st.ChecksumAlgorithm != "" {
+		var ok bool
+		if st.ChecksumType == ChecksumTypeFullObject {
+			out.Checksum, ok = checksum.MergeFullObject(st.ChecksumAlgorithm, partsCS)
+		} else {
+			out.Checksum, ok = checksum.MergeComposite(st.ChecksumAlgorithm, partsCS)
+		}
+		if !ok {
+			return nil, fmt.Errorf("%w: 无法合并 %s 校验和",
+				ErrCorrupt, st.ChecksumAlgorithm)
+		}
+		if declaredChecksum != "" && declaredChecksum != out.Checksum {
+			return nil, fmt.Errorf("%w: %s 声明 %s，实际 %s",
+				ErrBadDigest, st.ChecksumAlgorithm, declaredChecksum, out.Checksum)
+		}
+	}
+
+	sum := md5.Sum(etagInput)
+	out.ETag = hex.EncodeToString(sum[:]) + "-" + fmt.Sprint(len(parts))
+	return out, nil
 }
 
 // etagMatch 比较两个 ETag，忽略客户端可能带上的引号。
@@ -675,7 +1063,7 @@ func (s *Store) ListParts(bucket, key, uploadID string, opt ListPartsOptions) (*
 		return nil, ErrNoSuchUpload
 	}
 
-	res := &ListPartsResult{Upload: *st.info()}
+	res := &ListPartsResult{Upload: *st.Info()}
 	if opt.MaxParts <= 0 {
 		return res, nil
 	}
@@ -758,14 +1146,22 @@ func (s *Store) ListMultipartUploads(bucket string, opt ListMultipartUploadsOpti
 	if _, err := s.loadBucketMeta(bucket); err != nil {
 		return nil, err
 	}
-	res := &ListMultipartUploadsResult{}
-	if opt.MaxUploads <= 0 {
-		return res, nil
-	}
-
 	uploads, err := s.allUploads(bucket)
 	if err != nil {
 		return nil, err
+	}
+	return PageUploads(uploads, opt), nil
+}
+
+// PageUploads 对一组（已去重的）会话做排序、delimiter 折叠与分页。
+//
+// 单机直接从本地全部会话调用；集群把各节点的结果按 uploadId 合并后
+// 调用同一个函数 —— 分页边界因此在两条路径上不可能漂移。
+// 调用方需保证同一 uploadId 只出现一次（集群侧保留最新副本）。
+func PageUploads(uploads []MultipartUploadInfo, opt ListMultipartUploadsOptions) *ListMultipartUploadsResult {
+	res := &ListMultipartUploadsResult{}
+	if opt.MaxUploads <= 0 {
+		return res
 	}
 	sort.Slice(uploads, func(i, j int) bool {
 		if uploads[i].Key != uploads[j].Key {
@@ -825,7 +1221,7 @@ func (s *Store) ListMultipartUploads(bucket string, opt ListMultipartUploadsOpti
 			res.NextUploadID = last.upload.UploadID
 		}
 	}
-	return res, nil
+	return res
 }
 
 // pastUploadMarker 判断一条逻辑条目是否位于请求起始位置之后。
