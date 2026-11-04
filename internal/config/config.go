@@ -12,11 +12,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/binbinpeng123/Blink/internal/cluster"
 	"github.com/binbinpeng123/Blink/internal/logx"
 )
 
@@ -27,13 +29,26 @@ const (
 	DefaultRegion          = "us-east-1"
 	DefaultLogLevel        = "info"
 	DefaultFsyncPolicy     = "always"
-	DefaultClusterMode     = "single"
 	DefaultMaxClockSkew    = 15 * time.Minute
 	DefaultBlockSize       = 4 << 20 // 4 MiB
 	DefaultInlineThreshold = 64 << 10
 	DefaultHighWatermark   = 0.90
 	DefaultLowWatermark    = 0.85
 	DefaultMaxBucketCount  = 1000
+
+	// 集群默认值。单机模式下这些字段不参与任何行为。
+	DefaultInternalAddr = "0.0.0.0:9100"
+	DefaultReplicaCount = cluster.DefaultReplicaCount
+	DefaultWriteQuorum  = cluster.DefaultWriteQuorum
+	DefaultReadQuorum   = cluster.DefaultReadQuorum
+	DefaultVNodes       = cluster.DefaultVNodes
+	DefaultPeerTimeout  = cluster.DefaultPeerTimeout
+
+	// 集群模式取值。
+	ClusterModeSingle  = "single"
+	ClusterModeCluster = "cluster"
+	// DefaultClusterMode 保持单机默认：升级二进制不会改变既有部署的语义。
+	DefaultClusterMode = ClusterModeSingle
 
 	// FsyncAlways 表示数据与元数据均落盘后 fsync，可靠性优先。
 	FsyncAlways = "always"
@@ -54,6 +69,18 @@ const (
 	EnvVerifyRead  = "BLINK_VERIFY_READ"
 	EnvTLSCert     = "BLINK_TLS_CERT"
 	EnvTLSKey      = "BLINK_TLS_KEY"
+
+	// 集群成员与内部协议。密钥只从环境变量读取，不提供命令行参数：
+	// 命令行会出现在进程列表与 shell 历史里，而共享密钥泄露等于全集群失守。
+	EnvNodeID        = "BLINK_NODE_ID"
+	EnvClusterPeers  = "BLINK_CLUSTER_PEERS"
+	EnvInternalAddr  = "BLINK_INTERNAL_ADDR"
+	EnvClusterSecret = "BLINK_CLUSTER_SECRET"
+	EnvReplicaCount  = "BLINK_REPLICA_COUNT"
+	EnvWriteQuorum   = "BLINK_WRITE_QUORUM"
+	EnvReadQuorum    = "BLINK_READ_QUORUM"
+	EnvVNodes        = "BLINK_VNODES"
+	EnvPeerTimeout   = "BLINK_PEER_TIMEOUT"
 )
 
 // Config 是服务的完整启动配置。
@@ -92,8 +119,31 @@ type Config struct {
 	LowWatermark float64
 	// MaxBucketCount 是单实例桶数量软上限。
 	MaxBucketCount int
-	// ClusterMode 当前仅支持 single；为分布式预留。
+	// ClusterMode 取值 single 或 cluster。
+	//
+	// single（默认）完全绕过集群层：不建环、不监听内部端口、
+	// 不产生额外 goroutine。cluster 模式的参数在 Validate 中一次性校验。
 	ClusterMode string
+	// NodeID 是本节点 ID，集群模式必填且必须出现在 ClusterPeers 中。
+	NodeID string
+	// ClusterPeers 是静态成员表，格式 id@host:port,...，必须包含自身。
+	ClusterPeers string
+	// InternalAddr 是节点间内部协议监听地址，不得与 Addr 冲突。
+	InternalAddr string
+	// ClusterSecret 是节点间 HMAC 共享密钥，集群模式必填且 ≥32 字节。
+	//
+	// 与 TLSKey 一样，这里只保存值本身而不参与日志输出：Redacted 会替换它。
+	ClusterSecret string
+	// ReplicaCount 是副本数 N。
+	ReplicaCount int
+	// WriteQuorum 是写法定人数 W。
+	WriteQuorum int
+	// ReadQuorum 是读法定人数 R。W+R 必须大于 N。
+	ReadQuorum int
+	// VNodes 是每节点的虚拟节点数。
+	VNodes int
+	// PeerTimeout 是单次节点间请求超时。
+	PeerTimeout time.Duration
 	// TLSCert 是 PEM 证书链文件路径；为空表示不启用 TLS。
 	TLSCert string
 	// TLSKey 是 PEM 私钥文件路径；必须与 TLSCert 同时提供。
@@ -107,6 +157,13 @@ type Config struct {
 	// 不能静默忽略：BLINK_VERIFY_READ=yes（拼错的值）如果被当成 false，
 	// 运维会以为校验已经打开，而这恰恰是"以为有保护、实际没有"的一类错误。
 	envErr error
+
+	// clusterEnvErr 单独记录集群参数的环境变量解析失败。
+	//
+	// 单机模式必须完全忽略集群配置（老部署残留的变量不应改变行为、
+	// 更不应导致启动失败），因此这些错误只在 cluster 模式下并入启动错误；
+	// 单机模式通过 ClusterEnvWarnings 输出警告，不静默吞掉笔误。
+	clusterEnvErr error
 }
 
 // Default 返回全部使用默认值的配置（凭据为空）。
@@ -124,6 +181,12 @@ func Default() Config {
 		LowWatermark:    DefaultLowWatermark,
 		MaxBucketCount:  DefaultMaxBucketCount,
 		ClusterMode:     DefaultClusterMode,
+		InternalAddr:    DefaultInternalAddr,
+		ReplicaCount:    DefaultReplicaCount,
+		WriteQuorum:     DefaultWriteQuorum,
+		ReadQuorum:      DefaultReadQuorum,
+		VNodes:          DefaultVNodes,
+		PeerTimeout:     DefaultPeerTimeout,
 	}
 }
 
@@ -150,7 +213,15 @@ func Load(args []string, out io.Writer) (Config, error) {
 	fs.StringVar(&cfg.SecretKey, "secret-key", cfg.SecretKey, "S3 Secret Key（环境变量 "+EnvSecretKey+"）")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "日志级别：debug|info|warn|error（环境变量 "+EnvLogLevel+"）")
 	fs.StringVar(&cfg.FsyncPolicy, "fsync-policy", cfg.FsyncPolicy, "落盘策略：always|meta（环境变量 "+EnvFsyncPolicy+"）")
-	fs.StringVar(&cfg.ClusterMode, "cluster-mode", cfg.ClusterMode, "集群模式：当前仅支持 single（环境变量 "+EnvClusterMode+"）")
+	fs.StringVar(&cfg.ClusterMode, "cluster-mode", cfg.ClusterMode, "运行模式：single|cluster（环境变量 "+EnvClusterMode+"）")
+	fs.StringVar(&cfg.NodeID, "node-id", cfg.NodeID, "本节点 ID，须出现在 cluster-peers 中（环境变量 "+EnvNodeID+"）")
+	fs.StringVar(&cfg.ClusterPeers, "cluster-peers", cfg.ClusterPeers, "静态成员表 id@host:port,...，含自身（环境变量 "+EnvClusterPeers+"）")
+	fs.StringVar(&cfg.InternalAddr, "internal-addr", cfg.InternalAddr, "节点间内部协议监听地址（环境变量 "+EnvInternalAddr+"）")
+	fs.IntVar(&cfg.ReplicaCount, "replica-count", cfg.ReplicaCount, "副本数 N（环境变量 "+EnvReplicaCount+"）")
+	fs.IntVar(&cfg.WriteQuorum, "write-quorum", cfg.WriteQuorum, "写法定人数 W（环境变量 "+EnvWriteQuorum+"）")
+	fs.IntVar(&cfg.ReadQuorum, "read-quorum", cfg.ReadQuorum, "读法定人数 R（环境变量 "+EnvReadQuorum+"）")
+	fs.IntVar(&cfg.VNodes, "vnodes", cfg.VNodes, "每节点虚拟节点数（环境变量 "+EnvVNodes+"）")
+	fs.DurationVar(&cfg.PeerTimeout, "peer-timeout", cfg.PeerTimeout, "节点间请求超时（环境变量 "+EnvPeerTimeout+"）")
 	fs.DurationVar(&cfg.MaxClockSkew, "max-clock-skew", cfg.MaxClockSkew, "签名校验允许的时钟偏移")
 	fs.Int64Var(&cfg.BlockSize, "block-size", cfg.BlockSize, "大对象块大小（字节）")
 	fs.Int64Var(&cfg.InlineThreshold, "inline-threshold", cfg.InlineThreshold, "小对象内联阈值（字节）")
@@ -181,8 +252,18 @@ func applyEnv(cfg *Config) {
 	setIfPresent(EnvLogLevel, &cfg.LogLevel)
 	setIfPresent(EnvFsyncPolicy, &cfg.FsyncPolicy)
 	setIfPresent(EnvClusterMode, &cfg.ClusterMode)
+	setIfPresent(EnvNodeID, &cfg.NodeID)
+	setIfPresent(EnvClusterPeers, &cfg.ClusterPeers)
+	setIfPresent(EnvInternalAddr, &cfg.InternalAddr)
+	setIfPresent(EnvClusterSecret, &cfg.ClusterSecret)
 	setIfPresent(EnvTLSCert, &cfg.TLSCert)
 	setIfPresent(EnvTLSKey, &cfg.TLSKey)
+
+	cfg.applyIntEnv(EnvReplicaCount, &cfg.ReplicaCount, &cfg.clusterEnvErr)
+	cfg.applyIntEnv(EnvWriteQuorum, &cfg.WriteQuorum, &cfg.clusterEnvErr)
+	cfg.applyIntEnv(EnvReadQuorum, &cfg.ReadQuorum, &cfg.clusterEnvErr)
+	cfg.applyIntEnv(EnvVNodes, &cfg.VNodes, &cfg.clusterEnvErr)
+	cfg.applyDurationEnv(EnvPeerTimeout, &cfg.PeerTimeout, &cfg.clusterEnvErr)
 
 	if v := os.Getenv("BLINK_MAX_CLOCK_SKEW"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -194,11 +275,47 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv(EnvVerifyRead); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			cfg.envErr = fmt.Errorf("%s 取值 %q 不是合法的布尔值", EnvVerifyRead, v)
+			cfg.addEnvErr(fmt.Errorf("%s 取值 %q 不是合法的布尔值", EnvVerifyRead, v))
 		} else {
 			cfg.VerifyOnRead = b
 		}
 	}
+}
+
+// applyIntEnv 解析整数环境变量；失败记入 sink 而不是保留默认值 ——
+// "BLINK_VNODES=12O（字母 O）"被静默忽略会让人以为参数已经生效。
+func (c *Config) applyIntEnv(key string, dst *int, sink *error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		*sink = errors.Join(*sink, fmt.Errorf("%s 取值 %q 不是合法的整数", key, v))
+		return
+	}
+	*dst = n
+}
+
+// applyDurationEnv 解析时长环境变量，规则同 applyIntEnv。
+func (c *Config) applyDurationEnv(key string, dst *time.Duration, sink *error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		*sink = errors.Join(*sink, fmt.Errorf("%s 取值 %q 不是合法的时长（如 2s、500ms）", key, v))
+		return
+	}
+	*dst = d
+}
+
+// addEnvErr 累积环境变量解析错误。
+//
+// 用 errors.Join 而不是覆盖：多个变量同时写错时，运维应当一次看到全部问题。
+func (c *Config) addEnvErr(err error) {
+	c.envErr = errors.Join(c.envErr, err)
 }
 
 // setIfPresent 仅在环境变量存在且非空时覆盖目标字段。
@@ -236,9 +353,27 @@ func (c Config) Validate() error {
 		problems = append(problems, "fsync-policy 取值非法，必须是 "+FsyncAlways+" 或 "+FsyncMeta)
 	}
 
-	// 当前仅支持单节点；未知模式宁可拒绝启动，也不要静默降级成单机行为。
-	if c.ClusterMode != DefaultClusterMode {
-		problems = append(problems, "cluster-mode 当前仅支持 "+DefaultClusterMode+"，分布式模式尚未实现")
+	// 集群模式：single 与 cluster 之外的值拒绝启动，不静默降级。
+	//
+	// 单机模式刻意**忽略**全部集群字段：升级时遗留的 BLINK_NODE_ID
+	// 之类的环境变量不应改变单机行为，也不应因为写错而拒绝启动。
+	switch c.ClusterMode {
+	case ClusterModeSingle:
+	case ClusterModeCluster:
+		cc, err := c.ClusterConfig()
+		if err != nil {
+			problems = append(problems, err.Error())
+		} else if err := cc.Validate(); err != nil {
+			problems = append(problems, err.Error())
+		}
+		if strings.TrimSpace(c.InternalAddr) != "" && sameEndpoint(c.Addr, c.InternalAddr) {
+			problems = append(problems, "internal-addr 不能与 addr 使用同一端口，内部协议必须独立监听")
+		}
+		if c.clusterEnvErr != nil {
+			problems = append(problems, c.clusterEnvErr.Error())
+		}
+	default:
+		problems = append(problems, "cluster-mode 必须是 "+ClusterModeSingle+" 或 "+ClusterModeCluster+"，当前 "+strconv.Quote(c.ClusterMode))
 	}
 
 	if c.HighWatermark <= 0 || c.HighWatermark > 1 {
@@ -283,6 +418,56 @@ func (c Config) Validate() error {
 	return fmt.Errorf("配置校验失败: %s", strings.Join(problems, "; "))
 }
 
+// ClusterEnvWarnings 返回单机模式下被忽略的集群环境变量解析错误。
+//
+// 单机模式不读取这些参数，但笔误仍应出现在启动日志里 —— 否则运维会以为
+// BLINK_VNODES=12O 已经生效，切到集群模式时才发现配置从未被接受。
+func (c Config) ClusterEnvWarnings() []string {
+	if c.ClusterMode == ClusterModeCluster || c.clusterEnvErr == nil {
+		return nil
+	}
+	return strings.Split(c.clusterEnvErr.Error(), "\n")
+}
+
+// ClusterConfig 把集群相关字段转换成 cluster 层的强类型配置。
+//
+// 只在 cluster 模式下调用；single 模式不解析成员表，避免无关配置影响单机启动。
+func (c Config) ClusterConfig() (cluster.Config, error) {
+	peers, err := cluster.ParsePeers(c.ClusterPeers)
+	if err != nil {
+		return cluster.Config{}, err
+	}
+	return cluster.Config{
+		NodeID:       c.NodeID,
+		Peers:        peers,
+		InternalAddr: c.InternalAddr,
+		Secret:       []byte(c.ClusterSecret),
+		ReplicaCount: c.ReplicaCount,
+		WriteQuorum:  c.WriteQuorum,
+		ReadQuorum:   c.ReadQuorum,
+		VNodes:       c.VNodes,
+		PeerTimeout:  c.PeerTimeout,
+	}, nil
+}
+
+// sameEndpoint 判断两个监听地址是否可能争用同一端口。
+//
+// 只做保守判断：端口不同一定不冲突；主机相同一定冲突；
+// 任一方是通配地址（0.0.0.0 / :: / 空）时同端口也视为冲突。
+// 主机名解析到同一 IP 的情况不在检查范围内 —— 启动期不做 DNS，
+// 那种冲突会让第二次 Listen 直接失败，错误信息已经足够明确。
+func sameEndpoint(a, b string) bool {
+	aHost, aPort, errA := net.SplitHostPort(a)
+	bHost, bPort, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil || aPort != bPort {
+		return false
+	}
+	unspecified := func(host string) bool {
+		return host == "" || host == "0.0.0.0" || host == "::"
+	}
+	return aHost == bHost || unspecified(aHost) || unspecified(bHost)
+}
+
 // Redacted 返回可安全写入日志的配置副本，凭据字段被替换为占位符。
 func (c Config) Redacted() map[string]string {
 	return map[string]string{
@@ -301,6 +486,17 @@ func (c Config) Redacted() map[string]string {
 		"low_watermark":      strconv.FormatFloat(c.LowWatermark, 'f', 2, 64),
 		"max_bucket_count":   strconv.Itoa(c.MaxBucketCount),
 		"max_clock_skew_sec": strconv.FormatInt(int64(c.MaxClockSkew.Seconds()), 10),
+		// 集群字段：node_id / 成员表 / 端口都不是秘密，可用于排障；
+		// 共享密钥必须脱敏，且永远不输出长度或前缀。
+		"node_id":          c.NodeID,
+		"cluster_peers":    c.ClusterPeers,
+		"internal_addr":    c.InternalAddr,
+		"cluster_secret":   logx.Redact(c.ClusterSecret),
+		"replica_count":    strconv.Itoa(c.ReplicaCount),
+		"write_quorum":     strconv.Itoa(c.WriteQuorum),
+		"read_quorum":      strconv.Itoa(c.ReadQuorum),
+		"vnodes":           strconv.Itoa(c.VNodes),
+		"peer_timeout_sec": strconv.FormatInt(int64(c.PeerTimeout.Seconds()), 10),
 		// TLS 只输出开关与文件路径：路径不是秘密，但私钥内容永远不出现。
 		"tls_enabled": strconv.FormatBool(c.TLSCert != ""),
 		"tls_cert":    c.TLSCert,
@@ -313,7 +509,7 @@ func (c Config) String() string {
 	m := c.Redacted()
 	keys := []string{
 		"addr", "data_dir", "region", "access_key", "secret_key",
-		"log_level", "fsync_policy", "cluster_mode", "verify_read", "tls_enabled",
+		"log_level", "fsync_policy", "cluster_mode", "node_id", "verify_read", "tls_enabled",
 	}
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {

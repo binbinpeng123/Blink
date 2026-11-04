@@ -1,0 +1,253 @@
+// Package cluster 实现 Blink 的跨节点协调层：静态成员表、一致性哈希环、
+// 节点间内部 HTTP 协议与 HMAC 认证。
+//
+// 单机模式（cluster_mode=single）完全绕过本包：不建环、不监听内部端口、
+// 不产生额外 goroutine。集群模式的所有参数都在启动时一次性校验，
+// 校验失败拒绝启动 —— 不静默退化成弱一致的单机行为。
+package cluster
+
+import (
+	"fmt"
+	"net"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// 集群相关默认值。与 docs/reviews/08-distributed-storage.md 的配置表一致。
+const (
+	DefaultReplicaCount = 3
+	DefaultWriteQuorum  = 2
+	DefaultReadQuorum   = 2
+	DefaultVNodes       = 128
+	DefaultPeerTimeout  = 2 * time.Second
+
+	// MinSecretLen 是集群共享密钥的最小长度（字节）。
+	//
+	// HMAC-SHA256 的密钥短于 32 字节不降低理论强度，但短密钥通常意味着
+	// 人选的弱口令；这里用长度阈值把"随手填个 secret"挡在启动之前。
+	MinSecretLen = 32
+
+	// maxNodeIDLen 限制节点 ID 长度。节点 ID 会进入 HMAC 头与 JSON，
+	// 限制长度与字符集可以避免日志注入与畸形头。
+	maxNodeIDLen = 64
+	// maxVNodes 是每节点虚拟节点数的上限：它决定环的规模，
+	// 过大只会增加启动开销而不改善分布。
+	maxVNodes = 4096
+	// maxPeers 是成员表规模上限。静态成员表面向中小规模集群，
+	// 超过这个数量应当改用真正的成员发现，而不是继续拉长配置。
+	maxPeers = 1024
+)
+
+// Peer 是成员表中的一个节点。
+type Peer struct {
+	// ID 是节点标识，须在集群内唯一。
+	ID string
+	// Addr 是内部协议的 host:port。
+	Addr string
+}
+
+// URL 返回内部协议的基地址。
+func (p Peer) URL() *url.URL {
+	return &url.URL{Scheme: "http", Host: p.Addr}
+}
+
+// Config 是集群层的完整配置。
+//
+// 它与 internal/config.Config 刻意分开：后者负责环境变量/命令行解析，
+// 本结构只承载集群层自身需要的东西，便于单独测试与复用。
+type Config struct {
+	// NodeID 是本节点 ID，必须出现在 Peers 中。
+	NodeID string
+	// Peers 是静态成员表，包含自身。
+	Peers []Peer
+	// InternalAddr 是节点间内部协议的监听地址。
+	InternalAddr string
+	// Secret 是节点间 HMAC 共享密钥。
+	Secret []byte
+	// ReplicaCount 是副本数 N。
+	ReplicaCount int
+	// WriteQuorum 是写法定人数 W。
+	WriteQuorum int
+	// ReadQuorum 是读法定人数 R。
+	ReadQuorum int
+	// VNodes 是每节点的虚拟节点数。
+	VNodes int
+	// PeerTimeout 是单次节点间请求的超时。
+	PeerTimeout time.Duration
+}
+
+// ParsePeers 解析 id@host:port,... 形式的成员表。
+//
+// 解析是严格的：空项、重复 ID、重复地址、非法端口全部报错。
+// 成员表是启动期配置，任何一项写错都应该在启动时暴露，
+// 而不是等到某个 key 落到一个不存在的节点上才发现。
+func ParsePeers(s string) ([]Peer, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, fmt.Errorf("集群成员表为空，请设置 BLINK_CLUSTER_PEERS=id@host:port,...")
+	}
+	items := strings.Split(s, ",")
+	if len(items) > maxPeers {
+		return nil, fmt.Errorf("集群成员数 %d 超过上限 %d", len(items), maxPeers)
+	}
+
+	peers := make([]Peer, 0, len(items))
+	seenID := make(map[string]struct{}, len(items))
+	seenAddr := make(map[string]struct{}, len(items))
+	for i, raw := range items {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return nil, fmt.Errorf("集群成员表第 %d 项为空（多余的逗号？）", i+1)
+		}
+		id, addr, ok := strings.Cut(raw, "@")
+		if !ok || id == "" || addr == "" {
+			return nil, fmt.Errorf("集群成员表第 %d 项 %q 不是 id@host:port 形式", i+1, raw)
+		}
+		if err := validateNodeID(id); err != nil {
+			return nil, fmt.Errorf("集群成员表第 %d 项: %w", i+1, err)
+		}
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || host == "" {
+			return nil, fmt.Errorf("集群成员表第 %d 项 %q 的地址无效（需要 host:port，IPv6 用 [::1]:9100）", i+1, addr)
+		}
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("集群成员表第 %d 项 %q 的端口无效", i+1, addr)
+		}
+		if _, dup := seenID[id]; dup {
+			return nil, fmt.Errorf("集群成员表存在重复节点 ID %q", id)
+		}
+		if _, dup := seenAddr[addr]; dup {
+			return nil, fmt.Errorf("集群成员表存在重复地址 %q", addr)
+		}
+		seenID[id] = struct{}{}
+		seenAddr[addr] = struct{}{}
+		peers = append(peers, Peer{ID: id, Addr: addr})
+	}
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("集群成员表为空")
+	}
+	return peers, nil
+}
+
+// Validate 校验集群配置。
+//
+// 所有问题一次性汇总返回：边端部署时往往只能看到一行启动错误，
+// 一次修一个参数会让部署变成多轮试探。
+func (c Config) Validate() error {
+	var problems []string
+
+	if err := validateNodeID(c.NodeID); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if len(c.Peers) == 0 {
+		problems = append(problems, "集群成员表不能为空")
+	}
+
+	seenID := make(map[string]struct{}, len(c.Peers))
+	seenAddr := make(map[string]struct{}, len(c.Peers))
+	selfFound := false
+	for _, p := range c.Peers {
+		if err := validateNodeID(p.ID); err != nil {
+			problems = append(problems, "成员表: "+err.Error())
+			continue
+		}
+		if p.ID == c.NodeID {
+			selfFound = true
+		}
+		if _, dup := seenID[p.ID]; dup {
+			problems = append(problems, "成员表存在重复节点 ID "+p.ID)
+		}
+		if _, dup := seenAddr[p.Addr]; dup {
+			problems = append(problems, "成员表存在重复地址 "+p.Addr)
+		}
+		seenID[p.ID] = struct{}{}
+		seenAddr[p.Addr] = struct{}{}
+	}
+	if c.NodeID != "" && !selfFound {
+		problems = append(problems, "node-id "+c.NodeID+" 未出现在成员表中")
+	}
+
+	if len(c.Secret) < MinSecretLen {
+		problems = append(problems, fmt.Sprintf("cluster secret 至少 %d 字节，当前 %d 字节", MinSecretLen, len(c.Secret)))
+	}
+
+	if strings.TrimSpace(c.InternalAddr) == "" {
+		problems = append(problems, "内部监听地址不能为空")
+	} else if host, port, err := net.SplitHostPort(c.InternalAddr); err != nil || host == "" || port == "" {
+		problems = append(problems, "内部监听地址 "+c.InternalAddr+" 无效（需要 host:port）")
+	}
+
+	n := len(c.Peers)
+	if c.ReplicaCount < 1 || c.ReplicaCount > n {
+		problems = append(problems, fmt.Sprintf("replica-count 必须落在 [1, %d]（成员数），当前 %d", n, c.ReplicaCount))
+	}
+	if c.WriteQuorum < 1 || c.WriteQuorum > c.ReplicaCount {
+		problems = append(problems, fmt.Sprintf("write-quorum 必须落在 [1, %d]，当前 %d", c.ReplicaCount, c.WriteQuorum))
+	}
+	if c.ReadQuorum < 1 || c.ReadQuorum > c.ReplicaCount {
+		problems = append(problems, fmt.Sprintf("read-quorum 必须落在 [1, %d]，当前 %d", c.ReplicaCount, c.ReadQuorum))
+	}
+	// W+R>N 是"读到的副本集合必然与最近一次成功写入的副本集合相交"的充要条件。
+	// 不满足时读可能看不到刚写成功的数据，这属于静默弱一致，必须拒绝启动。
+	if c.WriteQuorum+c.ReadQuorum <= c.ReplicaCount {
+		problems = append(problems, fmt.Sprintf("write-quorum(%d)+read-quorum(%d) 必须大于 replica-count(%d)", c.WriteQuorum, c.ReadQuorum, c.ReplicaCount))
+	}
+
+	if c.VNodes < 1 || c.VNodes > maxVNodes {
+		problems = append(problems, fmt.Sprintf("vnodes 必须落在 [1, %d]，当前 %d", maxVNodes, c.VNodes))
+	}
+	if c.PeerTimeout <= 0 {
+		problems = append(problems, "peer-timeout 必须为正数")
+	}
+
+	if len(problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("集群配置校验失败: %s", strings.Join(problems, "; "))
+}
+
+// PeerByID 返回指定 ID 的成员。
+func (c Config) PeerByID(id string) (Peer, bool) {
+	for _, p := range c.Peers {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return Peer{}, false
+}
+
+// PeerIDs 返回排序后的成员 ID 列表。
+//
+// 排序保证同一个成员集合无论配置书写顺序如何，构造出的环完全一致。
+func (c Config) PeerIDs() []string {
+	ids := make([]string, 0, len(c.Peers))
+	for _, p := range c.Peers {
+		ids = append(ids, p.ID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// validateNodeID 校验节点 ID：非空、不超过 64 字节、只含安全字符。
+//
+// 节点 ID 会进入 HMAC 头与日志，限制字符集可以防止头注入与日志伪造。
+// 该字符集与 K8s 的 Pod 名兼容，便于直接用 downward API 注入。
+func validateNodeID(id string) error {
+	if id == "" {
+		return fmt.Errorf("节点 ID 不能为空")
+	}
+	if len(id) > maxNodeIDLen {
+		return fmt.Errorf("节点 ID %q 超过 %d 字节", id, maxNodeIDLen)
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			return fmt.Errorf("节点 ID %q 含非法字符 %q（只允许字母、数字、. _ -）", id, string(c))
+		}
+	}
+	return nil
+}

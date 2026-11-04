@@ -301,7 +301,7 @@ Pod DNS：`blink-0.blink-headless.blink.svc.cluster.local`；peers 使用短名 
 | `BLINK_REPAIR_INTERVAL` / `SCRUB_INTERVAL` / `REPAIR_MAX_CONCURRENCY` | 30s / 24h / 2 | |
 | `BLINK_TOMBSTONE_TTL` / `READ_DEGRADED` / `PEER_TIMEOUT` | 168h / false / 2s | |
 
-单机模式下出现集群变量只记录警告、不改变行为，保证老部署零回归。
+单机模式下出现集群变量不改变行为，解析失败的变量只记录警告（`cluster_env_ignored`），保证老部署零回归。
 
 ## 验收要求
 
