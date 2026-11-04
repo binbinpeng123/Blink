@@ -113,6 +113,7 @@
 | `MissingSecurityHeader` | 400 | 缺少必需的签名头 |
 | `AuthorizationHeaderMalformed` | 400 | Authorization 头格式非法 |
 | `SlowDown` | 503 | 请求速率超限（保留错误码；当前版本无自动限流） |
+| `ServiceUnavailable` | 503 | 集群模式下无法凑齐写/读 quorum，或扣桶时节点不可达（见 08 文档）。**不复用 `SlowDown`**：后者语义是限流 |
 | `InsufficientStorage` | 507 | 磁盘空间不足，写入被拒绝 |
 | `NoSuchCORSConfiguration` | 404 | 桶存在但未配置 CORS |
 | `AccessForbidden` | 403 | CORS 预检被拒（未启用或规则不匹配） |
@@ -268,6 +269,17 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 相对 AWS S3（自 2020 年 12 月起提供强一致）为**相等或更强**，不构成降级。
 
 **唯一例外**：对象在进行 Range/分片读取期间被覆盖，读取结果不作保证（AWS 同样不保证），实际行为在 `docs/design/known-limitations.md` 中记录。
+
+### 集群模式下的证明与例外（v0.2.0）
+
+上述承诺在分布式模式由 `W+R>N` 的 quorum 交集保证，详见 [08 文档](./08-distributed-storage.md)：
+
+- 默认 `N=3, W=2, R=2`。写集合与读集合必然交叠，读到的最高版本不早于已确认的写版本。
+- 该证明依赖**静态成员**：不做自动成员变更、不做共识。网络分区时多数派可写，少数派返回 `503 ServiceUnavailable`。
+- **例外一**：条件写（`If-None-Match: *`、`If-Match`）在并发协调者下是尽力而为，可能双成功，不等价于 AWS 的强串行化。
+- **例外二**：`PUT` 返回 5xx 时可能已部分生效（部分副本已写入）。5xx 后重试必须幂等。
+- **例外三**：集群 `LIST` 复杂度为 O(节点数 × 对象数)，不承诺单机模式的 `<500ms` 目标。
+- `DELETE` 返回成功后，任意节点立即 404、LIST 不再返回该 key，由 tombstone 保证；tombstone 保留期内不会发生"删除后旧副本复活"。
 
 ## 签名与认证
 
