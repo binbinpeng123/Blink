@@ -24,6 +24,21 @@ const (
 	DefaultVNodes       = 128
 	DefaultPeerTimeout  = 2 * time.Second
 
+	// 故障修复与反熵的默认值。
+	//
+	// RepairInterval 是调度器的兜底唤醒间隔，不是修复延迟：任务到点会被
+	// 精确唤醒，这个值只决定"没有事件时最多睡多久"。
+	DefaultRepairInterval = 30 * time.Second
+	// DefaultScrubInterval 是后台全量扫描的周期。24h 足够让"从未被读到
+	// 的冷数据"也被发现；扫描是顺序的，天然限速。
+	DefaultScrubInterval = 24 * time.Hour
+	// DefaultRepairMaxConcurrency 是每节点的修复并发上限。
+	// 修复是后台流量，压满 IO 会直接伤害在线请求。
+	DefaultRepairMaxConcurrency = 2
+	// DefaultHintTTL 是修复任务（hinted handoff）的最长保留时间。
+	// 超过之后仍失败的副本不再重试，交给反熵的周期扫描重新发现。
+	DefaultHintTTL = 72 * time.Hour
+
 	// MinSecretLen 是集群共享密钥的最小长度（字节）。
 	//
 	// HMAC-SHA256 的密钥短于 32 字节不降低理论强度，但短密钥通常意味着
@@ -77,6 +92,22 @@ type Config struct {
 	VNodes int
 	// PeerTimeout 是单次节点间请求的超时。
 	PeerTimeout time.Duration
+	// RepairInterval 是修复调度器的兜底唤醒间隔。
+	//
+	// 零值表示使用 DefaultRepairInterval（New 会归一化），因此零值 Config
+	// 的测试无需感知修复参数。
+	RepairInterval time.Duration
+	// ScrubInterval 是反熵扫描周期；<0 表示禁用后台扫描。
+	ScrubInterval time.Duration
+	// RepairMaxConcurrency 是每节点的修复并发上限。
+	RepairMaxConcurrency int
+	// HintTTL 是修复任务的最长保留期。
+	HintTTL time.Duration
+	// ReadDegraded 允许在可用副本不足 R 时，从任一可用副本读取。
+	//
+	// 默认 false：副本不足时回 503 而不是给出"可能是旧版本"的数据。
+	// 打开后读可用性优先于一致性，错误日志会标明降级读。
+	ReadDegraded bool
 }
 
 // ParsePeers 解析 id@host:port,... 形式的成员表。
@@ -202,10 +233,41 @@ func (c Config) Validate() error {
 		problems = append(problems, "peer-timeout 必须为正数")
 	}
 
+	// 修复参数：零值表示"用默认值"（见 normalize），负数一律拒绝。
+	if c.RepairInterval < 0 {
+		problems = append(problems, "repair-interval 不能为负数（0 表示使用默认值）")
+	}
+	if c.RepairMaxConcurrency < 0 {
+		problems = append(problems, "repair-max-concurrency 不能为负数（0 表示使用默认值）")
+	}
+	if c.HintTTL < 0 {
+		problems = append(problems, "hint-ttl 不能为负数（0 表示使用默认值）")
+	}
+
 	if len(problems) == 0 {
 		return nil
 	}
 	return fmt.Errorf("集群配置校验失败: %s", strings.Join(problems, "; "))
+}
+
+// normalize 把零值字段填成默认值。
+//
+// 零值必须等价于"未配置"：集群层会被大量测试与单机复用代码以
+// Config{...} 字面量构造，要求每个调用点都写全修复参数只会制造
+// "测试与生产默认值不一致"的漂移。
+func (c *Config) normalize() {
+	if c.RepairInterval <= 0 {
+		c.RepairInterval = DefaultRepairInterval
+	}
+	if c.ScrubInterval == 0 {
+		c.ScrubInterval = DefaultScrubInterval
+	}
+	if c.RepairMaxConcurrency <= 0 {
+		c.RepairMaxConcurrency = DefaultRepairMaxConcurrency
+	}
+	if c.HintTTL <= 0 {
+		c.HintTTL = DefaultHintTTL
+	}
 }
 
 // PeerByID 返回指定 ID 的成员。

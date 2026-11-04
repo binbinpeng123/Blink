@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,7 +30,16 @@ type testNode struct {
 	cl  *Cluster
 	st  *store.Store
 	ts  *httptest.Server
+	cfg Config
 	one sync.Once
+
+	// down 是"进程还在、但不再提供服务"的开关：内部请求直接回 503。
+	// 用它而不是 ts.Close 模拟故障，是因为 ts.Close 之后端口不可复用，
+	// 而故障恢复测试需要一个节点"原地重启"——内存里的存储必须保留。
+	down atomic.Bool
+	// handler 保存当前 Cluster 的内部 handler，支持原地重建 Cluster
+	// （验证 hint 持久化跨进程重启）。
+	handler atomic.Pointer[http.Handler]
 }
 
 // Close 幂等关闭监听与连接池；测试里会主动"杀掉"节点模拟故障。
@@ -38,6 +48,19 @@ func (n *testNode) Close() {
 		n.ts.Close()
 		n.cl.Close()
 	})
+}
+
+// SetDown 模拟节点宕机 / 恢复。存储与监听保持不变：恢复后必须看到
+// 宕机期间同一个数据目录，这正是"重启后修复补齐"要验证的场景。
+func (n *testNode) SetDown(down bool) {
+	n.down.Store(down)
+}
+
+// attachCluster 让这个节点对外提供指定 Cluster 的内部协议。
+func (n *testNode) attachCluster(cl *Cluster) {
+	n.cl = cl
+	h := cl.InternalHandler()
+	n.handler.Store(&h)
 }
 
 // newTestNodes 起 count 个互相认识的节点，N=3 / W=2 / R=2。
@@ -51,6 +74,13 @@ func newTestNodes(t *testing.T, count int) []*testNode {
 // MPU 测试必须传 ≥5 MiB 的非末分片；1 KiB 块会让一次分片变成五千多次
 // 内部 HTTP 往返，测试时间与覆盖面积不成比例，因此那里改用 MiB 级块。
 func newTestNodesWithBlockSize(t *testing.T, count int, blockSize int64) []*testNode {
+	t.Helper()
+	return newTestNodesWithOptions(t, count, blockSize, nil)
+}
+
+// newTestNodesWithOptions 允许在构造前微调集群配置（例如打开降级读、
+// 关闭后台反熵扫描），用于验证单机测试不需要感知的修复参数。
+func newTestNodesWithOptions(t *testing.T, count int, blockSize int64, tweak func(*Config)) []*testNode {
 	t.Helper()
 	if count < 3 {
 		t.Fatalf("集成测试至少需要 3 个节点，当前 %d", count)
@@ -81,7 +111,7 @@ func newTestNodesWithBlockSize(t *testing.T, count int, blockSize int64) []*test
 		if err != nil {
 			t.Fatalf("打开节点 %s 的存储失败: %v", n.id, err)
 		}
-		cl, err := New(Config{
+		cfg := Config{
 			NodeID:       n.id,
 			Peers:        peers,
 			InternalAddr: n.ts.Listener.Addr().String(),
@@ -91,13 +121,31 @@ func newTestNodesWithBlockSize(t *testing.T, count int, blockSize int64) []*test
 			ReadQuorum:   2,
 			VNodes:       64,
 			PeerTimeout:  time.Second,
-		}, st, logger)
+			// 后台扫描默认 24h，测试里不会自然触发；显式关掉可以
+			// 让"扫描修复"用例通过直接调用 scrubOnce 精确控制时机。
+			ScrubInterval: -1,
+		}
+		if tweak != nil {
+			tweak(&cfg)
+		}
+		cl, err := New(cfg, st, logger)
 		if err != nil {
 			t.Fatalf("构造节点 %s 的集群后端失败: %v", n.id, err)
 		}
 		n.st = st
-		n.cl = cl
-		n.ts.Config.Handler = cl.InternalHandler()
+		n.cfg = cfg
+		n.ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if n.down.Load() {
+				// 与真实进程"监听还在但存储不可用"的形态一致：
+				// 对端拿到的是一个明确的 503，而不是连接超时。
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":"node_down"}`))
+				return
+			}
+			(*n.handler.Load()).ServeHTTP(w, r)
+		})
+		n.attachCluster(cl)
 		n.ts.Start()
 	}
 

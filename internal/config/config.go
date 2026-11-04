@@ -44,6 +44,15 @@ const (
 	DefaultVNodes       = cluster.DefaultVNodes
 	DefaultPeerTimeout  = cluster.DefaultPeerTimeout
 
+	// 故障修复与反熵的默认值（与 cluster 包保持一致）。
+	DefaultRepairInterval       = cluster.DefaultRepairInterval
+	DefaultScrubInterval        = cluster.DefaultScrubInterval
+	DefaultRepairMaxConcurrency = cluster.DefaultRepairMaxConcurrency
+	DefaultHintTTL              = cluster.DefaultHintTTL
+	// DefaultReadDegraded 默认关闭：副本不足时回 503 而不是给出可能
+	// 过期的数据。
+	DefaultReadDegraded = false
+
 	// 集群模式取值。
 	ClusterModeSingle  = "single"
 	ClusterModeCluster = "cluster"
@@ -81,6 +90,13 @@ const (
 	EnvReadQuorum    = "BLINK_READ_QUORUM"
 	EnvVNodes        = "BLINK_VNODES"
 	EnvPeerTimeout   = "BLINK_PEER_TIMEOUT"
+
+	// 故障修复与反熵。
+	EnvRepairInterval       = "BLINK_REPAIR_INTERVAL"
+	EnvScrubInterval        = "BLINK_SCRUB_INTERVAL"
+	EnvRepairMaxConcurrency = "BLINK_REPAIR_MAX_CONCURRENCY"
+	EnvHintTTL              = "BLINK_HINT_TTL"
+	EnvReadDegraded         = "BLINK_READ_DEGRADED"
 )
 
 // Config 是服务的完整启动配置。
@@ -144,6 +160,16 @@ type Config struct {
 	VNodes int
 	// PeerTimeout 是单次节点间请求超时。
 	PeerTimeout time.Duration
+	// RepairInterval 是修复调度器的兜底唤醒间隔。
+	RepairInterval time.Duration
+	// ScrubInterval 是反熵扫描周期；负值禁用后台扫描。
+	ScrubInterval time.Duration
+	// RepairMaxConcurrency 是每节点的修复并发上限。
+	RepairMaxConcurrency int
+	// HintTTL 是修复任务的最长保留期。
+	HintTTL time.Duration
+	// ReadDegraded 允许在响应副本不足 R 时仍从可用副本读取。
+	ReadDegraded bool
 	// TLSCert 是 PEM 证书链文件路径；为空表示不启用 TLS。
 	TLSCert string
 	// TLSKey 是 PEM 私钥文件路径；必须与 TLSCert 同时提供。
@@ -187,6 +213,12 @@ func Default() Config {
 		ReadQuorum:      DefaultReadQuorum,
 		VNodes:          DefaultVNodes,
 		PeerTimeout:     DefaultPeerTimeout,
+
+		RepairInterval:       DefaultRepairInterval,
+		ScrubInterval:        DefaultScrubInterval,
+		RepairMaxConcurrency: DefaultRepairMaxConcurrency,
+		HintTTL:              DefaultHintTTL,
+		ReadDegraded:         DefaultReadDegraded,
 	}
 }
 
@@ -222,6 +254,10 @@ func Load(args []string, out io.Writer) (Config, error) {
 	fs.IntVar(&cfg.ReadQuorum, "read-quorum", cfg.ReadQuorum, "读法定人数 R（环境变量 "+EnvReadQuorum+"）")
 	fs.IntVar(&cfg.VNodes, "vnodes", cfg.VNodes, "每节点虚拟节点数（环境变量 "+EnvVNodes+"）")
 	fs.DurationVar(&cfg.PeerTimeout, "peer-timeout", cfg.PeerTimeout, "节点间请求超时（环境变量 "+EnvPeerTimeout+"）")
+	fs.DurationVar(&cfg.RepairInterval, "repair-interval", cfg.RepairInterval, "修复调度器兜底唤醒间隔（环境变量 "+EnvRepairInterval+"）")
+	fs.DurationVar(&cfg.ScrubInterval, "scrub-interval", cfg.ScrubInterval, "反熵扫描周期，负值禁用（环境变量 "+EnvScrubInterval+"）")
+	fs.IntVar(&cfg.RepairMaxConcurrency, "repair-max-concurrency", cfg.RepairMaxConcurrency, "每节点修复并发上限（环境变量 "+EnvRepairMaxConcurrency+"）")
+	fs.DurationVar(&cfg.HintTTL, "hint-ttl", cfg.HintTTL, "修复任务最长保留期（环境变量 "+EnvHintTTL+"）")
 	fs.DurationVar(&cfg.MaxClockSkew, "max-clock-skew", cfg.MaxClockSkew, "签名校验允许的时钟偏移")
 	fs.Int64Var(&cfg.BlockSize, "block-size", cfg.BlockSize, "大对象块大小（字节）")
 	fs.Int64Var(&cfg.InlineThreshold, "inline-threshold", cfg.InlineThreshold, "小对象内联阈值（字节）")
@@ -264,6 +300,10 @@ func applyEnv(cfg *Config) {
 	cfg.applyIntEnv(EnvReadQuorum, &cfg.ReadQuorum, &cfg.clusterEnvErr)
 	cfg.applyIntEnv(EnvVNodes, &cfg.VNodes, &cfg.clusterEnvErr)
 	cfg.applyDurationEnv(EnvPeerTimeout, &cfg.PeerTimeout, &cfg.clusterEnvErr)
+	cfg.applyDurationEnv(EnvRepairInterval, &cfg.RepairInterval, &cfg.clusterEnvErr)
+	cfg.applyDurationEnv(EnvScrubInterval, &cfg.ScrubInterval, &cfg.clusterEnvErr)
+	cfg.applyIntEnv(EnvRepairMaxConcurrency, &cfg.RepairMaxConcurrency, &cfg.clusterEnvErr)
+	cfg.applyDurationEnv(EnvHintTTL, &cfg.HintTTL, &cfg.clusterEnvErr)
 
 	if v := os.Getenv("BLINK_MAX_CLOCK_SKEW"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -278,6 +318,15 @@ func applyEnv(cfg *Config) {
 			cfg.addEnvErr(fmt.Errorf("%s 取值 %q 不是合法的布尔值", EnvVerifyRead, v))
 		} else {
 			cfg.VerifyOnRead = b
+		}
+	}
+	if v := os.Getenv(EnvReadDegraded); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			cfg.clusterEnvErr = errors.Join(cfg.clusterEnvErr,
+				fmt.Errorf("%s 取值 %q 不是合法的布尔值", EnvReadDegraded, v))
+		} else {
+			cfg.ReadDegraded = b
 		}
 	}
 }
@@ -447,6 +496,12 @@ func (c Config) ClusterConfig() (cluster.Config, error) {
 		ReadQuorum:   c.ReadQuorum,
 		VNodes:       c.VNodes,
 		PeerTimeout:  c.PeerTimeout,
+
+		RepairInterval:       c.RepairInterval,
+		ScrubInterval:        c.ScrubInterval,
+		RepairMaxConcurrency: c.RepairMaxConcurrency,
+		HintTTL:              c.HintTTL,
+		ReadDegraded:         c.ReadDegraded,
 	}, nil
 }
 
@@ -497,6 +552,12 @@ func (c Config) Redacted() map[string]string {
 		"read_quorum":      strconv.Itoa(c.ReadQuorum),
 		"vnodes":           strconv.Itoa(c.VNodes),
 		"peer_timeout_sec": strconv.FormatInt(int64(c.PeerTimeout.Seconds()), 10),
+
+		"repair_interval_sec":    strconv.FormatInt(int64(c.RepairInterval.Seconds()), 10),
+		"scrub_interval_sec":     strconv.FormatInt(int64(c.ScrubInterval.Seconds()), 10),
+		"repair_max_concurrency": strconv.Itoa(c.RepairMaxConcurrency),
+		"hint_ttl_hours":         strconv.FormatInt(int64(c.HintTTL.Hours()), 10),
+		"read_degraded":          strconv.FormatBool(c.ReadDegraded),
 		// TLS 只输出开关与文件路径：路径不是秘密，但私钥内容永远不出现。
 		"tls_enabled": strconv.FormatBool(c.TLSCert != ""),
 		"tls_cert":    c.TLSCert,

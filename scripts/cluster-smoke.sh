@@ -14,7 +14,9 @@
 #   - 有进行中 MPU 的桶删除被拒，Abort 后可以删除；
 #   - 非空桶删除被拒；清空后删桶对所有节点生效；
 #   - 杀掉 1 个节点后仍可读写（W=2 / R=2 仍可满足）；
-#   - 杀掉 2 个节点后读写回 503，而不是假装对象不存在。
+#   - 节点用同一数据目录重启后，宕机期间的写入被自动修复补齐，
+#     且修复队列（hint 文件）随任务完成清空；
+#   - 杀掉其余 2 个节点后读写回 503，而不是假装对象不存在。
 #
 # 该脚本只用固定端口、临时目录与测试凭据，仅用于本地验证，
 # 不得指向任何真实部署。
@@ -35,6 +37,12 @@ BUCKET="cluster-smoke-$(date +%s)"
 S3_PORT_BASE=19101
 INTERNAL_PORT_BASE=19201
 PEER_TIMEOUT="500ms"
+# 修复相关的默认值（30s 兜底唤醒、24h 反熵）对冒烟测试太慢：这里压到
+# 亚秒级，让"节点重启后自动补齐"能在几秒内观察到。hint TTL 放宽是为了
+# 避免故障验证过程中任务被提前丢弃，掩盖真正的失败。
+REPAIR_INTERVAL="500ms"
+HINT_TTL="10m"
+SCRUB_INTERVAL="-1s"
 
 TMP_DIR="$(mktemp -d)"
 PIDS=()
@@ -88,11 +96,10 @@ for i in $(seq 0 $((N - 1))); do
   PEERS+="node$((i + 1))@127.0.0.1:$(internal_port "$i")"
 done
 
-echo "==> 构建"
-make build >/dev/null
-
-echo "==> 启动 ${N} 个节点"
-for i in $(seq 0 $((N - 1))); do
+# start_node <序号>：启动一个节点。始终复用 $TMP_DIR/node<i>/data，
+# 这样"宕机 → 用同一数据目录重启"不会丢掉节点本地的副本与 hint。
+start_node() {
+  local i="$1"
   mkdir -p "$TMP_DIR/node${i}/data"
   BLINK_CLUSTER_MODE=cluster \
   BLINK_NODE_ID="node$((i + 1))" \
@@ -110,21 +117,36 @@ for i in $(seq 0 $((N - 1))); do
       --log-level debug \
       --verify-read \
       --peer-timeout "$PEER_TIMEOUT" \
-      >"$TMP_DIR/node${i}.log" 2>&1 &
-  PIDS+=("$!")
+      --repair-interval "$REPAIR_INTERVAL" \
+      --hint-ttl "$HINT_TTL" \
+      --scrub-interval "$SCRUB_INTERVAL" \
+      >>"$TMP_DIR/node${i}.log" 2>&1 &
+  PIDS[i]="$!"
+}
+
+# wait_node_ready <序号>：健康检查就绪才继续，避免把启动竞态误判为故障。
+wait_node_ready() {
+  local i="$1"
+  for _ in $(seq 1 100); do
+    if curl -fsS "http://127.0.0.1:$(s3_port "$i")/healthz" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+echo "==> 构建"
+make build >/dev/null
+
+echo "==> 启动 ${N} 个节点"
+for i in $(seq 0 $((N - 1))); do
+  start_node "$i"
 done
 
 echo "==> 等待节点就绪"
 for i in $(seq 0 $((N - 1))); do
-  ready=""
-  for _ in $(seq 1 100); do
-    if curl -fsS "http://127.0.0.1:$(s3_port "$i")/healthz" >/dev/null 2>&1; then
-      ready=1
-      break
-    fi
-    sleep 0.1
-  done
-  [[ -n "$ready" ]] || fail "节点 $((i + 1)) 未在 10 秒内就绪"
+  wait_node_ready "$i" || fail "节点 $((i + 1)) 未在 10 秒内就绪"
 done
 
 echo "==> 只在节点 1 建桶，验证广播到其余节点"
@@ -383,6 +405,18 @@ aws_at 1 s3api get-object --bucket "$BUCKET" --key degraded.bin "$TMP_DIR/degrad
 cmp -s "$TMP_DIR/small.bin" "$TMP_DIR/degraded.got" \
   || fail "1 个节点宕机后读到的内容不一致"
 
+# 用全新随机内容写一份：块在集群里从未出现过，修复必须真的搬运数据，
+# 而不是靠 CAS 去重"碰巧"命中已有块。
+OUTAGE_PAYLOAD="$TMP_DIR/outage.bin"
+dd if=/dev/urandom of="$OUTAGE_PAYLOAD" bs=1024 count=1024 2>/dev/null
+aws_at 0 s3api put-object --bucket "$BUCKET" --key outage.bin --body "$OUTAGE_PAYLOAD" >/dev/null \
+  || fail "1 个节点宕机后写入 outage.bin 失败"
+
+# 宕机节点此刻不该有这份副本——否则后面的"修复补齐"断言没有意义。
+if grep -rqF '"key":"outage.bin"' "$TMP_DIR/node2/data/buckets" 2>/dev/null; then
+  fail "宕机节点不应持有宕机期间写入的副本"
+fi
+
 # 删桶与对象数据面相反：任一节点不可达就拒绝，否则宕机节点可能带着
 # 旧桶（与旧对象）回归，造出"桶删了却还能读到数据"的状态。
 if OUT="$(aws_at 0 s3api delete-bucket --bucket "$BUCKET" 2>&1)"; then
@@ -391,10 +425,47 @@ fi
 grep -q "ServiceUnavailable\|503" <<<"$OUT" \
   || fail "节点宕机时删桶错误不是 503: ${OUT}"
 
-echo "==> 杀掉第 2 个节点后应返回 503"
-kill -9 "${PIDS[1]}" 2>/dev/null || true
-wait "${PIDS[1]}" 2>/dev/null || true
-PIDS[1]=""
+echo "==> 重启节点 3，验证自动修复补齐"
+# 同一数据目录 + 同一节点 ID：模拟 Pod 原地重启（StatefulSet 的常态）。
+start_node 2
+wait_node_ready 2 || fail "节点 3 重启后未在 10 秒内就绪"
+
+# pending_hints：任一节点上仍有未完成的修复任务就输出文件名。
+pending_hints() {
+  find "$TMP_DIR"/node*/data/cluster/hints -name '*.json' -print -quit 2>/dev/null
+}
+
+# 修复是异步的：轮询"副本出现且 hint 清空"，固定 sleep 会在慢机器上
+# 随机失败。
+REPAIR_DEADLINE=$((SECONDS + 30))
+while :; do
+  if grep -rqF '"key":"outage.bin"' "$TMP_DIR/node2/data/buckets" 2>/dev/null \
+    && [[ -z "$(pending_hints)" ]]; then
+    break
+  fi
+  ((SECONDS < REPAIR_DEADLINE)) || fail "节点 3 重启 30 秒后仍未补齐副本/清空 hint"
+  sleep 0.1
+done
+
+# 不只核对 meta：块也必须真的落到重启节点上。读路径会从远端兜底，
+# 只读一次无法区分"本地已修复"和"每次都走远端搬块"。
+META_FILE="$(grep -rlF '"key":"outage.bin"' "$TMP_DIR/node2/data/buckets" | head -1 || true)"
+for hash in $(grep -o '"hash":"[0-9a-f]\{64\}"' "$META_FILE" | cut -d'"' -f4); do
+  [[ -f "$TMP_DIR/node2/data/cas/${hash:0:2}/$hash" ]] \
+    || fail "重启节点缺少修复块 ${hash}"
+done
+
+aws_at 2 s3api get-object --bucket "$BUCKET" --key outage.bin "$TMP_DIR/outage.got" >/dev/null \
+  || fail "修复后节点 3 读取 outage.bin 失败"
+cmp -s "$OUTAGE_PAYLOAD" "$TMP_DIR/outage.got" \
+  || fail "修复后节点 3 读到的内容与写入不一致"
+
+echo "==> 杀掉其余 2 个节点后应返回 503"
+for idx in 1 2; do
+  kill -9 "${PIDS[$idx]}" 2>/dev/null || true
+  wait "${PIDS[$idx]}" 2>/dev/null || true
+  PIDS[$idx]=""
+done
 
 if OUT="$(aws_at 0 s3api get-object --bucket "$BUCKET" --key big.bin "$TMP_DIR/should-not-exist" 2>&1)"; then
   fail "只剩 1 个节点时读取应失败，实际成功"

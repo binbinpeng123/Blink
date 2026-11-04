@@ -144,6 +144,34 @@ func (c *PeerClient) PutBlock(ctx context.Context, hash string, data []byte) (bo
 	return out.Deduped, nil
 }
 
+// BlockExists 询问远端节点是否持有某个块。
+//
+// 用 HEAD 而不是 GET：修复前的存在性探测不需要任何内容，3 个副本
+// 各拉一遍完整块再丢弃会让一次修复的带宽放大三倍。
+//
+// 只有 200/404 是可靠答案；其余状态（含传输错误）返回 error，
+// 让修复器把它当作"目标暂不可用"重试，而不是误判为缺块去复制。
+func (c *PeerClient) BlockExists(ctx context.Context, hash string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, blockTransferTimeout)
+	defer cancel()
+
+	path := pathBlock + "?" + url.Values{"hash": {hash}}.Encode()
+	resp, err := c.doTransfer(ctx, http.MethodHead, path, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, c.peerError(http.MethodHead, path, resp)
+	}
+}
+
 // GetBlock 把远端块 b 的 [offset, offset+length) 字节流式写入 w。
 //
 // 返回的字节数必须恰好等于 length：Content-Length 已声明，短读意味着

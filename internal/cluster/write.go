@@ -165,6 +165,21 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 			store.ErrUnavailable, ok, c.cfg.WriteQuorum)
 	}
 
+	// 写已经向客户端确认成功，但副本未必齐全。把缺口交给修复队列：
+	//   - meta 提交失败的节点已经有块，只差 meta；
+	//   - 块阶段被移出 alive 的节点可能缺任意块，从块补齐开始。
+	// ErrStaleMeta 不修复：它表示对端已有更新版本，本任务已无意义。
+	for i, err := range errs {
+		if err != nil && !isStaleError(err) {
+			c.repair.enqueue(live[i].id, repairMeta, bucket, key, meta.ObjVersion)
+		}
+	}
+	for _, t := range ts {
+		if !alive[t.id] {
+			c.repair.enqueue(t.id, repairBlocks, bucket, key, meta.ObjVersion)
+		}
+	}
+
 	return &store.ObjectInfo{
 		Key:               key,
 		Size:              summary.Size,
@@ -250,6 +265,14 @@ func (c *Cluster) DeleteObject(bucket, key string) error {
 		}
 		return fmt.Errorf("%w: 删除墓碑仅 %d 个副本确认，需要 %d",
 			store.ErrUnavailable, ok, c.cfg.WriteQuorum)
+	}
+
+	// 墓碑缺一个副本，就意味着那个节点上可能留着一个永不消失的旧对象。
+	// 删除已向客户端确认，必须把墓碑补到每一个目标。
+	for i, err := range errs {
+		if err != nil && !isStaleError(err) {
+			c.repair.enqueue(ts[i].id, repairMeta, bucket, key, tomb.ObjVersion)
+		}
 	}
 	return nil
 }

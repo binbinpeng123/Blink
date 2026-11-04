@@ -311,6 +311,15 @@ func (c *Cluster) CompleteMultipartUpload(bucket, key, uploadID string, parts []
 		return nil, quorumError("提交对象元数据", ok, c.cfg.WriteQuorum, errs)
 	}
 
+	// Complete 成功后补齐缺 meta 的 O 目标。块的检查交给修复执行器：
+	// 分片数据在 UploadPart 时已按 O 分发，正常路径下它们都在，
+	// 逐个 HEAD 只会把 Complete 的延迟从"串接块表"拖成"遍历所有分片"。
+	for i, err := range errs {
+		if err != nil && !isStaleError(err) {
+			c.repair.enqueue(ts[i].id, repairBlocks, bucket, key, meta.ObjVersion)
+		}
+	}
+
 	// 对象已提交：会话清理是尽力而为。失败只会在 S 上留下过期状态，
 	// 由保留期清扫回收；此时向客户端报错反而会导致"对象已存在却收到失败"。
 	sessions := c.sessionTargets(uploadID)

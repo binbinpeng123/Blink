@@ -219,6 +219,13 @@ func (t target) putBlock(ctx context.Context, hash string, data []byte) (bool, e
 	return t.client.PutBlock(ctx, hash, data)
 }
 
+func (t target) blockExists(ctx context.Context, hash string) (bool, error) {
+	if t.local != nil {
+		return t.local.BlockExists(hash)
+	}
+	return t.client.BlockExists(ctx, hash)
+}
+
 func (t target) getBlock(ctx context.Context, b store.BlockDesc, offset, length int64, w io.Writer) error {
 	if t.local != nil {
 		return t.local.ReadBlockRange(w, b, offset, length)

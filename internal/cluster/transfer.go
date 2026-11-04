@@ -47,10 +47,38 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 		s.handleBlockPut(w, r)
 	case http.MethodGet:
 		s.handleBlockGet(w, r)
+	case http.MethodHead:
+		s.handleBlockHead(w, r)
 	default:
-		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodHead+", "+http.MethodPost)
 		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
 	}
+}
+
+// handleBlockHead 只回答"这个块在不在"，不返回内容。
+//
+// 修复路径用它避免把完整的块搬一遍再判断：块按内容寻址，绝大多数
+// 修复只需要确认目标有没有这个文件。HEAD 没有响应体，因此错误只能
+// 通过状态码表达 —— 这里不接受请求体里的任何参数。
+func (s *Server) handleBlockHead(w http.ResponseWriter, r *http.Request) {
+	hash := r.URL.Query().Get("hash")
+	ok, err := s.store.BlockExists(hash)
+	if err != nil {
+		// 哈希非法是 400；其余（含 IO 错误）一律 500，让调用方区分
+		// "确定缺失"与"查不了"——前者可以复制，后者必须重试。
+		if errors.Is(err, store.ErrInvalidBlock) {
+			writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_argument", Message: err.Error()})
+			return
+		}
+		s.logger.Error("internal_block_stat_failed", "hash", hash, "err", err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 // handleBlockPut 接收一个完整的内容块。
