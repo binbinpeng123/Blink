@@ -1,9 +1,6 @@
 package store
 
 import (
-	"crypto/md5"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -14,8 +11,13 @@ import (
 	"github.com/binbinpeng123/Blink/internal/checksum"
 )
 
-// defaultContentType 是客户端未提供 Content-Type 时的落库值（02 文档）。
-const defaultContentType = "application/octet-stream"
+// DefaultContentType 是客户端未提供 Content-Type 时的落库值（02 文档）。
+//
+// 导出给集群协调者：它构造副本 meta 时必须与单机路径落出同一个默认值，
+// 否则同一个对象经不同路径写入会有不同的 Content-Type。
+const DefaultContentType = "application/octet-stream"
+
+const defaultContentType = DefaultContentType
 
 // PutOptions 是一次 PutObject 的输入。
 //
@@ -204,116 +206,47 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 	}, nil
 }
 
-// streamResult 是一次流式切块的产出。
+// streamResult 是一次流式切块的产出，额外记下本地去重命中数。
 //
 // 抽出来给 UploadPart 复用：分片写入与普通对象写入在"切块、算 MD5、
 // 算校验和、块落 CAS"上完全一致，差别只在最终如何组装元数据。
 // 两处各写一遍读循环是最容易悄悄跑偏的那种重复 —— 一处改了块边界
 // 或校验顺序，另一处不会跟着变。
 type streamResult struct {
-	blocks []blockDesc
+	blocks []BlockDesc
 	size   int64
 	// etag 是内容 MD5 的小写十六进制（普通对象 ETag 与分片 ETag 同义）。
 	etag string
 	// checksum 是 alg 对应的校验和（base64）；alg 为空时为空串。
 	checksum string
-	deduped  int
+	// deduped 是命中本地 CAS、本次未写盘的块数。
+	deduped int
 }
 
-// streamBlocks 从 body 读完全部内容，切块写入 CAS，同时算出 MD5 与校验和。
+// streamBlocks 从 body 读完全部内容，切块写入本地 CAS。
 //
-// tag 只用于错误信息（对象 key 或分片标识），不参与任何判断。
-// 调用方负责长度校验：本函数不知道客户端声明了多少字节。
+// 切块与校验逻辑在导出的 StreamBlocks 中；这里只提供单机路径的落盘
+// 回调，集群路径用同一个 StreamBlocks 把块同时扇出到远端。
 func (s *Store) streamBlocks(body io.Reader, alg checksum.Algorithm, tag string) (*streamResult, error) {
-	var objSum checksum.Sum
-	if alg != "" {
-		sum, ok := checksum.New(alg)
-		if !ok {
-			return nil, fmt.Errorf("%w: 未知的校验和算法 %q", ErrInvalidChecksum, alg)
-		}
-		objSum = sum
-	}
-
-	res := &streamResult{blocks: make([]blockDesc, 0, 4)}
-	md5h := md5.New()
-
-	buf := make([]byte, s.blockSize)
-	// 小对象快路径：先读 inlineThreshold 字节。若流在此结束，对象只有一块，
-	// 省下 4 MiB 的缓冲分配 —— 边端常见的是几 KiB 的配置/清单文件，
-	// 为每个这样的对象分配一个块大小的缓冲是把内存当垃圾扔。
-	prefill := 0
-	if s.inlineThreshold > 0 {
-		n, err := io.ReadFull(body, buf[:s.inlineThreshold])
-		switch {
-		case err == nil, errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
-			prefill = n
-		default:
-			return nil, fsErr("读取请求体", tag, err)
-		}
-	}
-
-	for {
-		n, err := readBlock(body, buf, prefill)
-		prefill = 0
-		if n > 0 {
-			chunk := buf[:n]
-			// md5/sha 与校验和计算器都不返回错误，但接口要求处理它。
-			_, _ = md5h.Write(chunk)
-			if objSum != nil {
-				_, _ = objSum.Write(chunk)
-			}
-
-			sum := sha256.Sum256(chunk)
-			hash := hex.EncodeToString(sum[:])
-			wrote, err := s.putBlock(hash, chunk)
-			if err != nil {
-				return nil, err
-			}
-			if !wrote {
-				res.deduped++
-			}
-			res.blocks = append(res.blocks, blockDesc{
-				Hash:   hash,
-				Offset: res.size,
-				Length: int64(n),
-				CRC32C: checksum.BlockCRC32C(chunk),
-			})
-			res.size += int64(n)
-		}
+	res := &streamResult{}
+	summary, err := s.StreamBlocks(body, alg, tag, func(b Block) error {
+		wrote, err := s.putBlock(b.Desc.Hash, b.Data)
 		if err != nil {
-			// EOF 与 ErrUnexpectedEOF 都表示"正常读完，只是最后一块不满"；
-			// 其余错误意味着链路出了问题，必须让整次写入失败。
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				break
-			}
-			return nil, fsErr("读取请求体", tag, err)
+			return err
 		}
+		if !wrote {
+			res.deduped++
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	res.etag = hex.EncodeToString(md5h.Sum(nil))
-	if objSum != nil {
-		res.checksum = objSum.Encoded()
-	}
+	res.blocks = summary.Blocks
+	res.size = summary.Size
+	res.etag = summary.ETag
+	res.checksum = summary.Checksum
 	return res, nil
-}
-
-// readBlock 把一个块读满到 buf，返回块长度。
-//
-// prefill 表示 buf 前若干字节已在小对象快路径里读入。返回语义：
-//
-//	err == nil                 读满 buf，可能还有更多数据
-//	err == io.EOF              流已结束；n 为最后一块长度（空对象时为 0）
-//	err == io.ErrUnexpectedEOF 流在中途结束；n 为最后一块长度
-//
-// 关键细节：prefill > 0 且流恰好在此结束时，io.ReadFull 返回
-// (0, io.EOF)，此时 buf[:prefill] 本身就是最后一个完整块 ——
-// 直接丢弃会让每个"长度恰好是阈值整数倍"的对象少一段内容。
-func readBlock(r io.Reader, buf []byte, prefill int) (int, error) {
-	if prefill == 0 {
-		return io.ReadFull(r, buf)
-	}
-	n, err := io.ReadFull(r, buf[prefill:])
-	return prefill + n, err
 }
 
 // putBlock 把一块内容写入 CAS，返回是否真的写了盘。

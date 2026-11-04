@@ -28,7 +28,10 @@ type ObjectReader struct {
 
 // OpenObject 打开对象并返回读取器；对象不存在时返回 ErrNoSuchKey，
 // 桶不存在时返回 ErrBucketNotFound（与 PutObject 的区分方式一致）。
-func (s *Store) OpenObject(bucket, key string) (*ObjectReader, error) {
+//
+// 返回接口而非 *ObjectReader：集群后端会返回自己的读取器实现，
+// 两种后端在 s3api 眼中是同一种东西。
+func (s *Store) OpenObject(bucket, key string) (Reader, error) {
 	if err := validateBucketName(bucket); err != nil {
 		return nil, err
 	}
@@ -123,7 +126,7 @@ func (r *ObjectReader) WriteRangeTo(w io.Writer, offset, length int64) error {
 // 每次打开都先 Stat 校验文件长度与块描述一致。这一步很便宜（每 4 MiB
 // 一次 fstat），但能把"文件被截断/替换"从"客户端收到半个对象"变成
 // 一个明确的 ErrCorrupt —— 前者在 HTTP 层表现为连接中断，几乎无法排查。
-func (s *Store) copyBlockSegment(w io.Writer, b blockDesc, start, stop int64) error {
+func (s *Store) copyBlockSegment(w io.Writer, b BlockDesc, start, stop int64) error {
 	path := s.casPath(b.Hash)
 	st, err := s.fs.Stat(path)
 	if err != nil {

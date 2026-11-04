@@ -19,7 +19,7 @@
 | **Ceph RGW** | RADOS 对象 | 完整集群 | 多级 | 大规模统一存储 | **整体排除**：边端无法承载 |
 | **versitygw / s3proxy** | 直接 POSIX 映射 | 原样文件 | 无 | 简单网关 | **借鉴**：协议层可直接映射；**放弃**其做法（无校验、无恢复、无 AI 场景优化）—— 这正是 Blink 要填补的空白 |
 
-**结论**：Blink 采用"单二进制（MinIO 式）+ 块管理（Garage 式）+ 自研校验与恢复"，刻意**不做**纠删码、不引入外部键值引擎、不做多节点复制。
+**结论**：Blink 采用"单二进制（MinIO 式）+ 块管理（Garage 式）+ 自研校验与恢复"，不引入外部键值引擎。**v0.2.0 起在同一二进制中加入多副本与可选纠删码**（见 08 文档）；单机模式仍是默认路径，存储格式与写读路径不变，EC 只作为大对象的一种额外布局。
 
 ## 数据布局
 
@@ -67,8 +67,11 @@
 | `user_meta` | `x-amz-meta-*` 键值对 |
 | `blocks` | 有序块描述列表（每条含块哈希、偏移、长度） |
 | `checksum` | 对象级校验和（算法按客户端声明） |
-| `node_id` | 写入节点（分布式预留） |
-| `obj_version` | 单调递增版本号（分布式预留） |
+| `node_id` | 写入节点（v0.2.0 起作为冲突决胜字段） |
+| `obj_version` | 单调递增版本号；v0.2.0 起为 HLC `(physical_ms, counter)` |
+| `deleted` | tombstone 标记（仅集群模式写入；单机仍是物理删除） |
+| `layout` | `""`（默认副本/单机）或 `"ec"` |
+| `ec` | EC 布局：`{k, m, group}`，仅在 `layout:"ec"` 时存在 |
 
 `checksum` 与 `checksum_algorithm` 需同时记录，以便 `ChecksumMode: ENABLED` 时正确回传。
 
@@ -186,21 +189,28 @@
 
 **开发纪律**：创新 D 是唯一"必须先有基线基准数据、再决定是否合入"的项。任何没有前后 benchmark 对照的优化一律回滚。
 
-## 分布式预留接缝
+## 分布式扩展点（v0.2.0 已落地）
 
-**首个版本为单节点设计，但代码结构不得假设"只有本机"。** 以下接缝在本版本中不实现任何分布式行为，仅预留扩展点，且在单机模式下必须零额外开销：
+**v0.1.0 的"预留接缝"大部分只停留在文档，代码中并不存在** —— v0.2.0 从零补齐了这一层，并把预留清单改写为已落地清单。完整设计见 [08 分布式存储设计](./08-distributed-storage.md)。
 
-| 接缝 | 位置 | 当前行为 | 未来用途 |
+| 扩展点 | 位置 | 单机行为 | 集群行为 |
 | --- | --- | --- | --- |
-| `node_id` | `blink-meta.json` | 首次启动生成并持久化 | 集群节点身份 |
-| `Placement` 接口 | `internal/cluster` | 恒返回本机 | 分片与副本定位 |
-| `ChangeFeed` 事件钩子 | 每次成功写/删后发射 | 无订阅者时为空操作 | 复制与同步引擎订阅 |
-| `BlockFetcher` 接口 | 块读取路径 | 只读本地 CAS | 远程拉取块 |
-| `Store` 接口边界 | S3 API 层仅依赖该接口 | 单机文件系统实现 | 集群实现替换 |
-| `obj_version` + `node_id` | `meta.json` | 单调递增、记录来源节点 | 冲突检测与解决 |
-| `Cluster{}` 配置段 | 配置 | `Mode: single` | 后续模式扩展；未知模式拒绝启动 |
+| `store.Backend` 接口 | `internal/store/backend.go` | `*store.Store` 直接实现，**零额外调用跳转** | `*cluster.Cluster` 实现，内部持有本地 `*store.Store` 作为"副本引擎" |
+| `node_id` | `blink-meta.json` | 首次启动生成并持久化 | 由 `BLINK_NODE_ID` 提供，参与 LWW 决胜 |
+| 放置 | `internal/cluster/ring.go` | 不参与 | 128 vnode 一致性哈希，`Replicas(key, N)` |
+| 块读取 | 块读取路径 | 只读本地 CAS | 本地命中走 `sendfile`，未命中经内部接口流式拉取 |
+| 元数据版本 | `meta.json` | `obj_version` 单调递增 | HLC `(physical_ms, counter)` + `node_id` 决胜 |
+| 配置段 | `internal/config` | `BLINK_CLUSTER_MODE=single`（默认） | `cluster`，启动时强校验 peers/secret/quorum |
 
-**明确不做**：节点发现、成员管理、共识协议、数据复制、跨节点请求转发。
+**单机模式的零开销要求**：不启动内部端口、不启动修复/反熵 goroutine、不建立任何 Peer 客户端、不改变存储格式与写读路径。接口抽取的性能回退必须 <3%（以 `BenchmarkGetRangeSequential`、`BenchmarkList100kObjects` 前后对照为准）。
+
+**集群模式下的既有局限（沿用，不假装解决）**：
+
+- **CAS 去重是每节点内的**：同一内容落到不同节点仍各存一份。副本数 N 本身已把空间放大 N 倍，这是 S3 级别的冗余代价，不是缺陷。
+- **LIST 成本 ×N**：每节点都要扫本机 `meta.json`，集群 LIST 慢于单机（见 05 文档，不承诺 500ms）。
+- **块 GC 仍未实现**：删除对象只删 meta（集群模式写 tombstone），CAS 块不回收；多副本让空间占用更高。
+
+**明确不做**：节点发现、在线成员变更、共识协议（Raft）、跨区域复制、EC 自动换组重编码。
 
 ## 验收要求
 

@@ -18,10 +18,12 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/binbinpeng123/Blink/internal/buildinfo"
+	"github.com/binbinpeng123/Blink/internal/cluster"
 	"github.com/binbinpeng123/Blink/internal/config"
 	"github.com/binbinpeng123/Blink/internal/logx"
 	"github.com/binbinpeng123/Blink/internal/s3api"
@@ -31,6 +33,15 @@ import (
 
 // shutdownTimeout 是优雅关闭的最长等待时间，超过后强杀连接。
 const shutdownTimeout = 10 * time.Second
+
+// serving 描述一个监听端点：S3 端口与（集群模式下的）内部端口
+// 共享同一套启动与优雅关闭流程。
+type serving struct {
+	name string
+	srv  *http.Server
+	ln   net.Listener
+	tls  bool
+}
 
 func main() {
 	if err := run(os.Args[1:], os.Stderr); err != nil {
@@ -60,6 +71,12 @@ func run(args []string, stderr io.Writer) error {
 		attrs = append(attrs, slog.String(k, v))
 	}
 	logger.Info("blink_config", attrs...)
+
+	// 单机模式不读取集群参数，但残留变量的笔误仍要可见：
+	// 静默吞掉会让切到集群模式时才发现配置从未生效。
+	for _, warning := range cfg.ClusterEnvWarnings() {
+		logger.Warn("cluster_env_ignored", slog.String("detail", warning))
+	}
 
 	// TLS 证书在监听之前加载：证书与私钥不匹配时必须拒绝启动，
 	// 而不是先占住端口、在每次握手时才失败 —— 后者会让探活"看起来正常"。
@@ -111,12 +128,33 @@ func run(args []string, stderr io.Writer) error {
 		slog.Bool("verify_read", cfg.VerifyOnRead),
 	)
 
+	// 存储后端按模式二选一：
+	//   single  → *store.Store，调用路径与集群功能引入前逐字节等价；
+	//   cluster → *cluster.Cluster，把对象读写扇出到环上的副本节点。
+	// 两者都满足 store.Backend，s3api 不需要知道自己在哪种模式下运行。
+	var backend store.Backend = st
+	var internalHandler http.Handler
+	var cl *cluster.Cluster
+	if cfg.ClusterMode == config.ClusterModeCluster {
+		cc, err := cfg.ClusterConfig()
+		if err != nil {
+			return fmt.Errorf("构造集群配置失败: %w", err)
+		}
+		cl, err = cluster.New(cc, st, logger)
+		if err != nil {
+			return fmt.Errorf("构造集群后端失败: %w", err)
+		}
+		defer cl.Close()
+		backend = cl
+		internalHandler = cl.InternalHandler()
+	}
+
 	srv := s3api.New(s3api.Options{
 		Logger:       logger,
 		Region:       cfg.Region,
 		Provider:     provider,
 		MaxClockSkew: cfg.MaxClockSkew,
-		Store:        st,
+		Store:        backend,
 	})
 
 	httpSrv := &http.Server{
@@ -131,6 +169,8 @@ func run(args []string, stderr io.Writer) error {
 		httpSrv.TLSConfig = tlsCfg
 	}
 
+	// serving 描述一个监听端点：S3 端口与（集群模式下）内部端口
+	// 共享同一套启动与优雅关闭流程。
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return fmt.Errorf("监听 %s 失败: %w", cfg.Addr, err)
@@ -140,30 +180,55 @@ func run(args []string, stderr io.Writer) error {
 		slog.String("scheme", scheme),
 	)
 
+	servers := []serving{{name: "s3", srv: httpSrv, ln: ln, tls: tlsCfg != nil}}
+
+	// 内部端口只在集群模式监听。单机模式不打开 9100、不建环，
+	// 也不产生任何与集群相关的 goroutine —— 这是"零回归"的直接保证。
+	if internalHandler != nil {
+		internal, err := startClusterInternal(cfg, internalHandler, logger)
+		if err != nil {
+			_ = ln.Close()
+			return err
+		}
+		servers = append(servers, internal)
+	}
+
 	// 收到 SIGINT/SIGTERM 后开始优雅关闭：停止接受新连接，
 	// 等待在途请求完成（最多 shutdownTimeout）。
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	serveErr := make(chan error, 1)
-	go func() {
-		var err error
-		if tlsCfg != nil {
-			// 证书已装入 TLSConfig，certFile/keyFile 传空即可。
-			err = httpSrv.ServeTLS(ln, "", "")
-		} else {
-			err = httpSrv.Serve(ln)
-		}
-		if errors.Is(err, http.ErrServerClosed) {
-			err = nil
-		}
-		serveErr <- err
-	}()
+	serveErr := make(chan error, len(servers))
+	for _, s := range servers {
+		go func(s serving) {
+			var err error
+			if s.tls {
+				// 证书已装入 TLSConfig，certFile/keyFile 传空即可。
+				err = s.srv.ServeTLS(s.ln, "", "")
+			} else {
+				err = s.srv.Serve(s.ln)
+			}
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			if err != nil {
+				err = fmt.Errorf("%s 服务异常退出: %w", s.name, err)
+			}
+			serveErr <- err
+		}(s)
+	}
 
 	select {
 	case err := <-serveErr:
 		if err != nil {
-			return fmt.Errorf("HTTP 服务异常退出: %w", err)
+			// 一个端点异常退出时，把其余的也一并关掉：
+			// 带着半套服务继续跑，比直接退出更难排查。
+			closeCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			for _, s := range servers {
+				_ = s.srv.Shutdown(closeCtx)
+			}
+			cancel()
+			return err
 		}
 		return nil
 	case <-ctx.Done():
@@ -172,14 +237,72 @@ func run(args []string, stderr io.Writer) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("优雅关闭失败: %w", err)
+
+	// 并行关闭：多个端点的等待时间不应叠加，否则滚动升级时
+	// 一个慢连接就能把整个进程的退出拖过 kubelet 的宽限期。
+	var wg sync.WaitGroup
+	shutdownErr := make(chan error, len(servers))
+	for _, s := range servers {
+		wg.Add(1)
+		go func(s serving) {
+			defer wg.Done()
+			if err := s.srv.Shutdown(shutdownCtx); err != nil {
+				shutdownErr <- fmt.Errorf("%s 优雅关闭失败: %w", s.name, err)
+			}
+		}(s)
 	}
-	if err := <-serveErr; err != nil {
-		return fmt.Errorf("HTTP 服务异常退出: %w", err)
+	wg.Wait()
+	close(shutdownErr)
+	for err := range shutdownErr {
+		return err
+	}
+	for range servers {
+		if err := <-serveErr; err != nil {
+			return err
+		}
 	}
 	logger.Info("blink_stopped")
 	return nil
+}
+
+// startClusterInternal 构造并监听节点间内部协议端口。
+//
+// 内部端口刻意使用明文 HTTP：它在可信内网中由 NetworkPolicy 隔离，
+// 请求本身有 HMAC 认证；为它再配一套证书会把边端部署的运维成本
+// 推高到与收益不相称的程度（08 文档）。
+func startClusterInternal(cfg config.Config, handler http.Handler, logger *slog.Logger) (serving, error) {
+	cc, err := cfg.ClusterConfig()
+	if err != nil {
+		return serving{}, fmt.Errorf("构造集群配置失败: %w", err)
+	}
+
+	ln, err := net.Listen("tcp", cc.InternalAddr)
+	if err != nil {
+		return serving{}, fmt.Errorf("监听内部端口 %s 失败: %w", cc.InternalAddr, err)
+	}
+	logger.Info("cluster_internal_listening",
+		slog.String("node_id", cc.NodeID),
+		slog.String("addr", ln.Addr().String()),
+		slog.Int("peers", len(cc.Peers)),
+		slog.Int("replicas", cc.ReplicaCount),
+		slog.Int("write_quorum", cc.WriteQuorum),
+		slog.Int("read_quorum", cc.ReadQuorum),
+		slog.Int("vnodes", cc.VNodes),
+	)
+
+	return serving{
+		name: "internal",
+		srv: &http.Server{
+			Handler: handler,
+			// 内部请求体较小（≤ block-size），头部超时足以挡住慢速攻击。
+			// 不设 WriteTimeout：后续切片会有流式块传输。
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			ErrorLog:          newServeErrorLog(logger),
+		},
+		ln:  ln,
+		tls: false,
+	}, nil
 }
 
 // logTLSInfo 输出证书的公开信息（主题、SAN、到期时间）。

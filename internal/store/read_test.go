@@ -10,7 +10,7 @@ import (
 )
 
 // readRange 读取对象的一段并返回字符串。
-func readRange(t *testing.T, r *ObjectReader, offset, length int64) string {
+func readRange(t *testing.T, r Reader, offset, length int64) string {
 	t.Helper()
 	var buf bytes.Buffer
 	if err := r.WriteRangeTo(&buf, offset, length); err != nil {

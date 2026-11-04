@@ -186,6 +186,14 @@ var bucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
 // 与 AWS 一致：1024 字节。
 const maxKeyBytes = 1024
 
+// ValidateBucketName 校验 bucket 名。
+//
+// 集群层在发起跨节点请求之前必须先做与单机相同的校验：非法名字不该被
+// 广播到整个集群，也不该在远端被拒绝后才以 500 的形式暴露出来。
+func ValidateBucketName(name string) error {
+	return validateBucketName(name)
+}
+
 // validateBucketName 校验 bucket 名。
 func validateBucketName(name string) error {
 	if !bucketNameRe.MatchString(name) {
@@ -329,11 +337,31 @@ func (s *Store) objectRoot(bucket string) string {
 	return joinPath(s.bucketDir(bucket), objectsDirName)
 }
 
+// BucketIsEmpty 报告桶在**逻辑上**是否为空（无对象、无进行中的分片上传）。
+//
+// 与 DeleteBucket 内部的判空唯一区别是它先校验 bucket 名与桶是否存在，
+// 供集群层的 bucket-status 内部接口使用。
+func (s *Store) BucketIsEmpty(bucket string) (bool, error) {
+	if err := validateBucketName(bucket); err != nil {
+		return false, err
+	}
+	if _, err := s.loadBucketMeta(bucket); err != nil {
+		return false, err
+	}
+	return s.bucketIsEmpty(bucket)
+}
+
 // bucketIsEmpty 报告桶内是否既没有对象、也没有进行中的分片上传。
 //
 // 必须同时检查分片上传（02 文档）：只删掉对象就允许删桶，会让仍在
 // 上传的客户端在 Complete 时撞上一个不存在的桶，而不是得到
 // "桶非空"这个可理解的拒绝。
+//
+// 墓碑不算对象：集群删除留下的是"这个 key 已被删除"的记录，没有可
+// 丢失的数据；删桶会连同墓碑目录一起移除，正是期望的结果。否则一个
+// 清空过的桶将永远无法删除，直到后续切片的墓碑 GC 跑过为止。
+// 目录在而 meta.json 不在则相反，按非空处理 —— 那是写入进行中的中间态，
+// 保守拒绝删除比让一次并发 PUT 写进已删除的桶要好。
 func (s *Store) bucketIsEmpty(bucket string) (bool, error) {
 	root := s.objectRoot(bucket)
 	prefixes, err := s.fs.ReadDir(root)
@@ -351,8 +379,20 @@ func (s *Store) bucketIsEmpty(bucket string) (bool, error) {
 		if err != nil {
 			return false, fsErr("读取对象目录", bucket, err)
 		}
-		if len(objs) > 0 {
-			return false, nil
+		for _, o := range objs {
+			if !o.IsDir() {
+				continue // 与 LIST 一致：只认 <shard>/<hash>/ 这一种结构
+			}
+			m, err := s.readReplicaEntryAt(joinPath(root, p.Name(), o.Name(), objectMetaFileName))
+			if errors.Is(err, fs.ErrNotExist) {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			if !m.Deleted {
+				return false, nil
+			}
 		}
 	}
 	has, err := s.bucketHasUploads(bucket)

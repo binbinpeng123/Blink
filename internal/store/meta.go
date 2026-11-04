@@ -147,7 +147,10 @@ func (s *Store) dropBucketMeta(bucket string) {
 	delete(s.buckets, bucket)
 }
 
-// objectMeta 是对象目录下 meta.json 的内容，即 03 文档的字段表。
+// ObjectMeta 是对象目录下 meta.json 的内容，即 03 文档的字段表。
+//
+// 导出类型是集群层的需要：副本之间搬运的就是这份结构，集群模块必须能
+// 构造、比较并序列化它。单机路径的字段语义没有任何变化。
 //
 // 块描述**内嵌**在这个文件里，而不是单独的 blocks.bin：一次写入只有一个
 // 文件被 rename，因此"对象可见"与"块表完整"必然同时成立。拆成两个文件
@@ -158,7 +161,7 @@ func (s *Store) dropBucketMeta(bucket string) {
 // 按本结构约 30 MB JSON —— 超过 readFile 的 32 MiB 上限，属于已知限制
 // （见 known-limitations.md）。v1 的单次 PUT 上限是 5 GiB，约 1300 块、
 // 约 150 KB，远在安全范围内。
-type objectMeta struct {
+type ObjectMeta struct {
 	Version     int       `json:"version"`
 	Key         string    `json:"key"`
 	Size        int64     `json:"size"`
@@ -168,7 +171,7 @@ type objectMeta struct {
 	// UserMeta 原样保存 x-amz-meta-* 的值。
 	UserMeta map[string]string `json:"user_meta,omitempty"`
 	// Blocks 是**有序**块描述列表：顺序即对象内容的顺序。
-	Blocks []blockDesc `json:"blocks"`
+	Blocks []BlockDesc `json:"blocks"`
 	// Checksum 是客户端声明的对象级校验和（base64）；未声明时为空。
 	// 它是 base64 文本而非二进制，因为回传时要逐字节还原客户端的值。
 	Checksum string `json:"checksum,omitempty"`
@@ -187,13 +190,27 @@ type objectMeta struct {
 	// 单节点下它只用于观测"这个 key 被覆盖过几次"，但它同时是
 	// 分布式场景判断"哪份更新"的依据，因此 v1 就开始记录。
 	ObjVersion uint64 `json:"obj_version"`
+	// Deleted 标记这是一条删除墓碑（tombstone），而不是一个仍在的对象。
+	//
+	// 集群删除不能直接抹掉各节点的 meta：删除时不可达的节点恢复后会
+	// 带着旧副本回来，"对象被删了又出现"是最难向用户解释的一类错误。
+	// 墓碑保留 (ObjVersion, NodeID) 这组版本信息，任何比它旧的写回都会
+	// 被 PutReplicaMeta 拒绝，因此旧副本无法复活。
+	//
+	// 墓碑只有版本，没有内容：Size=0、Blocks 为空、ETag/ContentType 为空。
+	// 物理回收由后续切片的确定性 owner 在确认全副本不旧于墓碑后完成。
+	Deleted bool `json:"deleted,omitempty"`
 }
 
-// blockDesc 描述对象中的一个块。
+// objectMeta 是包内沿用的短名。用别名而不是第二个结构体：
+// 两者必须是同一个类型，否则读写路径会在编译期就被迫区分两份定义。
+type objectMeta = ObjectMeta
+
+// BlockDesc 描述对象中的一个块。
 //
 // Hash 既是 CAS 的定位键，也是完整性凭据：读取时重算内容哈希与它比对，
 // 就能发现"文件还在但内容变了"（03 文档的"完整性自校验"）。
-type blockDesc struct {
+type BlockDesc struct {
 	Hash   string `json:"hash"`
 	Offset int64  `json:"offset"`
 	Length int64  `json:"length"`

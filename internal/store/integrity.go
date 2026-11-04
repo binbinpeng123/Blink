@@ -28,7 +28,7 @@ import (
 // 必须先读完再返回：块级校验和覆盖整块，只读其中一段无法验证。
 // 调用方拿到已校验的字节后才可以写向客户端 —— 边读边写会让损坏的
 // 数据先一步到达网络上，而 HTTP 响应发出后无法撤回。
-func (s *Store) readBlockVerified(f io.Reader, b blockDesc) ([]byte, error) {
+func (s *Store) readBlockVerified(f io.Reader, b BlockDesc) ([]byte, error) {
 	data := make([]byte, b.Length)
 	if _, err := io.ReadFull(f, data); err != nil {
 		return nil, fmt.Errorf("%w: 读取块 %s 失败: %v", ErrCorrupt, b.Hash, err)
@@ -70,7 +70,7 @@ func (s *Store) ScrubObject(bucket, key string) error {
 }
 
 // scrubBlock 校验单个块。
-func (s *Store) scrubBlock(b blockDesc) error {
+func (s *Store) scrubBlock(b BlockDesc) error {
 	path := s.casPath(b.Hash)
 	f, err := s.fs.Open(path)
 	if err != nil {

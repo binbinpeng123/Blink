@@ -71,13 +71,16 @@ type ListResult struct {
 // 这是 03 文档标注的最大性能风险（创新 D 小对象打包要解决的问题）。
 //
 // 切片 9 在不改变"仍要读全部元数据"这一前提下削减了两项成本：
-// 分片之间并行扫描（readAllObjectMetas），以及 LIST 只解码它用到的字段
-// （listMeta）。前后对照见 docs/05 与 SESSION_MEMORY 中的基准数字。
+// 分片之间并行扫描（readAllEntries），以及 LIST 只解码它用到的字段
+// （ReplicaEntry）。前后对照见 docs/05 与 SESSION_MEMORY 中的基准数字。
 //
 // 一致性：读取的是"某一时刻的目录快照"。并发写入要么以完整 meta.json
 // 出现、要么不出现（写入以原子 rename 提交）；并发删除表现为某个
 // meta.json 读取时已不存在，此时跳过该对象而不是让整个 LIST 失败。
 // 因此结果是强一致的（不会看到半个对象），但不保证是某个单一瞬间的快照。
+//
+// 分页本身交给 PageObjects：集群 LIST 归并各节点结果后走的是同一份代码，
+// 单机与集群的分页边界不可能出现两套实现的分歧。
 func (s *Store) ListObjects(bucket string, opt ListOptions) (*ListResult, error) {
 	if err := validateBucketName(bucket); err != nil {
 		return nil, err
@@ -87,23 +90,52 @@ func (s *Store) ListObjects(bucket string, opt ListOptions) (*ListResult, error)
 	if _, err := s.loadBucketMeta(bucket); err != nil {
 		return nil, err
 	}
-
-	res := &ListResult{}
 	if opt.MaxKeys <= 0 {
-		return res, nil
+		return &ListResult{}, nil
 	}
 
-	metas, err := s.readAllObjectMetas(bucket)
+	entries, err := s.readAllEntries(bucket)
 	if err != nil {
 		return nil, err
 	}
+	objs := make([]ListObject, 0, len(entries))
+	for _, e := range entries {
+		if e.Deleted {
+			// 单机路径不会产生墓碑，但集群模式下同一个数据目录也可能
+			// 被副本引擎写入：墓碑对用户不可见，与"已删除"完全等价。
+			continue
+		}
+		objs = append(objs, ListObject{
+			Key:      e.Key,
+			Size:     e.Size,
+			ETag:     e.ETag,
+			Modified: e.Modified,
+		})
+	}
+	return PageObjects(objs, opt), nil
+}
+
+// PageObjects 对一组对象摘要做过滤、折叠与分页。
+//
+// 单机与集群 LIST 的唯一差别是"对象集合从哪里来"，分页算法必须是同一份
+// 代码：否则同一条 max-keys 在不同部署下会切在不同位置，跨分页边界的
+// 丢条/重条只在其中一种形态下出现。
+//
+// objs 会被原地按 key 排序，调用方必须传入自己独占的切片。
+func PageObjects(objs []ListObject, opt ListOptions) *ListResult {
+	res := &ListResult{}
+	if opt.MaxKeys <= 0 {
+		// S3 的 max-keys=0 返回空页且不截断；若这里回 IsTruncated=true，
+		// 客户端会带着同一个游标无限翻页。
+		return res
+	}
 	// Go 的字符串比较就是逐字节比较，因此这里天然满足 02 文档要求的
 	// UTF-8 字节序（不是 locale 序，也不是 rune 序）。
-	sort.Slice(metas, func(i, j int) bool { return metas[i].Key < metas[j].Key })
+	sort.Slice(objs, func(i, j int) bool { return objs[i].Key < objs[j].Key })
 
 	var last ListCursor
-	for _, m := range metas {
-		key := m.Key
+	for _, o := range objs {
+		key := o.Key
 		if opt.Prefix != "" && !strings.HasPrefix(key, opt.Prefix) {
 			continue
 		}
@@ -136,12 +168,7 @@ func (s *Store) ListObjects(bucket string, opt ListOptions) (*ListResult, error)
 			res.IsTruncated = true
 			break
 		}
-		res.Objects = append(res.Objects, ListObject{
-			Key:      key,
-			Size:     m.Size,
-			ETag:     m.ETag,
-			Modified: m.Modified,
-		})
+		res.Objects = append(res.Objects, o)
 		res.KeyCount++
 		last = ListCursor{After: key}
 	}
@@ -150,7 +177,7 @@ func (s *Store) ListObjects(bucket string, opt ListOptions) (*ListResult, error)
 		next := last
 		res.Next = &next
 	}
-	return res, nil
+	return res
 }
 
 // pastCursor 判断 key 是否晚于请求的起始位置。
@@ -176,24 +203,46 @@ func pastCursor(key string, opt ListOptions) bool {
 	return true
 }
 
-// listMeta 是 LIST 需要的全部对象元数据。
+// ReplicaEntry 是 LIST 需要的全部对象元数据。
 //
 // 刻意不复用 objectMeta：完整结构里的 blocks 在真实负载下可能很大
 // （4 MiB 块、64 MiB 对象就有 16 条块描述，GB 级对象上千条），而清单
 // 一条也用不到。encoding/json 对结构体里没有的字段仍然要扫描 token，
-// 但不再为每个块分配 blockDesc、也不再解转义哈希字符串 —— 对象越大，
+// 但不再为每个块分配 BlockDesc、也不再解转义哈希字符串 —— 对象越大，
 // 省下的分配与解析时间越多。
+//
+// NodeID/ObjVersion/Deleted 是集群 LIST 的必需品：同一 key 可能在多个
+// 节点各有一份不同版本的副本，协调者必须知道谁更新；墓碑必须与活对象
+// 一起返回，否则"已删除的 key 从某个节点漏出来"。
 //
 // 这不改变"目录布局是稳定契约"这一事实：字段名与 objectMeta 一致，
 // 缺字段/字段类型错误照样在解码时失败并报 ErrCorrupt。
-type listMeta struct {
-	Key      string    `json:"key"`
-	Size     int64     `json:"size"`
-	ETag     string    `json:"etag"`
-	Modified time.Time `json:"modified"`
+type ReplicaEntry struct {
+	Key        string    `json:"key"`
+	Size       int64     `json:"size"`
+	ETag       string    `json:"etag"`
+	Modified   time.Time `json:"modified"`
+	NodeID     string    `json:"node_id"`
+	ObjVersion uint64    `json:"obj_version"`
+	Deleted    bool      `json:"deleted,omitempty"`
 }
 
-// readAllObjectMetas 读出桶内全部对象元数据。
+// ScanReplicaEntries 读出桶内全部副本条目，**包含 tombstone**。
+//
+// 集群 LIST 需要墓碑才能保证"一个节点上已删除、另一个节点上还残留旧副本"
+// 时结果仍是删除；过滤墓碑是合并完成后的事（见 cluster.list）。
+// 顺序未定义 —— 调用方按 key 归并。
+func (s *Store) ScanReplicaEntries(bucket string) ([]ReplicaEntry, error) {
+	if err := validateBucketName(bucket); err != nil {
+		return nil, err
+	}
+	if _, err := s.loadBucketMeta(bucket); err != nil {
+		return nil, err
+	}
+	return s.readAllEntries(bucket)
+}
+
+// readAllEntries 读出桶内全部副本条目。
 //
 // 目录布局为 objects/<hash 前 2 位>/<hash>/meta.json（见 paths.go）。
 // 目录名与 meta 里的 Key 必须互相印证：不一致意味着有人手工动过数据目录，
@@ -205,7 +254,7 @@ type listMeta struct {
 // 串行扫描等于把本地盘的队列深度浪费到 1。结果按分片序拼回，
 // worker 之间不共享切片，无需加锁；错误也按分片序挑第一个，
 // 使并发下的失败原因可复现。
-func (s *Store) readAllObjectMetas(bucket string) ([]listMeta, error) {
+func (s *Store) readAllEntries(bucket string) ([]ReplicaEntry, error) {
 	root := s.objectRoot(bucket)
 	shards, err := s.fs.ReadDir(root)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -227,12 +276,12 @@ func (s *Store) readAllObjectMetas(bucket string) ([]listMeta, error) {
 		return nil, nil
 	}
 
-	parts := make([][]listMeta, len(names))
+	parts := make([][]ReplicaEntry, len(names))
 	errs := make([]error, len(names))
 	workers := listScanWorkers(len(names))
 	if workers <= 1 {
 		for i, name := range names {
-			parts[i], errs[i] = s.readShardMetas(root, name)
+			parts[i], errs[i] = s.readShardEntries(root, name)
 		}
 	} else {
 		var wg sync.WaitGroup
@@ -242,7 +291,7 @@ func (s *Store) readAllObjectMetas(bucket string) ([]listMeta, error) {
 			go func() {
 				defer wg.Done()
 				for i := range next {
-					parts[i], errs[i] = s.readShardMetas(root, names[i])
+					parts[i], errs[i] = s.readShardEntries(root, names[i])
 				}
 			}()
 		}
@@ -260,11 +309,11 @@ func (s *Store) readAllObjectMetas(bucket string) ([]listMeta, error) {
 		}
 		total += len(parts[i])
 	}
-	metas := make([]listMeta, 0, total)
+	entries := make([]ReplicaEntry, 0, total)
 	for _, p := range parts {
-		metas = append(metas, p...)
+		entries = append(entries, p...)
 	}
-	return metas, nil
+	return entries, nil
 }
 
 // listScanWorkers 返回扫描分片时使用的并发度。
@@ -286,8 +335,8 @@ func listScanWorkers(shards int) int {
 	return n
 }
 
-// readShardMetas 扫描一个分片目录下的全部对象。
-func (s *Store) readShardMetas(root, shardName string) ([]listMeta, error) {
+// readShardEntries 扫描一个分片目录下的全部对象。
+func (s *Store) readShardEntries(root, shardName string) ([]ReplicaEntry, error) {
 	entries, err := s.fs.ReadDir(joinPath(root, shardName))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil // 并发删除让整个分片目录消失
@@ -295,13 +344,13 @@ func (s *Store) readShardMetas(root, shardName string) ([]listMeta, error) {
 	if err != nil {
 		return nil, fsErr("读取对象分片目录", shardName, err)
 	}
-	out := make([]listMeta, 0, len(entries))
+	out := make([]ReplicaEntry, 0, len(entries))
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		metaPath := joinPath(root, shardName, e.Name(), objectMetaFileName)
-		m, err := s.readListMetaAt(metaPath)
+		m, err := s.readReplicaEntryAt(metaPath)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue // 并发删除：对象在遍历途中没了
 		}
@@ -318,19 +367,19 @@ func (s *Store) readShardMetas(root, shardName string) ([]listMeta, error) {
 	return out, nil
 }
 
-// readListMetaAt 按路径读取 LIST 需要的字段。
+// readReplicaEntryAt 按路径读取 LIST 需要的字段。
 //
 // 错误语义与 readObjectMetaAt 一致：文件不存在时满足
 // errors.Is(err, fs.ErrNotExist)（并发删除，由调用方跳过），
 // 解析失败一律是 ErrCorrupt。
-func (s *Store) readListMetaAt(path string) (listMeta, error) {
+func (s *Store) readReplicaEntryAt(path string) (ReplicaEntry, error) {
 	data, err := readFile(s.fs, path)
 	if err != nil {
-		return listMeta{}, err
+		return ReplicaEntry{}, err
 	}
-	var m listMeta
+	var m ReplicaEntry
 	if err := json.Unmarshal(data, &m); err != nil {
-		return listMeta{}, fmt.Errorf("%w: 对象元数据 %s 不是合法 JSON: %v", ErrCorrupt, path, err)
+		return ReplicaEntry{}, fmt.Errorf("%w: 对象元数据 %s 不是合法 JSON: %v", ErrCorrupt, path, err)
 	}
 	return m, nil
 }
