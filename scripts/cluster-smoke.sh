@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# 集群冒烟：在本机起 N 个 blink 进程，验证切片 3 的跨节点读写能力。
+# 集群冒烟：在本机起 N 个 blink 进程，验证跨节点读写、LIST 与桶控制面。
 #
 # 覆盖项：
-#   - 每个节点各自建桶后，任一节点写入、其余节点读出，内容逐字节一致；
+#   - 桶只在 1 个节点创建，其余节点立即可见（重复创建回 409）；
+#   - 任一节点写入、其余节点读出，内容逐字节一致；
 #   - 跨块 Range 读取；
 #   - 覆盖写后所有节点收敛到新内容；
-#   - 删除后所有节点立即 404；
+#   - 删除后所有节点立即 404，且 LIST 不再返回该 key；
+#   - 任意节点的 LIST 结果与对象集合一致（含 prefix/delimiter）；
+#   - CORS 配置写入 1 个节点后其余节点可读；
+#   - 非空桶删除被拒；清空后删桶对所有节点生效；
 #   - 杀掉 1 个节点后仍可读写（W=2 / R=2 仍可满足）；
 #   - 杀掉 2 个节点后读写回 503，而不是假装对象不存在。
 #
@@ -120,12 +124,21 @@ for i in $(seq 0 $((N - 1))); do
   [[ -n "$ready" ]] || fail "节点 $((i + 1)) 未在 10 秒内就绪"
 done
 
-# 切片 3 的桶控制面仍只作用于本节点，因此每个节点都要建一次桶。
-echo "==> 在每个节点上创建桶 ${BUCKET}"
+echo "==> 只在节点 1 建桶，验证广播到其余节点"
+aws_at 0 s3api create-bucket --bucket "$BUCKET" >/dev/null \
+  || fail "节点 1 建桶失败"
 for i in $(seq 0 $((N - 1))); do
-  aws_at "$i" s3api create-bucket --bucket "$BUCKET" >/dev/null \
-    || fail "节点 $((i + 1)) 建桶失败"
+  aws_at "$i" s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1 \
+    || fail "节点 $((i + 1)) 看不到桶 ${BUCKET}（建桶未广播）"
+  aws_at "$i" s3api list-buckets --query 'Buckets[].Name' --output text \
+    | tr '\t' '\n' | grep -qx "$BUCKET" \
+    || fail "节点 $((i + 1)) 的 list-buckets 缺少 ${BUCKET}"
 done
+if OUT="$(aws_at 2 s3api create-bucket --bucket "$BUCKET" 2>&1)"; then
+  fail "在节点 3 重复建桶应失败，实际成功"
+fi
+grep -q "BucketAlreadyOwnedByYou" <<<"$OUT" \
+  || fail "重复建桶错误不是 BucketAlreadyOwnedByYou: ${OUT}"
 
 echo "==> 生成测试对象"
 PAYLOAD="$TMP_DIR/payload.bin"
@@ -174,12 +187,83 @@ for i in $(seq 0 $((N - 1))); do
     || fail "节点 $((i + 1)) 未收敛到覆盖后的内容"
 done
 
-echo "==> 删除后所有节点立即 404"
+# 跨节点 LIST：每个节点看到的对象集合必须完全相同。
+# 对象轮流经不同节点写入，副本散落在不同节点上，归并逻辑只要漏一份就会露馅。
+echo "==> 跨节点 LIST"
+for i in 0 1 2; do
+  aws_at "$i" s3api put-object --bucket "$BUCKET" --key "dir/obj-$i.bin" \
+    --body "$TMP_DIR/small.bin" >/dev/null || fail "节点 $((i + 1)) 写入 dir/obj-$i.bin 失败"
+done
+
+list_keys() {
+  # $1 = 节点序号；过滤掉空结果时 aws-cli 输出的 None。
+  aws_at "$1" s3api list-objects-v2 --bucket "$BUCKET" \
+    --query 'Contents[].Key' --output text 2>/dev/null \
+    | tr '\t' '\n' | grep -vx 'None' | sed '/^$/d' | sort
+}
+WANT_KEYS="$(printf '%s\n' big.bin dir/obj-0.bin dir/obj-1.bin dir/obj-2.bin small.bin | sort)"
+for i in $(seq 0 $((N - 1))); do
+  GOT_KEYS="$(list_keys "$i")"
+  [[ "$GOT_KEYS" == "$WANT_KEYS" ]] \
+    || fail "节点 $((i + 1)) 的 LIST 结果不符\n期望:\n${WANT_KEYS}\n实际:\n${GOT_KEYS}"
+done
+
+# delimiter 折叠必须在归并之后进行：三个 dir/ 对象只应产生一个 CommonPrefix。
+PREFIXES="$(aws_at 1 s3api list-objects-v2 --bucket "$BUCKET" --delimiter / \
+  --query 'CommonPrefixes[].Prefix' --output text | tr '\t' '\n' | grep -vx 'None' | sort)"
+[[ "$PREFIXES" == "dir/" ]] || fail "delimiter 折叠结果 = [${PREFIXES}]，期望 [dir/]"
+
+echo "==> CORS 广播"
+CORS_JSON="$TMP_DIR/cors.json"
+cat >"$CORS_JSON" <<'JSON'
+{"CORSRules":[{"ID":"smoke","AllowedOrigins":["https://example.com"],
+"AllowedMethods":["GET","PUT"],"AllowedHeaders":["*"]}]}
+JSON
+aws_at 0 s3api put-bucket-cors --bucket "$BUCKET" --cors-configuration "file://$CORS_JSON" >/dev/null \
+  || fail "节点 1 写入 CORS 失败"
+for i in $(seq 0 $((N - 1))); do
+  GET_CORS="$(aws_at "$i" s3api get-bucket-cors --bucket "$BUCKET" \
+    --query 'CORSRules[0].ID' --output text)"
+  [[ "$GET_CORS" == "smoke" ]] || fail "节点 $((i + 1)) 的 CORS = ${GET_CORS}，期望 smoke"
+done
+
+echo "==> 删除后所有节点立即 404，且 LIST 消失"
 aws_at 1 s3api delete-object --bucket "$BUCKET" --key small.bin >/dev/null \
   || fail "删除失败"
 for i in $(seq 0 $((N - 1))); do
   if aws_at "$i" s3api head-object --bucket "$BUCKET" --key small.bin >/dev/null 2>&1; then
     fail "节点 $((i + 1)) 删除后仍能 HEAD 到对象"
+  fi
+  # 墓碑必须参与归并：某个节点还留着删除前的活副本时，不能把它列出来。
+  if list_keys "$i" | grep -qx "small.bin"; then
+    fail "节点 $((i + 1)) 的 LIST 仍返回已删除的 small.bin"
+  fi
+done
+
+# 桶删除是整集群操作：空判定必须覆盖全部节点，删除也要落到全部节点。
+echo "==> 桶删除：非空拒绝，清空后全集群生效"
+META_BUCKET="${BUCKET}-meta"
+aws_at 1 s3api create-bucket --bucket "$META_BUCKET" >/dev/null \
+  || fail "建桶 ${META_BUCKET} 失败"
+aws_at 2 s3api put-object --bucket "$META_BUCKET" --key keep.bin \
+  --body "$TMP_DIR/small.bin" >/dev/null || fail "写入 ${META_BUCKET}/keep.bin 失败"
+
+if OUT="$(aws_at 0 s3api delete-bucket --bucket "$META_BUCKET" 2>&1)"; then
+  fail "非空桶删除应失败，实际成功"
+fi
+grep -q "BucketNotEmpty" <<<"$OUT" || fail "非空桶删除错误不是 BucketNotEmpty: ${OUT}"
+
+aws_at 0 s3api delete-object --bucket "$META_BUCKET" --key keep.bin >/dev/null \
+  || fail "删除 ${META_BUCKET}/keep.bin 失败"
+aws_at 2 s3api delete-bucket --bucket "$META_BUCKET" >/dev/null \
+  || fail "清空后删桶失败"
+for i in $(seq 0 $((N - 1))); do
+  if aws_at "$i" s3api head-bucket --bucket "$META_BUCKET" >/dev/null 2>&1; then
+    fail "节点 $((i + 1)) 删除后仍能看到桶 ${META_BUCKET}"
+  fi
+  if aws_at "$i" s3api list-buckets --query 'Buckets[].Name' --output text \
+    | tr '\t' '\n' | grep -qx "$META_BUCKET"; then
+    fail "节点 $((i + 1)) 的 list-buckets 仍包含 ${META_BUCKET}"
   fi
 done
 
@@ -194,6 +278,14 @@ aws_at 1 s3api get-object --bucket "$BUCKET" --key degraded.bin "$TMP_DIR/degrad
   || fail "1 个节点宕机后读取失败（R=2 应仍可满足）"
 cmp -s "$TMP_DIR/small.bin" "$TMP_DIR/degraded.got" \
   || fail "1 个节点宕机后读到的内容不一致"
+
+# 删桶与对象数据面相反：任一节点不可达就拒绝，否则宕机节点可能带着
+# 旧桶（与旧对象）回归，造出"桶删了却还能读到数据"的状态。
+if OUT="$(aws_at 0 s3api delete-bucket --bucket "$BUCKET" 2>&1)"; then
+  fail "节点宕机时删桶应失败，实际成功"
+fi
+grep -q "ServiceUnavailable\|503" <<<"$OUT" \
+  || fail "节点宕机时删桶错误不是 503: ${OUT}"
 
 echo "==> 杀掉第 2 个节点后应返回 503"
 kill -9 "${PIDS[1]}" 2>/dev/null || true

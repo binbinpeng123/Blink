@@ -143,12 +143,23 @@ func readAll(t *testing.T, cl *Cluster, bucket, key string) []byte {
 	return buf.Bytes()
 }
 
+// createBucketOnAll 在第一个节点建桶，并验证它已广播到每个节点。
+//
+// 桶是集群范围的命名空间：逐个节点建会得到 ErrBucketExists，
+// 因此"建一次、处处可见"本身就是本切片要验证的行为。
 func createBucketOnAll(t *testing.T, nodes []*testNode, bucket string) {
 	t.Helper()
+	if err := nodes[0].cl.CreateBucket(bucket); err != nil {
+		t.Fatalf("节点 %s 建桶失败: %v", nodes[0].id, err)
+	}
 	for _, n := range nodes {
-		if err := n.cl.CreateBucket(bucket); err != nil {
-			t.Fatalf("节点 %s 建桶失败: %v", n.id, err)
+		ok, err := n.st.BucketExists(bucket)
+		if err != nil || !ok {
+			t.Fatalf("节点 %s 未收到桶 %s 的广播（exists=%v err=%v）", n.id, bucket, ok, err)
 		}
+	}
+	if err := nodes[len(nodes)-1].cl.CreateBucket(bucket); !errors.Is(err, store.ErrBucketExists) {
+		t.Fatalf("重复建桶错误 = %v，期望 ErrBucketExists", err)
 	}
 }
 
@@ -326,9 +337,10 @@ func TestReplicatedDelete(t *testing.T) {
 			t.Errorf("节点 %s 删除后读取错误 = %v，期望 ErrNoSuchKey", n.id, err)
 		}
 	}
-	// 删除是幂等的：再删一次仍是 NoSuchKey，而不是副本数量不足。
-	if err := nodes[0].cl.DeleteObject(bucket, key); !errors.Is(err, store.ErrNoSuchKey) {
-		t.Errorf("重复删除错误 = %v，期望 ErrNoSuchKey", err)
+	// 删除是幂等的：对象已经在墓碑状态下，再删一次仍然成功
+	// （S3 的 DELETE 对不存在的 key 返回 204，客户端重试不该失败）。
+	if err := nodes[0].cl.DeleteObject(bucket, key); err != nil {
+		t.Errorf("重复删除错误 = %v，期望 nil", err)
 	}
 }
 

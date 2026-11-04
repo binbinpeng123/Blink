@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/binbinpeng123/Blink/internal/store"
 )
@@ -22,8 +23,13 @@ import (
 // 语义最清楚。
 
 const (
-	pathBlock = "/internal/v1/block"
-	pathMeta  = "/internal/v1/meta"
+	pathBlock       = "/internal/v1/block"
+	pathMeta        = "/internal/v1/meta"
+	pathList        = "/internal/v1/list"
+	pathBucket      = "/internal/v1/bucket"
+	pathBucketState = "/internal/v1/bucket-status"
+	pathBuckets     = "/internal/v1/buckets"
+	pathCORS        = "/internal/v1/cors"
 )
 
 // handleBlock 同时处理块的写入（POST）与读取（GET）。
@@ -231,8 +237,204 @@ func (s *Server) handleMetaDelete(w http.ResponseWriter, r *http.Request) {
 // Found 与 Meta 必须同时传递：meta 为 nil 但 found=true 在协议上不可能
 // 出现，写出两个字段让调用方无需猜测。
 type metaResponse struct {
-	Found bool             `json:"found"`
+	Found bool              `json:"found"`
 	Meta  *store.ObjectMeta `json:"meta,omitempty"`
+}
+
+// listResponse 是 GET /internal/v1/list 的响应。
+//
+// Bucket 与 Entries 分开：「本节点没有这个桶」是正常响应（200 +
+// bucket=false），不是故障；协调者据此判断 NoSuchBucket，而只有真正
+// 的 I/O 错误才应让该节点退出法定人数统计。
+type listResponse struct {
+	Bucket  bool                 `json:"bucket"`
+	Entries []store.ReplicaEntry `json:"entries,omitempty"`
+}
+
+// bucketInfo 是 GET /internal/v1/bucket 的响应。
+type bucketInfo struct {
+	Exists    bool      `json:"exists"`
+	CreatedAt time.Time `json:"created_at,omitzero"`
+}
+
+// bucketState 是 GET /internal/v1/bucket-status 的响应。
+//
+// Empty 只在 Exists=true 时有意义：不存在的桶没有"空不空"可言。
+type bucketState struct {
+	Exists bool `json:"exists"`
+	Empty  bool `json:"empty"`
+}
+
+// bucketsResponse 是 GET /internal/v1/buckets 的响应。
+type bucketsResponse struct {
+	Buckets []string `json:"buckets"`
+}
+
+// corsResponse 是 GET /internal/v1/cors 的响应。
+//
+// Found=false 表示"桶在但没有配置"，与 404 "桶不存在" 是两件事。
+type corsResponse struct {
+	Found  bool                     `json:"found"`
+	Config *store.CORSConfiguration `json:"config,omitempty"`
+}
+
+// handleList 返回本节点持有的、桶内全部副本条目（**含墓碑**）。
+//
+// 返回墓碑而不是过滤掉：同一个 key 在 A 上已删除、在 B 上还残留旧副本时，
+// 协调者必须看到墓碑才能判定最终状态是"不存在"。过滤只能在全集群归并后做。
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
+		return
+	}
+	bucket := r.URL.Query().Get("bucket")
+	if err := store.ValidateBucketName(bucket); err != nil {
+		s.writeStoreError(w, "校验桶名", err)
+		return
+	}
+	exists, err := s.store.BucketExists(bucket)
+	if err != nil {
+		s.writeStoreError(w, "检查桶", err)
+		return
+	}
+	if !exists {
+		writeJSON(w, http.StatusOK, listResponse{})
+		return
+	}
+	entries, err := s.store.ScanReplicaEntries(bucket)
+	if err != nil {
+		s.writeStoreError(w, "扫描桶", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, listResponse{Bucket: true, Entries: entries})
+}
+
+// handleBucket 同时处理桶的查询、创建与删除。
+//
+// PUT/DELETE 都是幂等的：广播会被重试，节点也可能收到重复请求。
+// "已经存在"与"本来就没有"在控制面上都是成功 —— 真正需要报错的是
+// "桶非空"和 I/O 失败。
+func (s *Server) handleBucket(w http.ResponseWriter, r *http.Request) {
+	bucket := r.URL.Query().Get("bucket")
+	switch r.Method {
+	case http.MethodGet:
+		if err := store.ValidateBucketName(bucket); err != nil {
+			s.writeStoreError(w, "校验桶名", err)
+			return
+		}
+		created, err := s.store.BucketCreatedAt(bucket)
+		if errors.Is(err, store.ErrBucketNotFound) {
+			writeJSON(w, http.StatusOK, bucketInfo{})
+			return
+		}
+		if err != nil {
+			s.writeStoreError(w, "读取桶元数据", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, bucketInfo{Exists: true, CreatedAt: created})
+	case http.MethodPut:
+		if err := s.store.CreateBucket(bucket); err != nil && !errors.Is(err, store.ErrBucketExists) {
+			s.writeStoreError(w, "创建桶", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case http.MethodDelete:
+		if err := s.store.DeleteBucket(bucket); err != nil && !errors.Is(err, store.ErrBucketNotFound) {
+			s.writeStoreError(w, "删除桶", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut+", "+http.MethodDelete)
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
+	}
+}
+
+// handleBucketState 返回桶是否存在于本节点、以及本节点视角下是否为空。
+func (s *Server) handleBucketState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
+		return
+	}
+	bucket := r.URL.Query().Get("bucket")
+	exists, err := s.store.BucketExists(bucket)
+	if err != nil {
+		s.writeStoreError(w, "检查桶", err)
+		return
+	}
+	if !exists {
+		writeJSON(w, http.StatusOK, bucketState{})
+		return
+	}
+	empty, err := s.store.BucketIsEmpty(bucket)
+	if err != nil {
+		s.writeStoreError(w, "检查桶是否为空", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, bucketState{Exists: true, Empty: empty})
+}
+
+// handleBuckets 返回本节点的桶名列表。
+func (s *Server) handleBuckets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
+		return
+	}
+	names, err := s.store.ListBuckets()
+	if err != nil {
+		s.writeStoreError(w, "列举桶", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, bucketsResponse{Buckets: names})
+}
+
+// handleCORS 同时处理桶级 CORS 配置的读取、写入与删除。
+func (s *Server) handleCORS(w http.ResponseWriter, r *http.Request) {
+	bucket := r.URL.Query().Get("bucket")
+	switch r.Method {
+	case http.MethodGet:
+		cfg, err := s.store.GetBucketCORS(bucket)
+		switch {
+		case errors.Is(err, store.ErrNoSuchCORSConfiguration):
+			writeJSON(w, http.StatusOK, corsResponse{})
+		case err != nil:
+			s.writeStoreError(w, "读取 CORS 配置", err)
+		default:
+			writeJSON(w, http.StatusOK, corsResponse{Found: true, Config: cfg})
+		}
+	case http.MethodPut:
+		body, err := io.ReadAll(io.LimitReader(r.Body, MaxRequestBody+1))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody{Error: "read_failed"})
+			return
+		}
+		if len(body) > MaxRequestBody {
+			writeJSON(w, http.StatusRequestEntityTooLarge, errorBody{Error: "request_too_large"})
+			return
+		}
+		var cfg store.CORSConfiguration
+		if err := json.Unmarshal(body, &cfg); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_cors", Message: "不是合法 JSON"})
+			return
+		}
+		if err := s.store.PutBucketCORS(bucket, &cfg); err != nil {
+			s.writeStoreError(w, "写入 CORS 配置", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case http.MethodDelete:
+		if err := s.store.DeleteBucketCORS(bucket); err != nil {
+			s.writeStoreError(w, "删除 CORS 配置", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPut+", "+http.MethodDelete)
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{Error: "method_not_allowed"})
+	}
 }
 
 // parseIntParam 解析可选的整数 query 参数，缺省时返回 def。
@@ -283,6 +485,16 @@ func (s *Server) writeStoreError(w http.ResponseWriter, op string, err error) {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid_argument", Message: err.Error()})
 	case errors.Is(err, store.ErrStaleMeta):
 		writeJSON(w, http.StatusConflict, errorBody{Error: "stale_meta", Message: err.Error()})
+	case errors.Is(err, store.ErrBucketNotFound):
+		// 必须排在 fs.ErrNotExist 之前？两类错误互不包装，但桶级错误
+		// 需要自己的 code 让协调者区分"桶不存在"与"对象不存在"。
+		writeJSON(w, http.StatusNotFound, errorBody{Error: "bucket_not_found", Message: err.Error()})
+	case errors.Is(err, store.ErrBucketExists):
+		writeJSON(w, http.StatusConflict, errorBody{Error: "bucket_exists", Message: err.Error()})
+	case errors.Is(err, store.ErrBucketNotEmpty):
+		// 409 而不是 400：桶非空是**当前状态**不允许删除，
+		// 协调者清空对象后重试就能成功，不是请求本身写错了。
+		writeJSON(w, http.StatusConflict, errorBody{Error: "bucket_not_empty", Message: err.Error()})
 	case errors.Is(err, fs.ErrNotExist):
 		writeJSON(w, http.StatusNotFound, errorBody{Error: "not_found", Message: err.Error()})
 	case errors.Is(err, store.ErrCorrupt):

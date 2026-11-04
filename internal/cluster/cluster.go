@@ -12,10 +12,14 @@ import (
 
 // Cluster 是集群模式下的存储后端。
 //
-// 它嵌入 *store.Store，因此桶、分片上传、LIST 等尚未分布化的能力
-// 直接沿用本节点的单机实现（切片 4/5 再逐个替换）。对象读写
-// （PutObject/OpenObject/DeleteObject）由本类型覆盖，按一致性哈希
-// 扇出到副本节点。
+// 它嵌入 *store.Store，分片上传（MPU）等尚未分布化的能力沿用本节点的
+// 单机实现（切片 5 替换）。以下能力由本类型覆盖：
+//   - 对象读写（PutObject/OpenObject/DeleteObject）：按一致性哈希扇出到
+//     N 个副本，凑 W/R 法定人数；
+//   - 桶控制面（CreateBucket/DeleteBucket/BucketExists/ListBuckets/
+//     BucketCreatedAt/CORS）：跨节点广播，规则刻意与数据面不同 ——
+//     建桶/写 CORS 只要求可达节点 ack，删桶要求全部节点可达且集群范围为空；
+//   - LIST（ListObjects）：向全部节点要整桶清单，按 key 归并后分页。
 //
 // 每个节点的本地存储同时扮演两个角色：
 //   - 单机实现的持有者（桶、MPU 等）；
@@ -102,6 +106,20 @@ func (c *Cluster) Close() {
 // targetsFor 返回 key 的 N 个副本节点，顺序即副本偏序（第 1 个是 primary）。
 func (c *Cluster) targetsFor(bucket, key string) []target {
 	ids := c.ring.Replicas(ReplicaKey(bucket, key), c.cfg.ReplicaCount)
+	ts := make([]target, len(ids))
+	for i, id := range ids {
+		ts[i] = c.targetFor(id)
+	}
+	return ts
+}
+
+// allTargets 返回成员表中的**全部**节点（含本地），按节点 ID 排序。
+//
+// 与 targetsFor 不同，这里不做哈希放置：桶与 LIST 是集群范围的，
+// 必须问遍每个节点。顺序取 PeerIDs()（已排序）而不是配置书写顺序，
+// 让"取第一个有值的回答"这类兜底逻辑与成员表的书写方式无关。
+func (c *Cluster) allTargets() []target {
+	ids := c.cfg.PeerIDs()
 	ts := make([]target, len(ids))
 	for i, id := range ids {
 		ts[i] = c.targetFor(id)

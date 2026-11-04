@@ -190,6 +190,16 @@ type ObjectMeta struct {
 	// 单节点下它只用于观测"这个 key 被覆盖过几次"，但它同时是
 	// 分布式场景判断"哪份更新"的依据，因此 v1 就开始记录。
 	ObjVersion uint64 `json:"obj_version"`
+	// Deleted 标记这是一条删除墓碑（tombstone），而不是一个仍在的对象。
+	//
+	// 集群删除不能直接抹掉各节点的 meta：删除时不可达的节点恢复后会
+	// 带着旧副本回来，"对象被删了又出现"是最难向用户解释的一类错误。
+	// 墓碑保留 (ObjVersion, NodeID) 这组版本信息，任何比它旧的写回都会
+	// 被 PutReplicaMeta 拒绝，因此旧副本无法复活。
+	//
+	// 墓碑只有版本，没有内容：Size=0、Blocks 为空、ETag/ContentType 为空。
+	// 物理回收由后续切片的确定性 owner 在确认全副本不旧于墓碑后完成。
+	Deleted bool `json:"deleted,omitempty"`
 }
 
 // objectMeta 是包内沿用的短名。用别名而不是第二个结构体：

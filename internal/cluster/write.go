@@ -30,10 +30,9 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 		return nil, fmt.Errorf("%w: 缺少 Content-Length", store.ErrIncompleteBody)
 	}
 
-	// 桶的存在性暂时只看本节点：桶控制面在切片 4 才会广播到全集群。
-	// 在此之前，"在 A 建桶、经 B 写入"应当明确失败，而不是悄悄写进
-	// 一个 B 上并不存在的命名空间。
-	exists, err := c.Store.BucketExists(bucket)
+	// 桶是集群范围的命名空间：只要任意节点上有它，就可以从本节点写入。
+	// 直接看本地会把"在 A 建桶、经 B 写入"判成 NoSuchBucket。
+	exists, err := c.BucketExists(bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -54,12 +53,16 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 	// 条件写能看见其他节点上已提交的对象，且新版本号不小于任何
 	// 已经可见的版本。响应不足 R 时宁可失败也不猜。
 	probe := c.probeMetas(bucket, key, ts)
-	responded, found := countResponses(probe)
+	responded, _ := countResponses(probe)
 	if responded < c.cfg.ReadQuorum {
 		return nil, fmt.Errorf("%w: 仅 %d/%d 个副本可响应，无法确定写入版本（%v）",
 			store.ErrUnavailable, responded, c.cfg.ReplicaCount, firstError(probe))
 	}
-	if opt.IfNoneMatchAny && found > 0 {
+	// 条件写问的是"这个 key 上还有没有活着的对象"。墓碑是删除的证据，
+	// 不是对象：把它算进来会让"删掉后用同一个 key 重新上传"永远返回
+	// PreconditionFailed。版本号仍然从包含墓碑的 latestMeta 取，
+	// 否则新版本会小于墓碑而被副本拒收。
+	if opt.IfNoneMatchAny && liveCount(probe) > 0 {
 		return nil, store.ErrPreconditionFailed
 	}
 
@@ -178,14 +181,32 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 	}, nil
 }
 
-// DeleteObject 从环上的全部副本删除对象。
+// DeleteObject 在环上写下一条删除墓碑（tombstone）。
 //
-// 当前实现直接删除各节点的 meta（块留给 GC），没有 tombstone：
-// 一个在删除时不可达的节点，恢复后会把旧副本带回来。这一点由
-// 切片 4 的 tombstone 修复，届时本方法的调用路径不变。
+// S3 的 DELETE 是幂等的：对象不存在也回 204。因此这里**不**先判对象
+// 是否存在，而是无条件提交一个更高的版本：
+//   - 对象在 → 墓碑版本高于它，此后读与 LIST 都不可能再看到它；
+//   - 对象不在 → 墓碑本身就是"这个 key 从此刻起不存在"的记录，重复
+//     删除的第 N 次调用与第一次得到同一个结果。
+//
+// 为什么不直接删 meta：删除时不可达的节点恢复后会带着旧副本回来，
+// "对象删了又出现"是最难向用户解释的一类错误。墓碑把删除本身变成一个
+// 可比较的版本，任何比它旧的写回都会被副本层拒绝（ErrStaleMeta），
+// 旧副本因此无法复活。块不在这里回收 —— 可能被其他 key 去重引用，
+// 留给后续切片的墓碑 GC。
 func (c *Cluster) DeleteObject(bucket, key string) error {
 	if err := store.ValidateObjectPath(bucket, key); err != nil {
 		return err
+	}
+
+	// 桶不存在时与 PUT 一样明确失败：否则"桶被删了"会伪装成
+	// "对象删掉了"，两种状态对客户端的含义完全不同。
+	exists, err := c.BucketExists(bucket)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return store.ErrBucketNotFound
 	}
 
 	unlock := c.locks.Lock(bucket + "\x00" + key)
@@ -193,26 +214,41 @@ func (c *Cluster) DeleteObject(bucket, key string) error {
 
 	ts := c.targetsFor(bucket, key)
 
-	// 先确认对象确实存在：直接删的语义是"不存在就回 NoSuchKey"。
-	// 响应不足 R 时无法区分"不存在"与"副本都失联"，宁可回 503。
+	// 写前 meta barrier：新版本必须大于已经可见的任何版本（含之前的
+	// 墓碑）。少于 R 个响应时无法确定该用哪个版本号，宁可回 503 ——
+	// 猜一个版本可能比现有墓碑还低，副本会以 ErrStaleMeta 拒绝，
+	// 删除就静默失效了。
 	probe := c.probeMetas(bucket, key, ts)
-	responded, found := countResponses(probe)
+	responded, _ := countResponses(probe)
 	if responded < c.cfg.ReadQuorum {
-		return fmt.Errorf("%w: 仅 %d/%d 个副本可响应，无法确认对象状态（%v）",
+		return fmt.Errorf("%w: 仅 %d/%d 个副本可响应，无法确定删除版本（%v）",
 			store.ErrUnavailable, responded, c.cfg.ReplicaCount, firstError(probe))
 	}
-	if found == 0 {
-		return store.ErrNoSuchKey
+	var seen uint64
+	if m := latestMeta(probe); m != nil {
+		seen = m.ObjVersion
 	}
 
-	ok, errs := c.deleteMetaFromAll(bucket, key, ts)
+	tomb := &store.ObjectMeta{
+		Version:    store.FormatVersion,
+		Key:        key,
+		Modified:   c.now().UTC().Truncate(time.Second),
+		NodeID:     c.cfg.NodeID,
+		ObjVersion: c.clock.Next(seen),
+		Deleted:    true,
+	}
+
+	// 提交给**全部**目标而不是只提交给 W 个：墓碑写到的节点越多，
+	// 旧副本能存活的空间越小。W 个 ack 就足以向客户端确认删除，
+	// 其余节点的失败留给后续切片的反熵修复。
+	ok, errs := c.putMetaToAll(bucket, key, tomb, ts)
 	if ok < c.cfg.WriteQuorum {
 		for i, err := range errs {
 			if err != nil {
-				c.logger.Warn("replica_delete_failed", "peer", ts[i].id, "err", err.Error())
+				c.logger.Warn("tombstone_failed", "peer", ts[i].id, "err", err.Error())
 			}
 		}
-		return fmt.Errorf("%w: 删除仅 %d 个副本确认，需要 %d",
+		return fmt.Errorf("%w: 删除墓碑仅 %d 个副本确认，需要 %d",
 			store.ErrUnavailable, ok, c.cfg.WriteQuorum)
 	}
 	return nil

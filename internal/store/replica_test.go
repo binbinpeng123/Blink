@@ -231,6 +231,134 @@ func TestBlockHashValidation(t *testing.T) {
 	}
 }
 
+// tombstoneMeta 构造一条删除墓碑：只有版本与节点，没有内容。
+func tombstoneMeta(key string, version uint64, nodeID string) *ObjectMeta {
+	return &ObjectMeta{
+		Version:    FormatVersion,
+		Key:        key,
+		Modified:   time.Unix(1_700_000_000, 0).UTC(),
+		NodeID:     nodeID,
+		ObjVersion: version,
+		Deleted:    true,
+	}
+}
+
+// TestTombstoneLifecycle 验证墓碑的完整语义：
+//
+//	活副本 → 墓碑（接受）→ 旧活版本写回（拒绝）→ 更高版本活副本（接受）
+//
+// 第一步与第二步是"删除后不复活"的全部保证；第三步保证删除之后
+// 同一个 key 还能重新上传。
+func TestTombstoneLifecycle(t *testing.T) {
+	s := newTestStore(t)
+	const bucket, key = "test-bucket", "obj"
+	hash := BlockHash([]byte("hello"))
+	if err := s.CreateBucket(bucket); err != nil {
+		t.Fatalf("建桶失败: %v", err)
+	}
+
+	if err := s.PutReplicaMeta(bucket, key, replicaMeta(key, 2, "node-b", singleBlock(hash, 5))); err != nil {
+		t.Fatalf("写入活副本失败: %v", err)
+	}
+	if err := s.PutReplicaMeta(bucket, key, tombstoneMeta(key, 3, "node-a")); err != nil {
+		t.Fatalf("写入墓碑失败: %v", err)
+	}
+
+	m, found, err := s.LoadReplicaMeta(bucket, key)
+	if err != nil || !found {
+		t.Fatalf("读取墓碑失败: found=%v err=%v", found, err)
+	}
+	if !m.Deleted || m.Size != 0 || len(m.Blocks) != 0 {
+		t.Fatalf("墓碑内容 = %+v，期望 Deleted 且无内容", m)
+	}
+
+	// 删除时不可达的节点恢复后写回旧副本：必须被墓碑挡住。
+	if err := s.PutReplicaMeta(bucket, key, replicaMeta(key, 2, "node-c", singleBlock(hash, 5))); !errors.Is(err, ErrStaleMeta) {
+		t.Fatalf("旧活版本写回应返回 ErrStaleMeta，实际 %v", err)
+	}
+	// 同版本但 node_id 更小同样被拒（版本相同时的确定性裁决对墓碑生效）。
+	if err := s.PutReplicaMeta(bucket, key, tombstoneMeta(key, 3, "node-0")); !errors.Is(err, ErrStaleMeta) {
+		t.Fatalf("同版本低 node_id 应为 ErrStaleMeta，实际 %v", err)
+	}
+
+	// 删除后重新上传：版本更高，必须成功，墓碑被覆盖。
+	if err := s.PutReplicaMeta(bucket, key, replicaMeta(key, 4, "node-a", singleBlock(hash, 5))); err != nil {
+		t.Fatalf("删除后重新上传失败: %v", err)
+	}
+	m, found, err = s.LoadReplicaMeta(bucket, key)
+	if err != nil || !found || m.Deleted {
+		t.Fatalf("重新上传后状态 = %+v found=%v err=%v", m, found, err)
+	}
+
+	// 整桶扫描必须能把墓碑与活对象区分开。
+	if err := s.PutReplicaMeta(bucket, "gone", tombstoneMeta("gone", 1, "node-a")); err != nil {
+		t.Fatalf("写入第二个墓碑失败: %v", err)
+	}
+	entries, err := s.ScanReplicaEntries(bucket)
+	if err != nil {
+		t.Fatalf("扫描副本失败: %v", err)
+	}
+	got := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		got[e.Key] = e.Deleted
+	}
+	if deleted, ok := got["gone"]; !ok || !deleted {
+		t.Fatalf("扫描结果缺少 gone 的墓碑: %+v", entries)
+	}
+	if deleted, ok := got[key]; !ok || deleted {
+		t.Fatalf("扫描结果中 %s 应为活对象: %+v", key, entries)
+	}
+}
+
+// TestPutReplicaMetaRejectsInvalidTombstone 验证"墓碑"不是绕过内容校验的
+// 后门：带大小或块表的墓碑是自相矛盾的元数据，必须拒绝。
+func TestPutReplicaMetaRejectsInvalidTombstone(t *testing.T) {
+	s := newTestStore(t)
+	const bucket, key = "test-bucket", "obj"
+	hash := BlockHash([]byte("hello"))
+
+	cases := []struct {
+		name string
+		meta *ObjectMeta
+	}{
+		{
+			name: "墓碑带大小",
+			meta: func() *ObjectMeta {
+				m := tombstoneMeta(key, 1, "n")
+				m.Size = 5
+				return m
+			}(),
+		},
+		{
+			name: "墓碑带块表",
+			meta: func() *ObjectMeta {
+				m := tombstoneMeta(key, 1, "n")
+				m.Blocks = []BlockDesc{singleBlock(hash, 5)}
+				return m
+			}(),
+		},
+		{
+			name: "墓碑缺少 node_id",
+			meta: tombstoneMeta(key, 1, ""),
+		},
+		{
+			name: "墓碑版本号为 0",
+			meta: tombstoneMeta(key, 0, "n"),
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := s.PutReplicaMeta(bucket, key, c.meta); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("应拒绝非法墓碑，实际 %v", err)
+			}
+			if _, found, _ := s.LoadReplicaMeta(bucket, key); found {
+				t.Fatal("被拒绝的墓碑不能落盘")
+			}
+		})
+	}
+}
+
 // TestDeleteReplicaMeta 验证删除只移除对象元数据，不动 CAS 块。
 func TestDeleteReplicaMeta(t *testing.T) {
 	s := newTestStore(t)

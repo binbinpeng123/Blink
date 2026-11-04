@@ -64,6 +64,36 @@ func countResponses(results []metaResult) (responded, found int) {
 	return responded, found
 }
 
+// liveCount 统计仍持有**活对象**（非墓碑）的副本数。
+//
+// 与 countResponses 的 found 刻意分开：墓碑也满足 found，但它证明的是
+// "这个 key 已被删除"，不是"对象还在"。读路径用它判断存活副本是否够
+// R 份，条件写用它判断 key 是否仍被占用。
+func liveCount(results []metaResult) int {
+	n := 0
+	for _, r := range results {
+		if r.err != nil || !r.found || r.meta == nil {
+			continue
+		}
+		if !r.meta.Deleted {
+			n++
+		}
+	}
+	return n
+}
+
+// sameVersion 判断两份元数据是否描述了同一个版本。
+//
+// 判定与 newerMeta/staleMeta 一致：(ObjVersion, NodeID) 相同即同一版本。
+// 版本号相同而 NodeID 不同是两次并发的写，读到哪个取决于仲裁结果；
+// 对读路径而言它们不是"同一份数据"，不能互相替代。
+func sameVersion(a, b *store.ObjectMeta) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.ObjVersion == b.ObjVersion && a.NodeID == b.NodeID
+}
+
 // latestMeta 返回响应中最新的副本元数据；没有副本时返回 nil。
 func latestMeta(results []metaResult) *store.ObjectMeta {
 	var latest *store.ObjectMeta
@@ -166,34 +196,7 @@ func (c *Cluster) putMetaToAll(bucket, key string, m *store.ObjectMeta, ts []tar
 	return success, errs
 }
 
-// deleteMetaFromAll 并行删除各目标上的副本，返回成功数。
-//
-// "目标本来就没有这份副本"也算成功：删除是幂等的，
-// 计数衡量的是"这些节点都确认了删除"，不是"删掉了 N 份"。
-func (c *Cluster) deleteMetaFromAll(bucket, key string, ts []target) (ok int, errs []error) {
-	errs = make([]error, len(ts))
-	var success int
-	var mu sync.Mutex
-
-	var wg sync.WaitGroup
-	for i, t := range ts {
-		wg.Add(1)
-		go func(i int, t target) {
-			defer wg.Done()
-			if _, err := t.deleteMeta(context.Background(), bucket, key); err != nil {
-				errs[i] = err
-				return
-			}
-			mu.Lock()
-			success++
-			mu.Unlock()
-		}(i, t)
-	}
-	wg.Wait()
-	return success, errs
-}
-
-// target 的四个副本操作：本地直连存储，远端走内部协议。
+// target 的副本操作：本地直连存储，远端走内部协议。
 
 func (t target) getMeta(ctx context.Context, bucket, key string) (*store.ObjectMeta, bool, error) {
 	if t.local != nil {
@@ -207,13 +210,6 @@ func (t target) putMeta(ctx context.Context, bucket, key string, m *store.Object
 		return t.local.PutReplicaMeta(bucket, key, m)
 	}
 	return t.client.PutMeta(ctx, bucket, key, m)
-}
-
-func (t target) deleteMeta(ctx context.Context, bucket, key string) (bool, error) {
-	if t.local != nil {
-		return t.local.DeleteReplicaMeta(bucket, key)
-	}
-	return t.client.DeleteMeta(ctx, bucket, key)
 }
 
 func (t target) putBlock(ctx context.Context, hash string, data []byte) (bool, error) {

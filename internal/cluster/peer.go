@@ -22,6 +22,20 @@ import (
 // 因此 16 MiB 足够且能防住一个错误的实现对端把内存撑爆。
 const maxResponseBytes = 16 << 20
 
+// maxListResponseBytes 是内部 LIST 响应的读取上限。
+//
+// 比普通 JSON 的上限大得多：一个桶的清单随对象数线性增长，10 万条
+// ReplicaEntry 约 20 MB。上限存在的意义是挡住畸形/恶意响应，而不是
+// 限制合法规模；超过它时调用方得到明确错误，而不是把内存吃光。
+const maxListResponseBytes = 64 << 20
+
+// listTimeout 是单节点 LIST（以及其它可能较大的 JSON 响应）的超时。
+//
+// 不能用 PeerTimeout（2s）：那是给几十字节 JSON 用的。本机环回上
+// 10 万对象的扫描 + 序列化 + 传输仍在秒级，30s 只用来把"对端僵死"
+// 变成一个可统计的失败。
+const listTimeout = 30 * time.Second
+
 // blockTransferTimeout 是单个块上传/下载的超时。
 //
 // 不能沿用 PeerTimeout（2s）：那是给几十字节 JSON 用的，一个 4 MiB 块
@@ -44,6 +58,12 @@ type PeerClient struct {
 	secret   []byte
 	client   *http.Client
 	transfer *http.Client
+	// bulk 承载可能返回大量 JSON 的请求（集群 LIST、整桶清单）。
+	//
+	// 与 client 分开是为了让超时与响应上限都按量级匹配：client 的 2s
+	// 会把一次正常的万级对象 LIST 误判成节点故障，进而让整个集群 LIST
+	// 回 503；而把 2s 全局调大又会让"节点僵死"的探测变慢。
+	bulk *http.Client
 }
 
 // NewPeerClient 构造到 p 的客户端。
@@ -63,6 +83,7 @@ func NewPeerClient(p Peer, selfID string, secret []byte, timeout time.Duration) 
 		selfID: selfID,
 		secret: secret,
 		client: &http.Client{Timeout: timeout, CheckRedirect: checkRedirect},
+		bulk:   &http.Client{Timeout: listTimeout, CheckRedirect: checkRedirect},
 		transfer: &http.Client{
 			CheckRedirect: checkRedirect,
 			Transport: &http.Transport{
@@ -83,6 +104,7 @@ func (c *PeerClient) Peer() Peer {
 // closeIdle 关闭到该节点的空闲连接。
 func (c *PeerClient) closeIdle() {
 	c.client.CloseIdleConnections()
+	c.bulk.CloseIdleConnections()
 	c.transfer.CloseIdleConnections()
 }
 
@@ -187,6 +209,11 @@ func (c *PeerClient) PutMeta(ctx context.Context, bucket, key string, m *store.O
 }
 
 // DeleteMeta 删除远端节点上的副本，返回删除前是否存在。
+//
+// 注意：对象删除**不再**走这里。删除写入的是墓碑元数据（保证删除的
+// 版本能被副本比较看到），物理删掉 meta 目录会让宕机节点恢复后无据可查。
+// 本方法保留给切片 6 的墓碑回收：那时由确定性 owner 在确认全部副本
+// 已过 TTL 之后物理清理。
 func (c *PeerClient) DeleteMeta(ctx context.Context, bucket, key string) (bool, error) {
 	var out struct {
 		Found bool `json:"found"`
@@ -195,6 +222,88 @@ func (c *PeerClient) DeleteMeta(ctx context.Context, bucket, key string) (bool, 
 		return false, err
 	}
 	return out.Found, nil
+}
+
+// ListReplicas 取远端节点上某桶的全部副本条目（含墓碑）。
+//
+// 走 doBulk：整桶清单是唯一一个响应体随数据规模增长的内部接口，
+// 用普通请求的 2s 超时会把一个健康但有十万对象的节点误判成故障。
+func (c *PeerClient) ListReplicas(ctx context.Context, bucket string) (listResponse, error) {
+	var out listResponse
+	if err := c.doBulk(ctx, http.MethodGet, pathList+"?"+bucketQuery(bucket), nil, &out); err != nil {
+		return listResponse{}, err
+	}
+	return out, nil
+}
+
+// BucketInfo 读取远端节点上的桶元数据；桶不存在时 Exists=false。
+func (c *PeerClient) BucketInfo(ctx context.Context, bucket string) (bucketInfo, error) {
+	var out bucketInfo
+	if err := c.do(ctx, http.MethodGet, pathBucket+"?"+bucketQuery(bucket), nil, &out); err != nil {
+		return bucketInfo{}, err
+	}
+	return out, nil
+}
+
+// BucketState 读取远端节点上桶的存在性与空否。
+func (c *PeerClient) BucketState(ctx context.Context, bucket string) (bucketState, error) {
+	var out bucketState
+	if err := c.do(ctx, http.MethodGet, pathBucketState+"?"+bucketQuery(bucket), nil, &out); err != nil {
+		return bucketState{}, err
+	}
+	return out, nil
+}
+
+// ListBuckets 读取远端节点的桶名列表。
+func (c *PeerClient) ListBuckets(ctx context.Context) ([]string, error) {
+	var out bucketsResponse
+	if err := c.do(ctx, http.MethodGet, pathBuckets, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Buckets, nil
+}
+
+// CreateBucket 在远端节点创建桶。重复创建不算错误（对端幂等）。
+func (c *PeerClient) CreateBucket(ctx context.Context, bucket string) error {
+	return c.do(ctx, http.MethodPut, pathBucket+"?"+bucketQuery(bucket), nil, nil)
+}
+
+// DeleteBucket 在远端节点删除桶。
+func (c *PeerClient) DeleteBucket(ctx context.Context, bucket string) error {
+	return c.do(ctx, http.MethodDelete, pathBucket+"?"+bucketQuery(bucket), nil, nil)
+}
+
+// GetCORS 读取远端节点上的桶 CORS 配置。
+//
+// found=false 表示桶在但没有配置，与"节点不可达"由 error 区分。
+func (c *PeerClient) GetCORS(ctx context.Context, bucket string) (*store.CORSConfiguration, bool, error) {
+	var out corsResponse
+	if err := c.do(ctx, http.MethodGet, pathCORS+"?"+bucketQuery(bucket), nil, &out); err != nil {
+		return nil, false, err
+	}
+	if out.Found && out.Config == nil {
+		return nil, false, fmt.Errorf("节点 %s: 协议错误: found=true 但 CORS 配置为空", c.peer.ID)
+	}
+	return out.Config, out.Found, nil
+}
+
+// PutCORS 向远端节点写入桶 CORS 配置。
+func (c *PeerClient) PutCORS(ctx context.Context, bucket string, cfg *store.CORSConfiguration) error {
+	body, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("节点 %s: 编码 CORS 配置失败: %w", c.peer.ID, err)
+	}
+	return c.do(ctx, http.MethodPut, pathCORS+"?"+bucketQuery(bucket), body, nil)
+}
+
+// DeleteCORS 删除远端节点上的桶 CORS 配置（未配置也成功）。
+func (c *PeerClient) DeleteCORS(ctx context.Context, bucket string) error {
+	return c.do(ctx, http.MethodDelete, pathCORS+"?"+bucketQuery(bucket), nil, nil)
+}
+
+// bucketQuery 构造只带桶名的 query 串。
+func bucketQuery(bucket string) string {
+	return url.Values{"bucket": {bucket}}.Encode()
 }
 
 // objectQuery 构造 bucket/key 的 query 串。
@@ -237,8 +346,20 @@ func (c *PeerClient) peerError(method, path string, resp *http.Response) error {
 	}
 }
 
-
 func (c *PeerClient) do(ctx context.Context, method, path string, body []byte, out any) error {
+	return c.doWith(ctx, c.client, maxResponseBytes, method, path, body, out)
+}
+
+// doBulk 与 do 相同，但使用大响应的超时与上限。
+func (c *PeerClient) doBulk(ctx context.Context, method, path string, body []byte, out any) error {
+	return c.doWith(ctx, c.bulk, maxListResponseBytes, method, path, body, out)
+}
+
+// doWith 发送一个已签名的 JSON 请求并解析响应。
+//
+// client 与 limit 由调用方按响应量级选择：小响应快速失败，大响应
+// 给足时间。签名、状态码与解析逻辑只有这一份，两种量级不会漂移。
+func (c *PeerClient) doWith(ctx context.Context, client *http.Client, limit int, method, path string, body []byte, out any) error {
 	req, err := http.NewRequestWithContext(ctx, method, "http://"+c.peer.Addr+path, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("节点 %s: 构造请求 %s %s 失败: %w", c.peer.ID, method, path, err)
@@ -248,7 +369,7 @@ func (c *PeerClient) do(ctx context.Context, method, path string, body []byte, o
 	}
 	SignRequest(req, c.secret, c.selfID, body, time.Now())
 
-	resp, err := c.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		// err 来自 net/http，只含地址与网络错误，不含密钥。
 		return fmt.Errorf("节点 %s: %s %s 失败: %w", c.peer.ID, method, path, err)
@@ -264,12 +385,12 @@ func (c *PeerClient) do(ctx context.Context, method, path string, body []byte, o
 		return nil
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
 		return fmt.Errorf("节点 %s: 读取 %s 响应失败: %w", c.peer.ID, path, err)
 	}
-	if len(data) > maxResponseBytes {
-		return fmt.Errorf("节点 %s: %s 响应超过 %d 字节上限", c.peer.ID, path, maxResponseBytes)
+	if len(data) > limit {
+		return fmt.Errorf("节点 %s: %s 响应超过 %d 字节上限", c.peer.ID, path, limit)
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return fmt.Errorf("节点 %s: 解析 %s 响应失败: %w", c.peer.ID, path, err)

@@ -257,14 +257,23 @@ func validateReplicaMeta(key string, m *ObjectMeta) error {
 	if m.Size < 0 {
 		return fmt.Errorf("%w: 对象大小 %d 为负", ErrCorrupt, m.Size)
 	}
-	if m.ETag == "" {
-		return fmt.Errorf("%w: 缺少 ETag", ErrCorrupt)
-	}
 	if m.NodeID == "" {
 		return fmt.Errorf("%w: 缺少 node_id", ErrCorrupt)
 	}
 	if m.ObjVersion == 0 {
 		return fmt.Errorf("%w: obj_version 必须从 1 开始", ErrCorrupt)
+	}
+	// 墓碑只有版本，没有内容。ETag/ContentType/块表的校验必须放在
+	// 这之后：墓碑本来就不该有它们，先判空会把每一次删除都判成损坏。
+	if m.Deleted {
+		if m.Size != 0 || len(m.Blocks) != 0 {
+			return fmt.Errorf("%w: 删除墓碑不应携带内容（size=%d，blocks=%d）",
+				ErrCorrupt, m.Size, len(m.Blocks))
+		}
+		return nil
+	}
+	if m.ETag == "" {
+		return fmt.Errorf("%w: 缺少 ETag", ErrCorrupt)
 	}
 	if m.ContentType == "" {
 		return fmt.Errorf("%w: 缺少 content_type", ErrCorrupt)

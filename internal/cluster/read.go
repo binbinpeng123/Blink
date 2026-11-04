@@ -11,11 +11,13 @@ import (
 
 // OpenObject 打开环上最新版本的副本。
 //
-// 读路径不做"读修复"（切片 6 实现），但已经做两件必须现在就做的事：
-//   - 至少 R 个副本响应且至少 R 份持有该对象，否则回 503 而不是 404：
-//     副本不够时"不存在"是不可知，不是事实；
+// 读路径不做"读修复"（切片 6 实现），但已经做三件必须现在就做的事：
 //   - 多份 meta 里选 (ObjVersion, NodeID) 最大的一份，保证写到 W 之后
-//     从任意节点都能读到最新版本。
+//     从任意节点都能读到最新版本；
+//   - 最新版本是墓碑 ⇒ 404：删除必须立刻对任意节点可见，不能被
+//     "其它节点上还有旧副本"拖成"读得到"；
+//   - 至少 R 个副本响应且至少 R 份存活副本，否则回 503 而不是 404：
+//     副本不够时"不存在"是不可知，不是事实。
 func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 	if err := store.ValidateObjectPath(bucket, key); err != nil {
 		return nil, err
@@ -32,23 +34,33 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 	if found == 0 {
 		return nil, store.ErrNoSuchKey
 	}
-	if found < c.cfg.ReadQuorum {
-		return nil, fmt.Errorf("%w: 仅 %d 份副本可用，需要 %d",
-			store.ErrUnavailable, found, c.cfg.ReadQuorum)
-	}
 
 	latest := latestMeta(results)
 	if latest == nil {
 		// countResponses 已保证 found>0；走到这里说明响应格式有误。
 		return nil, fmt.Errorf("%w: 副本元数据缺失", store.ErrCorrupt)
 	}
+	// 最新版本是墓碑 ⇒ 对象已被删除。这条判断必须在存活副本数之前：
+	// 删除留下的墓碑本来就比任何活副本新，"存活副本不足 R"是删除后的
+	// 正常状态，把它报成 503 会让客户端一直重试一个永远不存在的对象。
+	if latest.Deleted {
+		return nil, store.ErrNoSuchKey
+	}
+	if live := liveCount(results); live < c.cfg.ReadQuorum {
+		return nil, fmt.Errorf("%w: 仅 %d 份存活副本可用，需要 %d",
+			store.ErrUnavailable, live, c.cfg.ReadQuorum)
+	}
 
 	// 源顺序：本地优先（命中现有 sendfile 零拷贝路径），其次是持有
-	// 该版本的远端副本；最后才是"响应了但说没有"的节点 —— 它们可能
-	// 因为 meta 提交失败而只有块没有 meta，兜底使用无害（块按内容寻址）。
+	// **同一版本**的远端副本；最后才是其余节点 —— 它们可能是旧版本，
+	// 也可能因为 meta 提交失败而只有块没有 meta。块按内容寻址，
+	// 旧版本副本上恰好存在本次要读的块时兜底使用无害。
+	//
+	// 只认同一版本是必须的：旧版本副本的块表指向别的块，把它排在前面
+	// 会先拉一遍注定失败的数据，再回落到正确来源，白白付出带宽。
 	hasLatest := make(map[string]bool, len(results))
 	for _, r := range results {
-		if r.err == nil && r.found && r.meta != nil {
+		if r.err == nil && r.found && r.meta != nil && !r.meta.Deleted && sameVersion(r.meta, latest) {
 			hasLatest[r.id] = true
 		}
 	}
