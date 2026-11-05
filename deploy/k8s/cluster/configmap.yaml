@@ -1,0 +1,59 @@
+# 集群模式的非机密配置。
+#
+# 与 deploy/k8s/configmap.yaml（单机）的关键差异：
+#   - BLINK_CLUSTER_MODE=cluster，并给出静态 peers；
+#   - 增加内部端口 9100；
+#   - quorum 参数显式写出，避免依默认值漂移。
+#
+# peers 必须与 statefulset.yaml 的 replicas 完全一致，且必须包含自身。
+# 扩缩容不是改一个数字：成员表是静态的，需同时修改两份清单并离线迁移
+# 数据（v0.2.0 无自动再平衡）。详见 README.md。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blink-config
+  namespace: blink
+  labels:
+    app.kubernetes.io/name: blink
+data:
+  # 容器内必须监听 0.0.0.0；127.0.0.1 无法被 Service 转发到。
+  BLINK_ADDR: "0.0.0.0:9000"
+  # 内部端口只能集群内可达，不得经由 LoadBalancer/Ingress 暴露。
+  BLINK_INTERNAL_ADDR: "0.0.0.0:9100"
+  BLINK_DATA_DIR: "/var/lib/blink"
+  BLINK_REGION: "us-east-1"
+  BLINK_LOG_LEVEL: "info"
+  # always：数据与元数据都 fsync 后才返回成功，可靠性优先。
+  BLINK_FSYNC_POLICY: "always"
+  # 读取时逐块校验会放弃 sendfile 零拷贝；模型加载场景默认关闭。
+  BLINK_VERIFY_READ: "false"
+
+  BLINK_CLUSTER_MODE: "cluster"
+  # 格式必须是 id@host:port，ID 与 StatefulSet 的 Pod 名一致
+  # （BLINK_NODE_ID 取自 downward API 的 metadata.name）。
+  # 使用 headless Service 的短名：同 namespace 内可直接解析，
+  # 且不依赖 cluster domain 的具体取值。
+  # 三项顺序不重要，但必须与 StatefulSet 的 3 个副本一一对应。
+  BLINK_CLUSTER_PEERS: "blink-0@blink-0.blink-headless:9100,blink-1@blink-1.blink-headless:9100,blink-2@blink-2.blink-headless:9100"
+
+  BLINK_REPLICA_COUNT: "3"
+  BLINK_WRITE_QUORUM: "2"
+  BLINK_READ_QUORUM: "2"
+  BLINK_VNODES: "128"
+
+  # 纠删码默认关闭。3 节点可改 true 使用全局默认 2+1；>=6 节点为 4+2；
+  # 4–5 节点没有默认 profile，必须同时显式设置 EC_K/EC_M，否则拒绝启动。
+  # 开启后仅对 >= EC_MIN_SIZE（默认 32 MiB）的对象生效。
+  # 升级期间必须先关闭 EC：旧版本二进制无法解释 layout=ec 的 meta。
+  BLINK_EC_ENABLED: "false"
+  # BLINK_EC_K: "2"
+  # BLINK_EC_M: "1"
+  BLINK_EC_MIN_SIZE: "32MiB"
+
+  BLINK_REPAIR_INTERVAL: "30s"
+  BLINK_SCRUB_INTERVAL: "24h"
+  BLINK_REPAIR_MAX_CONCURRENCY: "2"
+  # 修复任务（hinted handoff）的最长保留期；超过后交给反熵重新发现。
+  BLINK_HINT_TTL: "72h"
+  BLINK_READ_DEGRADED: "false"
+  BLINK_PEER_TIMEOUT: "2s"

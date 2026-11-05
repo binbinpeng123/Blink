@@ -31,10 +31,9 @@ v0.1.0 的服务没有"多副本共享同一份数据"的能力，也没有 lead
 | `deploy/k8s/service.yaml` | ClusterIP，端口 9000 |
 | `deploy/k8s/statefulset.yaml` | 工作负载、探针、安全上下文、资源限制 |
 | `deploy/k8s/examples/secret.example.yaml` | 凭据示例；复制为 `secret.yaml`（已 gitignore）后填入真实值 |
-| `deploy/k8s/headless-service.yaml` | **v0.2.0**：`clusterIP: None`，暴露 9000 + 9100，供集群内 peers 互相寻址 |
-| `deploy/k8s/networkpolicy.yaml` | **v0.2.0**：仅允许同 namespace 访问 9100 内部端口 |
+| `deploy/k8s/cluster/` | **v0.2.0**：集群形态的自包含清单（namespace、ConfigMap、普通 Service、headless Service、StatefulSet、NetworkPolicy、Secret 示例与 README） |
 
-`examples/` 不在 `kubectl apply -f deploy/k8s/` 的非递归范围内，避免用占位凭据把服务跑起来。
+集群清单放在独立子目录，避免与单机清单同名资源混用。`deploy/k8s/cluster/examples/` 不在 `kubectl apply -f deploy/k8s/cluster/` 的非递归范围内，避免用占位凭据把服务跑起来。单机与集群清单共用 namespace `blink` 与资源名，是**互斥的两种部署形态**，不要在同一 namespace 里先后应用。
 
 部署顺序：
 
@@ -93,14 +92,18 @@ make image IMAGE=blink:dev
 | 服务 | 保留普通 ClusterIP（S3 流量），新增 headless Service 提供稳定 Pod DNS |
 | 端口 | 增加 `internal` 9100；`BLINK_INTERNAL_ADDR` 必须与 `BLINK_ADDR` 不同 |
 | 身份 | `BLINK_NODE_ID` 取自 downward API `metadata.name`，且必须出现在 peers 列表中 |
-| peers | `id@host:port,...`，使用 headless 短名（如 `blink-0.blink-headless:9100`），**必须包含自身** |
+| peers | `id@host:port,...`，id 必须等于 Pod 名，host 使用 headless 短名（如 `blink-0@blink-0.blink-headless:9100`），**必须包含自身** |
 | 密钥 | `BLINK_CLUSTER_SECRET` 集群模式必填、≥32 字节，缺失即拒绝启动 |
 | 网络 | NetworkPolicy 限制 9100 仅同 namespace 可达；**9100 不得经由 LoadBalancer/Ingress 暴露** |
 
 ```bash
-# 仅校验清单，不部署
+# 仅校验清单，不部署（单机 / 集群二选一）
 kubectl apply --dry-run=client -f deploy/k8s/
+kubectl apply --dry-run=client -f deploy/k8s/cluster/
 ```
+
+集群清单的完整部署顺序、扩缩容与 NetworkPolicy 的 CNI 限制见
+[`deploy/k8s/cluster/README.md`](../../deploy/k8s/cluster/README.md)。
 
 **就绪探针不检查 quorum**：见下文探针章节。
 
@@ -179,7 +182,7 @@ env:
 | `kubectl apply --dry-run=client` 清单校验 | 已执行（5 个对象） |
 | 真实 K8s 安装、重启、升级、卸载 | **未执行**（无隔离开发集群，未在共享集群部署） |
 | K3s `local-path` 实际绑定行为 | **未执行** |
-| 集群清单（headless Service / `volumeClaimTemplates` / NetworkPolicy） | **待 v0.2.0 实现后 `--dry-run=client` 校验**；真实集群**未实测** |
+| 集群清单（headless Service / `volumeClaimTemplates` / NetworkPolicy） | `kubectl create --dry-run=client --validate=false` 离线识别并渲染 6 个对象（基于本机发现缓存，**未连接集群、未做 OpenAPI schema 校验**）；真实集群**未实测** |
 | 多 Pod 跨节点读写 | **本机多进程模拟**验证；**未在真实 K8s 多节点验证** |
 
 本文件最初要求的"在隔离开发集群完成安装、重启、升级、卸载，并验证卸载后数据保留配置"**尚未满足**。在拿到可用的开发机或本地 K3s 之前，不得声称部署验证通过。
