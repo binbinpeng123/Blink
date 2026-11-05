@@ -8,6 +8,7 @@ import (
 	"io/fs"
 
 	"github.com/binbinpeng123/Blink/internal/checksum"
+	"github.com/binbinpeng123/Blink/internal/ec"
 	"github.com/binbinpeng123/Blink/internal/store"
 )
 
@@ -101,6 +102,23 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 		}
 	}
 
+	// EC 对象的数据不在副本集上：副本只负责 meta 仲裁，分片按 meta 中
+	// 记录的组读取。组必须取自 meta 而不是重算环 —— 成员表变更后重算
+	// 可能指向另一批节点，而分片还在旧组里。
+	var ecr *ecReader
+	if latest.Layout == store.LayoutEC {
+		group, err := c.ecTargetsFor(latest)
+		if err != nil {
+			return nil, err
+		}
+		codec, err := ec.NewCodec(latest.EC.K, latest.EC.M)
+		if err != nil {
+			return nil, fmt.Errorf("%w: EC 参数 k=%d m=%d 非法: %v",
+				store.ErrCorrupt, latest.EC.K, latest.EC.M, err)
+		}
+		ecr = &ecReader{codec: codec, group: group}
+	}
+
 	return &clusterReader{
 		info: store.ObjectInfo{
 			Key:               latest.Key,
@@ -117,6 +135,7 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 		},
 		blocks:  latest.Blocks,
 		sources: sources,
+		ecr:     ecr,
 		repair: func(t target, b store.BlockDesc) {
 			c.repair.enqueue(t.id, repairBlocks, bucket, key, latest.ObjVersion)
 		},
@@ -145,6 +164,9 @@ type clusterReader struct {
 	info    store.ObjectInfo
 	blocks  []store.BlockDesc
 	sources []target
+
+	// ecr 非 nil 表示对象是 EC 布局，块由分片重建而不是从副本整块读取。
+	ecr *ecReader
 
 	// repair 在某次块读取因"副本侧原因"失败时上报给协调者。
 	// 为 nil 表示不修复（测试与只读视图）。
@@ -204,6 +226,9 @@ func (r *clusterReader) WriteRangeTo(w io.Writer, offset, length int64) error {
 // 只有"一个字节都还没写"时才允许换源：一旦部分内容已交给调用方，
 // 换源会从段首重读并重复写入，产出的内容比失败更糟。
 func (r *clusterReader) readSegment(w io.Writer, b store.BlockDesc, offset, length int64) error {
+	if r.ecr != nil {
+		return r.readECSegment(w, b, offset, length)
+	}
 	var lastErr error
 	for _, src := range r.sources {
 		cw := &countingWriter{w: w}

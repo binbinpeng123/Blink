@@ -200,6 +200,36 @@ type ObjectMeta struct {
 	// 墓碑只有版本，没有内容：Size=0、Blocks 为空、ETag/ContentType 为空。
 	// 物理回收由后续切片的确定性 owner 在确认全副本不旧于墓碑后完成。
 	Deleted bool `json:"deleted,omitempty"`
+	// Layout 标记对象的数据布局："" 或 "replica" 为多副本，"ec" 为纠删码。
+	//
+	// 空字符串是多副本的历史写法，必须继续接受：升级前写入的对象没有
+	// 这个字段，读到它们不能报错。
+	Layout string `json:"layout,omitempty"`
+	// EC 仅在 Layout==LayoutEC 时非空，记录分片组与 (k,m) 参数。
+	//
+	// 同一对象的所有块共享同一个分片组：块是独立编码的，但落到哪
+	// k+m 个节点由对象 key 的环位置一次决定，避免逐块重算放置。
+	EC *ECLayout `json:"ec,omitempty"`
+}
+
+// 数据布局常量。
+const (
+	// LayoutReplica 是显式多副本布局；空字符串含义相同。
+	LayoutReplica = "replica"
+	// LayoutEC 是纠删码布局。
+	LayoutEC = "ec"
+)
+
+// ECLayout 描述一个 EC 对象的分片组。
+type ECLayout struct {
+	K int `json:"k"`
+	M int `json:"m"`
+	// Group 是 shard 组：长度必须为 K+M，下标即 shard 序号。
+	//
+	// 下标固定意味着"第 i 片"由 meta 决定而非节点自报：同一块的所有
+	// 分片长度相同，重建时按 present 标记取任意 K 片即可，但修复必须
+	// 知道缺的是哪一片，因此组顺序是元数据的一部分。
+	Group []string `json:"group"`
 }
 
 // objectMeta 是包内沿用的短名。用别名而不是第二个结构体：
@@ -218,6 +248,18 @@ type BlockDesc struct {
 	//
 	// 与 Hash 并存不是冗余：SHA256 用于"内容就是它宣称的东西"（安全性），
 	// CRC32C 用于"盘上的位没翻转"（可廉价全量重算，有硬件指令）。
+	CRC32C uint32 `json:"crc32c"`
+	// Shards 仅 EC 布局下非空，长度必须为 K+M。
+	//
+	// 每个分片单独作为 CAS 块存放：Hash 是分片内容哈希，修复搬运与
+	// 去重复用块层能力；BlockDesc.Hash 仍是整块哈希，用于重建后校验。
+	Shards []ShardDesc `json:"shards,omitempty"`
+}
+
+// ShardDesc 描述 EC 块的一个分片。
+type ShardDesc struct {
+	Hash   string `json:"hash"`
+	Length int64  `json:"length"`
 	CRC32C uint32 `json:"crc32c"`
 }
 

@@ -2,11 +2,19 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 
 	"github.com/binbinpeng123/Blink/internal/store"
 )
+
+// errTargetUnavailable 表示目标节点既没有本地句柄也没有远端客户端。
+//
+// targetFor 对成员表之外的 ID 返回这样一个空目标。EC meta 里记录的
+// 分片组可能来自成员表变更之前，用它对旧组做修复时就会遇到；空目标
+// 必须返回错误而不是在 nil 上取方法，否则一次陈旧元数据就能让进程 panic。
+var errTargetUnavailable = errors.New("cluster: 目标节点不可用")
 
 // 本文件是集群读写的公共零件：把一次操作扇出到多个副本目标，
 // 再按法定人数汇总结果。
@@ -198,7 +206,13 @@ func (c *Cluster) putMetaToAll(bucket, key string, m *store.ObjectMeta, ts []tar
 
 // target 的副本操作：本地直连存储，远端走内部协议。
 
+// available 报告目标是否指向某个真实节点。
+func (t target) available() bool { return t.local != nil || t.client != nil }
+
 func (t target) getMeta(ctx context.Context, bucket, key string) (*store.ObjectMeta, bool, error) {
+	if !t.available() {
+		return nil, false, errTargetUnavailable
+	}
 	if t.local != nil {
 		return t.local.LoadReplicaMeta(bucket, key)
 	}
@@ -206,6 +220,9 @@ func (t target) getMeta(ctx context.Context, bucket, key string) (*store.ObjectM
 }
 
 func (t target) putMeta(ctx context.Context, bucket, key string, m *store.ObjectMeta) error {
+	if !t.available() {
+		return errTargetUnavailable
+	}
 	if t.local != nil {
 		return t.local.PutReplicaMeta(bucket, key, m)
 	}
@@ -213,6 +230,9 @@ func (t target) putMeta(ctx context.Context, bucket, key string, m *store.Object
 }
 
 func (t target) putBlock(ctx context.Context, hash string, data []byte) (bool, error) {
+	if !t.available() {
+		return false, errTargetUnavailable
+	}
 	if t.local != nil {
 		return t.local.PutBlock(hash, data)
 	}
@@ -220,6 +240,9 @@ func (t target) putBlock(ctx context.Context, hash string, data []byte) (bool, e
 }
 
 func (t target) blockExists(ctx context.Context, hash string) (bool, error) {
+	if !t.available() {
+		return false, errTargetUnavailable
+	}
 	if t.local != nil {
 		return t.local.BlockExists(hash)
 	}
@@ -227,6 +250,9 @@ func (t target) blockExists(ctx context.Context, hash string) (bool, error) {
 }
 
 func (t target) getBlock(ctx context.Context, b store.BlockDesc, offset, length int64, w io.Writer) error {
+	if !t.available() {
+		return errTargetUnavailable
+	}
 	if t.local != nil {
 		return t.local.ReadBlockRange(w, b, offset, length)
 	}

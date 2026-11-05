@@ -76,8 +76,32 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 		alive[t.id] = true
 	}
 
+	// EC 只对足够大的对象生效：小对象走副本，避免 k+m 份分片描述与
+	// k+m 个 CAS 文件相对几百字节内容造成的放大。
+	useEC := c.ecEnabled() && opt.ExpectedSize >= c.cfg.ECMinSize
+	var ecw *ecWriteState
+	if useEC {
+		ecw, err = c.newECWrite(bucket, key)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	var blockCount, dedupedBlocks int
+	var shardBlocks [][]store.ShardDesc
 	summary, err := c.Store.StreamBlocks(body, opt.ChecksumAlgorithm, key, func(b store.Block) error {
+		if ecw != nil {
+			descs, deduped, err := c.distributeECBlock(ecw, b)
+			if err != nil {
+				return err
+			}
+			shardBlocks = append(shardBlocks, descs)
+			blockCount++
+			if deduped {
+				dedupedBlocks++
+			}
+			return nil
+		}
 		deduped, err := c.distributeBlock(alive, ts, b)
 		if err != nil {
 			return err
@@ -94,6 +118,18 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// 回调里的 BlockDesc 是值拷贝，分片表只能在 StreamBlocks 返回后
+	// 按索引回填；在回调里改 b.Desc 不会传回 summary。
+	if ecw != nil {
+		if len(shardBlocks) != len(summary.Blocks) {
+			return nil, fmt.Errorf("%w: 分片表 %d 项与块表 %d 项不一致",
+				store.ErrCorrupt, len(shardBlocks), len(summary.Blocks))
+		}
+		for i := range summary.Blocks {
+			summary.Blocks[i].Shards = shardBlocks[i]
+		}
 	}
 
 	// 长度与摘要校验必须在 meta 落盘之前：此刻失败只会留下孤儿块，
@@ -142,16 +178,26 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 		NodeID:            c.cfg.NodeID,
 		ObjVersion:        c.clock.Next(seen),
 	}
-
-	live := make([]target, 0, len(ts))
-	for _, t := range ts {
-		if alive[t.id] {
-			live = append(live, t)
-		}
+	if ecw != nil {
+		meta.Layout = store.LayoutEC
+		meta.EC = &store.ECLayout{K: ecw.codec.K(), M: ecw.codec.M(), Group: ecw.names}
 	}
-	if len(live) < c.cfg.WriteQuorum {
-		return nil, fmt.Errorf("%w: 仅 %d 个副本完成了块写入，需要 %d",
-			store.ErrUnavailable, len(live), c.cfg.WriteQuorum)
+
+	// EC 的"块已落地"不等于副本节点持有数据：分片在 k+m 个组员上，
+	// meta 仍提交给 N 个副本。因此 EC 路径用完整副本集，由 W 个 ack
+	// 决定成败；不可达的节点会在这里各自失败，不拖累其余节点提交。
+	live := ts
+	if ecw == nil {
+		live = make([]target, 0, len(ts))
+		for _, t := range ts {
+			if alive[t.id] {
+				live = append(live, t)
+			}
+		}
+		if len(live) < c.cfg.WriteQuorum {
+			return nil, fmt.Errorf("%w: 仅 %d 个副本完成了块写入，需要 %d",
+				store.ErrUnavailable, len(live), c.cfg.WriteQuorum)
+		}
 	}
 
 	ok, errs := c.putMetaToAll(bucket, key, meta, live)
@@ -174,9 +220,17 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 			c.repair.enqueue(live[i].id, repairMeta, bucket, key, meta.ObjVersion)
 		}
 	}
-	for _, t := range ts {
-		if !alive[t.id] {
-			c.repair.enqueue(t.id, repairBlocks, bucket, key, meta.ObjVersion)
+	if ecw != nil {
+		// 分片没写成功的组员各自补分片；不按副本集过滤，否则组里
+		// 不在副本集上的节点会被 repair.enqueue 直接丢弃。
+		for id := range ecw.failed {
+			c.repair.enqueue(id, repairBlocks, bucket, key, meta.ObjVersion)
+		}
+	} else {
+		for _, t := range ts {
+			if !alive[t.id] {
+				c.repair.enqueue(t.id, repairBlocks, bucket, key, meta.ObjVersion)
+			}
 		}
 	}
 

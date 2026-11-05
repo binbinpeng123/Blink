@@ -173,8 +173,9 @@ func (r *repairer) enqueue(targetID string, kind repairKind, bucket, key string,
 	if err := store.ValidateObjectPath(bucket, key); err != nil {
 		return
 	}
-	if !r.c.isReplicaTarget(targetID, bucket, key) {
-		// 目标已不在这个 key 的副本集里（成员表变更后），补它没有意义。
+	if !r.c.isDataTarget(targetID, bucket, key) {
+		// 目标已不在这个 key 的副本集或分片组里（成员表变更后），
+		// 补它没有意义。
 		return
 	}
 
@@ -391,20 +392,9 @@ func (r *repairer) execute(t *repairTask) error {
 
 	ctx := context.Background()
 
+	// 先探测、再定位目标。不能先按副本集定位：EC 分片组里可能有节点
+	// 不在副本集上，那样一进来就会被判成 repair_target_moved 而永久漏修。
 	ts := r.c.targetsFor(task.Bucket, task.Key)
-	var target *target
-	for i := range ts {
-		if ts[i].id == task.TargetNode {
-			target = &ts[i]
-			break
-		}
-	}
-	if target == nil {
-		r.c.logger.Info("repair_target_moved",
-			"peer", task.TargetNode, "bucket", task.Bucket, "key", task.Key)
-		return nil
-	}
-
 	probe := r.c.probeMetas(task.Bucket, task.Key, ts)
 	responded, _ := countResponses(probe)
 	if responded < r.c.cfg.ReadQuorum {
@@ -422,10 +412,43 @@ func (r *repairer) execute(t *repairTask) error {
 		return nil
 	}
 
+	// 目标可能同时是副本成员与分片组成员，两个身份分别处理：
+	//   - 副本成员负责 meta（以及副本布局下的整块）；
+	//   - 分片组成员负责自己那一片。
+	replicaIdx := -1
+	for i := range ts {
+		if ts[i].id == task.TargetNode {
+			replicaIdx = i
+			break
+		}
+	}
+	var group []target
+	groupIdx := -1
+	if latest.Layout == store.LayoutEC && latest.EC != nil {
+		g, err := r.c.ecTargetsFor(latest)
+		if err != nil {
+			return err
+		}
+		group = g
+		for i := range group {
+			if group[i].id == task.TargetNode {
+				groupIdx = i
+				break
+			}
+		}
+	}
+	if replicaIdx < 0 && groupIdx < 0 {
+		r.c.logger.Info("repair_target_moved",
+			"peer", task.TargetNode, "bucket", task.Bucket, "key", task.Key)
+		return nil
+	}
+
 	var current *store.ObjectMeta
-	for _, res := range probe {
-		if res.id == task.TargetNode && res.err == nil && res.found {
-			current = res.meta
+	if replicaIdx >= 0 {
+		for _, res := range probe {
+			if res.id == task.TargetNode && res.err == nil && res.found {
+				current = res.meta
+			}
 		}
 	}
 	if current != nil && newerMeta(current, latest) {
@@ -433,14 +456,28 @@ func (r *repairer) execute(t *repairTask) error {
 	}
 
 	if !latest.Deleted {
-		if err := r.ensureBlocks(ctx, ts, *target, latest.Blocks); err != nil {
-			return err
+		if groupIdx >= 0 {
+			if err := r.ensureECShards(ctx, latest, groupIdx, group, group[groupIdx]); err != nil {
+				return err
+			}
 		}
+		// EC 对象的整块并不存在于任何节点，块表里也没有可搬运的整块：
+		// 副本成员只承担 meta，数据由上面的分片补齐负责。
+		if replicaIdx >= 0 && latest.Layout != store.LayoutEC {
+			if err := r.ensureBlocks(ctx, ts, ts[replicaIdx], latest.Blocks); err != nil {
+				return err
+			}
+		}
+	}
+
+	if replicaIdx < 0 {
+		// 只是分片组成员，不持有 meta：分片补齐即完成。
+		return nil
 	}
 	if current != nil && sameVersion(current, latest) {
 		return nil
 	}
-	if err := target.putMeta(ctx, task.Bucket, task.Key, latest); err != nil {
+	if err := ts[replicaIdx].putMeta(ctx, task.Bucket, task.Key, latest); err != nil {
 		if isStaleError(err) {
 			// 对端已有更新版本：本任务的目标已被别处满足。
 			return nil
@@ -637,7 +674,7 @@ func (r *repairer) loadHints() {
 				_ = os.Remove(path)
 				continue
 			}
-			if !r.c.isReplicaTarget(t.TargetNode, t.Bucket, t.Key) {
+			if !r.c.isDataTarget(t.TargetNode, t.Bucket, t.Key) {
 				_ = os.Remove(path)
 				continue
 			}

@@ -53,6 +53,12 @@ const (
 	// 过期的数据。
 	DefaultReadDegraded = false
 
+	// DefaultECEnabled 默认关闭纠删码：单机与既有集群的行为不变，
+	// 是否启用属于部署决策而不是升级副作用。
+	DefaultECEnabled = false
+	// DefaultECMinSize 与 cluster 包保持一致。
+	DefaultECMinSize = cluster.DefaultECMinSize
+
 	// 集群模式取值。
 	ClusterModeSingle  = "single"
 	ClusterModeCluster = "cluster"
@@ -97,6 +103,12 @@ const (
 	EnvRepairMaxConcurrency = "BLINK_REPAIR_MAX_CONCURRENCY"
 	EnvHintTTL              = "BLINK_HINT_TTL"
 	EnvReadDegraded         = "BLINK_READ_DEGRADED"
+
+	// 纠删码。k/m 留空（0）时按成员数选 profile。
+	EnvECEnabled = "BLINK_EC_ENABLED"
+	EnvECK       = "BLINK_EC_K"
+	EnvECM       = "BLINK_EC_M"
+	EnvECMinSize = "BLINK_EC_MIN_SIZE"
 )
 
 // Config 是服务的完整启动配置。
@@ -170,6 +182,13 @@ type Config struct {
 	HintTTL time.Duration
 	// ReadDegraded 允许在响应副本不足 R 时仍从可用副本读取。
 	ReadDegraded bool
+	// ECEnabled 开启对象级纠删码；仅对 ≥ECMinSize 的对象生效。
+	ECEnabled bool
+	// ECK / ECM 是数据片与校验片数；都为 0 时按成员数选择默认 profile。
+	ECK int
+	ECM int
+	// ECMinSize 是走 EC 的最小对象字节数。
+	ECMinSize int64
 	// TLSCert 是 PEM 证书链文件路径；为空表示不启用 TLS。
 	TLSCert string
 	// TLSKey 是 PEM 私钥文件路径；必须与 TLSCert 同时提供。
@@ -219,6 +238,8 @@ func Default() Config {
 		RepairMaxConcurrency: DefaultRepairMaxConcurrency,
 		HintTTL:              DefaultHintTTL,
 		ReadDegraded:         DefaultReadDegraded,
+		ECEnabled:            DefaultECEnabled,
+		ECMinSize:            DefaultECMinSize,
 	}
 }
 
@@ -258,6 +279,10 @@ func Load(args []string, out io.Writer) (Config, error) {
 	fs.DurationVar(&cfg.ScrubInterval, "scrub-interval", cfg.ScrubInterval, "反熵扫描周期，负值禁用（环境变量 "+EnvScrubInterval+"）")
 	fs.IntVar(&cfg.RepairMaxConcurrency, "repair-max-concurrency", cfg.RepairMaxConcurrency, "每节点修复并发上限（环境变量 "+EnvRepairMaxConcurrency+"）")
 	fs.DurationVar(&cfg.HintTTL, "hint-ttl", cfg.HintTTL, "修复任务最长保留期（环境变量 "+EnvHintTTL+"）")
+	fs.BoolVar(&cfg.ECEnabled, "ec-enabled", cfg.ECEnabled, "开启对象级纠删码（环境变量 "+EnvECEnabled+"）")
+	fs.IntVar(&cfg.ECK, "ec-k", cfg.ECK, "EC 数据片数，0 表示按成员数选 profile（环境变量 "+EnvECK+"）")
+	fs.IntVar(&cfg.ECM, "ec-m", cfg.ECM, "EC 校验片数，0 表示按成员数选 profile（环境变量 "+EnvECM+"）")
+	fs.Var(sizeValue{&cfg.ECMinSize}, "ec-min-size", "走 EC 的最小对象大小，如 32MiB（环境变量 "+EnvECMinSize+"）")
 	fs.DurationVar(&cfg.MaxClockSkew, "max-clock-skew", cfg.MaxClockSkew, "签名校验允许的时钟偏移")
 	fs.Int64Var(&cfg.BlockSize, "block-size", cfg.BlockSize, "大对象块大小（字节）")
 	fs.Int64Var(&cfg.InlineThreshold, "inline-threshold", cfg.InlineThreshold, "小对象内联阈值（字节）")
@@ -304,6 +329,9 @@ func applyEnv(cfg *Config) {
 	cfg.applyDurationEnv(EnvScrubInterval, &cfg.ScrubInterval, &cfg.clusterEnvErr)
 	cfg.applyIntEnv(EnvRepairMaxConcurrency, &cfg.RepairMaxConcurrency, &cfg.clusterEnvErr)
 	cfg.applyDurationEnv(EnvHintTTL, &cfg.HintTTL, &cfg.clusterEnvErr)
+	cfg.applyIntEnv(EnvECK, &cfg.ECK, &cfg.clusterEnvErr)
+	cfg.applyIntEnv(EnvECM, &cfg.ECM, &cfg.clusterEnvErr)
+	cfg.applySizeEnv(EnvECMinSize, &cfg.ECMinSize, &cfg.clusterEnvErr)
 
 	if v := os.Getenv("BLINK_MAX_CLOCK_SKEW"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -327,6 +355,15 @@ func applyEnv(cfg *Config) {
 				fmt.Errorf("%s 取值 %q 不是合法的布尔值", EnvReadDegraded, v))
 		} else {
 			cfg.ReadDegraded = b
+		}
+	}
+	if v := os.Getenv(EnvECEnabled); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			cfg.clusterEnvErr = errors.Join(cfg.clusterEnvErr,
+				fmt.Errorf("%s 取值 %q 不是合法的布尔值", EnvECEnabled, v))
+		} else {
+			cfg.ECEnabled = b
 		}
 	}
 }
@@ -358,6 +395,85 @@ func (c *Config) applyDurationEnv(key string, dst *time.Duration, sink *error) {
 		return
 	}
 	*dst = d
+}
+
+// applySizeEnv 解析带单位的大小环境变量（如 32MiB、1GiB，或纯字节数）。
+func (c *Config) applySizeEnv(key string, dst *int64, sink *error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return
+	}
+	n, err := parseSize(v)
+	if err != nil {
+		*sink = errors.Join(*sink, fmt.Errorf("%s 取值 %q 无效: %v", key, v, err))
+		return
+	}
+	*dst = n
+}
+
+// sizeValue 让 flag 包接受 "32MiB" 这类大小写法。
+type sizeValue struct{ dst *int64 }
+
+func (v sizeValue) String() string {
+	if v.dst == nil {
+		return "0"
+	}
+	return strconv.FormatInt(*v.dst, 10)
+}
+
+func (v sizeValue) Set(s string) error {
+	n, err := parseSize(s)
+	if err != nil {
+		return err
+	}
+	if v.dst != nil {
+		*v.dst = n
+	}
+	return nil
+}
+
+// parseSize 解析大小，支持 B/KiB/MiB/GiB/TiB。
+//
+// KB/MB/GB/TB 也按 1024 进制解释：这是存储配置里的常见写法，
+// 与其纠结 SI 与 IEC 的差异，不如让同一后缀永远表示同一个数值。
+func parseSize(raw string) (int64, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, errors.New("大小为空")
+	}
+	upper := strings.ToUpper(s)
+	var unit int64 = 1
+	switch {
+	case strings.HasSuffix(upper, "TIB"):
+		unit, s = 1<<40, s[:len(s)-3]
+	case strings.HasSuffix(upper, "GIB"):
+		unit, s = 1<<30, s[:len(s)-3]
+	case strings.HasSuffix(upper, "MIB"):
+		unit, s = 1<<20, s[:len(s)-3]
+	case strings.HasSuffix(upper, "KIB"):
+		unit, s = 1<<10, s[:len(s)-3]
+	case strings.HasSuffix(upper, "TB"):
+		unit, s = 1<<40, s[:len(s)-2]
+	case strings.HasSuffix(upper, "GB"):
+		unit, s = 1<<30, s[:len(s)-2]
+	case strings.HasSuffix(upper, "MB"):
+		unit, s = 1<<20, s[:len(s)-2]
+	case strings.HasSuffix(upper, "KB"):
+		unit, s = 1<<10, s[:len(s)-2]
+	case strings.HasSuffix(upper, "B"):
+		s = s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("无法解析大小 %q（示例：32MiB、1GiB、33554432）", raw)
+	}
+	if n < 0 {
+		return 0, errors.New("大小不能为负数")
+	}
+	if n > (1<<63-1)/unit {
+		return 0, fmt.Errorf("大小 %q 超出 int64 范围", raw)
+	}
+	return n * unit, nil
 }
 
 // addEnvErr 累积环境变量解析错误。
@@ -502,6 +618,11 @@ func (c Config) ClusterConfig() (cluster.Config, error) {
 		RepairMaxConcurrency: c.RepairMaxConcurrency,
 		HintTTL:              c.HintTTL,
 		ReadDegraded:         c.ReadDegraded,
+
+		ECEnabled: c.ECEnabled,
+		ECK:       c.ECK,
+		ECM:       c.ECM,
+		ECMinSize: c.ECMinSize,
 	}, nil
 }
 
@@ -558,6 +679,10 @@ func (c Config) Redacted() map[string]string {
 		"repair_max_concurrency": strconv.Itoa(c.RepairMaxConcurrency),
 		"hint_ttl_hours":         strconv.FormatInt(int64(c.HintTTL.Hours()), 10),
 		"read_degraded":          strconv.FormatBool(c.ReadDegraded),
+		"ec_enabled":             strconv.FormatBool(c.ECEnabled),
+		"ec_k":                   strconv.Itoa(c.ECK),
+		"ec_m":                   strconv.Itoa(c.ECM),
+		"ec_min_size_bytes":      strconv.FormatInt(c.ECMinSize, 10),
 		// TLS 只输出开关与文件路径：路径不是秘密，但私钥内容永远不出现。
 		"tls_enabled": strconv.FormatBool(c.TLSCert != ""),
 		"tls_cert":    c.TLSCert,

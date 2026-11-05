@@ -16,7 +16,13 @@
 #   - 杀掉 1 个节点后仍可读写（W=2 / R=2 仍可满足）；
 #   - 节点用同一数据目录重启后，宕机期间的写入被自动修复补齐，
 #     且修复队列（hint 文件）随任务完成清空；
-#   - 杀掉其余 2 个节点后读写回 503，而不是假装对象不存在。
+#   - 只保留 1 个节点时读写回 503，而不是假装对象不存在。
+#
+# 带 --ec 时额外验证纠删码：
+#   - 写入 ≥32 MiB 对象，其它节点读回逐字节一致；
+#   - meta 记录 layout=ec / 4+2 分片组；
+#   - 删掉 2 片后仍能从剩余 4 片重建读取；
+#   - 读路径触发的修复把删掉的分片重新写回磁盘。
 #
 # 该脚本只用固定端口、临时目录与测试凭据，仅用于本地验证，
 # 不得指向任何真实部署。
@@ -26,13 +32,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 N="${1:-3}"
-if [[ "$N" != "3" ]]; then
-  echo "用法: $0 [3]" >&2
-  echo "当前切片只验证 N=3 的副本读写；EC/6 节点形态在切片 7 引入。" >&2
-  exit 2
+MODE="${2:-}"
+case "$N:$MODE" in
+  3:) ;;
+  6:--ec) ;;
+  *)
+    echo "用法: $0 [3 | 6 --ec]" >&2
+    echo "3 节点验证多副本读写；6 节点 --ec 额外验证纠删码（4+2）。" >&2
+    exit 2
+    ;;
+esac
+if [[ "$N" == "6" ]]; then
+  EC_ENABLED=true
+  EC_K=4
+  EC_M=2
+else
+  EC_ENABLED=false
+  EC_K=0
+  EC_M=0
 fi
 
 BIN="bin/blink"
+# 最后一个节点的下标：脚本里"另一个节点"的验证尽量落在它身上，
+# 既覆盖非首节点的视角，也能在 3/6 两种规模下复用同一份逻辑。
+LAST=$((N - 1))
 BUCKET="cluster-smoke-$(date +%s)"
 S3_PORT_BASE=19101
 INTERNAL_PORT_BASE=19201
@@ -109,6 +132,9 @@ start_node() {
   BLINK_REPLICA_COUNT=3 \
   BLINK_WRITE_QUORUM=2 \
   BLINK_READ_QUORUM=2 \
+  BLINK_EC_ENABLED="$EC_ENABLED" \
+  BLINK_EC_K="$EC_K" \
+  BLINK_EC_M="$EC_M" \
     "$BIN" \
       --addr "127.0.0.1:$(s3_port "$i")" \
       --data-dir "$TMP_DIR/node${i}/data" \
@@ -159,8 +185,8 @@ for i in $(seq 0 $((N - 1))); do
     | tr '\t' '\n' | grep -qx "$BUCKET" \
     || fail "节点 $((i + 1)) 的 list-buckets 缺少 ${BUCKET}"
 done
-if OUT="$(aws_at 2 s3api create-bucket --bucket "$BUCKET" 2>&1)"; then
-  fail "在节点 3 重复建桶应失败，实际成功"
+if OUT="$(aws_at "$LAST" s3api create-bucket --bucket "$BUCKET" 2>&1)"; then
+  fail "在节点 ${N} 重复建桶应失败，实际成功"
 fi
 grep -q "BucketAlreadyOwnedByYou" <<<"$OUT" \
   || fail "重复建桶错误不是 BucketAlreadyOwnedByYou: ${OUT}"
@@ -171,11 +197,11 @@ dd if=/dev/urandom of="$PAYLOAD" bs=1024 count=8192 2>/dev/null # 8 MiB，跨多
 WANT_ETAG="$(md5 -q "$PAYLOAD")"
 WANT_SIZE="$(wc -c <"$PAYLOAD" | tr -d ' ')"
 
-echo "==> 节点 1 写入，节点 2/3 读取"
+echo "==> 节点 1 写入，其余节点读取"
 aws_at 0 s3api put-object --bucket "$BUCKET" --key big.bin --body "$PAYLOAD" >/dev/null \
   || fail "节点 1 写入失败"
 
-for i in 1 2; do
+for i in $(seq 1 "$LAST"); do
   aws_at "$i" s3api get-object --bucket "$BUCKET" --key big.bin "$TMP_DIR/read${i}.bin" >/dev/null \
     || fail "节点 $((i + 1)) 读取失败"
   cmp -s "$PAYLOAD" "$TMP_DIR/read${i}.bin" \
@@ -183,10 +209,10 @@ for i in 1 2; do
 done
 
 echo "==> 校验 HEAD 元数据"
-HEAD_ETAG="$(aws_at 2 s3api head-object --bucket "$BUCKET" --key big.bin --query ETag --output text \
+HEAD_ETAG="$(aws_at "$LAST" s3api head-object --bucket "$BUCKET" --key big.bin --query ETag --output text \
   | tr -d '"')"
 [[ "$HEAD_ETAG" == "$WANT_ETAG" ]] || fail "HEAD ETag=${HEAD_ETAG}，期望 ${WANT_ETAG}"
-HEAD_SIZE="$(aws_at 2 s3api head-object --bucket "$BUCKET" --key big.bin --query ContentLength --output text)"
+HEAD_SIZE="$(aws_at "$LAST" s3api head-object --bucket "$BUCKET" --key big.bin --query ContentLength --output text)"
 [[ "$HEAD_SIZE" == "$WANT_SIZE" ]] || fail "HEAD ContentLength=${HEAD_SIZE}，期望 ${WANT_SIZE}"
 
 echo "==> 跨块 Range 读取"
@@ -203,7 +229,7 @@ echo "==> 覆盖写后所有节点收敛"
 echo -n "new-content-after-overwrite" >"$TMP_DIR/small.bin"
 aws_at 0 s3api put-object --bucket "$BUCKET" --key small.bin --body "$TMP_DIR/small.bin" >/dev/null \
   || fail "首次写入 small.bin 失败"
-aws_at 2 s3api put-object --bucket "$BUCKET" --key small.bin --body "$PAYLOAD" >/dev/null \
+aws_at "$LAST" s3api put-object --bucket "$BUCKET" --key small.bin --body "$PAYLOAD" >/dev/null \
   || fail "覆盖写 small.bin 失败"
 for i in $(seq 0 $((N - 1))); do
   aws_at "$i" s3api get-object --bucket "$BUCKET" --key small.bin "$TMP_DIR/small${i}.got" >/dev/null \
@@ -215,7 +241,7 @@ done
 # 跨节点 LIST：每个节点看到的对象集合必须完全相同。
 # 对象轮流经不同节点写入，副本散落在不同节点上，归并逻辑只要漏一份就会露馅。
 echo "==> 跨节点 LIST"
-for i in 0 1 2; do
+for i in $(seq 0 "$LAST"); do
   aws_at "$i" s3api put-object --bucket "$BUCKET" --key "dir/obj-$i.bin" \
     --body "$TMP_DIR/small.bin" >/dev/null || fail "节点 $((i + 1)) 写入 dir/obj-$i.bin 失败"
 done
@@ -226,7 +252,8 @@ list_keys() {
     --query 'Contents[].Key' --output text 2>/dev/null \
     | tr '\t' '\n' | grep -vx 'None' | sed '/^$/d' | sort
 }
-WANT_KEYS="$(printf '%s\n' big.bin dir/obj-0.bin dir/obj-1.bin dir/obj-2.bin small.bin | sort)"
+WANT_KEYS="$({ printf '%s\n' big.bin small.bin
+  for i in $(seq 0 "$LAST"); do printf 'dir/obj-%s.bin\n' "$i"; done; } | sort)"
 for i in $(seq 0 $((N - 1))); do
   GOT_KEYS="$(list_keys "$i")"
   [[ "$GOT_KEYS" == "$WANT_KEYS" ]] \
@@ -274,9 +301,9 @@ cat "$TMP_DIR/part1.bin" "$TMP_DIR/part2.bin" >"$TMP_DIR/mpu.want"
 ETAG1="$(aws_at 1 s3api upload-part --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
   --upload-id "$UPLOAD_ID" --part-number 1 --body "$TMP_DIR/part1.bin" \
   --query ETag --output text)" || fail "节点 2 上传分片 1 失败"
-ETAG2="$(aws_at 2 s3api upload-part --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
+ETAG2="$(aws_at "$LAST" s3api upload-part --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
   --upload-id "$UPLOAD_ID" --part-number 2 --body "$TMP_DIR/part2.bin" \
-  --query ETag --output text)" || fail "节点 3 上传分片 2 失败"
+  --query ETag --output text)" || fail "节点 ${N} 上传分片 2 失败"
 
 LIST_PARTS="$(aws_at 0 s3api list-parts --bucket "$MPU_BUCKET" --key "$MPU_KEY" \
   --upload-id "$UPLOAD_ID" --query 'Parts[].[PartNumber,Size]' --output text)" \
@@ -327,7 +354,7 @@ done
 
 # 进行中的 MPU 让桶"非空"：非空判定必须查全部节点，而不只是本地磁盘。
 echo "==> 进行中 MPU 阻止删桶，Abort 后可删"
-UPLOAD_ID2="$(aws_at 2 s3api create-multipart-upload --bucket "$MPU_BUCKET" --key in-progress.bin \
+UPLOAD_ID2="$(aws_at "$LAST" s3api create-multipart-upload --bucket "$MPU_BUCKET" --key in-progress.bin \
   --query UploadId --output text)" || fail "创建第二个会话失败"
 if OUT="$(aws_at 0 s3api delete-bucket --bucket "$MPU_BUCKET" 2>&1)"; then
   fail "有进行中 MPU 时删桶应失败，实际成功"
@@ -336,7 +363,7 @@ grep -q "BucketNotEmpty" <<<"$OUT" || fail "有进行中 MPU 时删桶错误不�
 
 aws_at 1 s3api abort-multipart-upload --bucket "$MPU_BUCKET" --key in-progress.bin \
   --upload-id "$UPLOAD_ID2" >/dev/null || fail "Abort 失败"
-if OUT="$(aws_at 2 s3api list-parts --bucket "$MPU_BUCKET" --key in-progress.bin \
+if OUT="$(aws_at "$LAST" s3api list-parts --bucket "$MPU_BUCKET" --key in-progress.bin \
   --upload-id "$UPLOAD_ID2" 2>&1)"; then
   fail "Abort 后仍能列举分片"
 fi
@@ -345,7 +372,7 @@ grep -q "NoSuchUpload" <<<"$OUT" || fail "Abort 后 list-parts 错误不是 NoSu
 # Abort 是集群范围的：会话清掉后桶里只剩已完成的 mpu.bin，删对象即可删桶。
 aws_at 0 s3api delete-object --bucket "$MPU_BUCKET" --key "$MPU_KEY" >/dev/null \
   || fail "删除 MPU 对象失败"
-aws_at 2 s3api delete-bucket --bucket "$MPU_BUCKET" >/dev/null \
+aws_at "$LAST" s3api delete-bucket --bucket "$MPU_BUCKET" >/dev/null \
   || fail "Abort 后删桶失败"
 for i in $(seq 0 $((N - 1))); do
   if aws_at "$i" s3api head-bucket --bucket "$MPU_BUCKET" >/dev/null 2>&1; then
@@ -371,7 +398,7 @@ echo "==> 桶删除：非空拒绝，清空后全集群生效"
 META_BUCKET="${BUCKET}-meta"
 aws_at 1 s3api create-bucket --bucket "$META_BUCKET" >/dev/null \
   || fail "建桶 ${META_BUCKET} 失败"
-aws_at 2 s3api put-object --bucket "$META_BUCKET" --key keep.bin \
+aws_at "$LAST" s3api put-object --bucket "$META_BUCKET" --key keep.bin \
   --body "$TMP_DIR/small.bin" >/dev/null || fail "写入 ${META_BUCKET}/keep.bin 失败"
 
 if OUT="$(aws_at 0 s3api delete-bucket --bucket "$META_BUCKET" 2>&1)"; then
@@ -381,7 +408,7 @@ grep -q "BucketNotEmpty" <<<"$OUT" || fail "非空桶删除错误不是 BucketNo
 
 aws_at 0 s3api delete-object --bucket "$META_BUCKET" --key keep.bin >/dev/null \
   || fail "删除 ${META_BUCKET}/keep.bin 失败"
-aws_at 2 s3api delete-bucket --bucket "$META_BUCKET" >/dev/null \
+aws_at "$LAST" s3api delete-bucket --bucket "$META_BUCKET" >/dev/null \
   || fail "清空后删桶失败"
 for i in $(seq 0 $((N - 1))); do
   if aws_at "$i" s3api head-bucket --bucket "$META_BUCKET" >/dev/null 2>&1; then
@@ -393,10 +420,86 @@ for i in $(seq 0 $((N - 1))); do
   fi
 done
 
+# EC 段落在所有节点都在线时执行：4+2 的编码写入要求 6 个组成员全部可达，
+# 而下面的故障注入会杀掉一个节点。
+if [[ "$EC_ENABLED" == "true" ]]; then
+  echo "==> 纠删码：写入 40 MiB 对象（超过 32 MiB 阈值）"
+  EC_PAYLOAD="$TMP_DIR/ec.bin"
+  dd if=/dev/urandom of="$EC_PAYLOAD" bs=1048576 count=40 2>/dev/null
+  aws_at 0 s3api put-object --bucket "$BUCKET" --key ec/object.bin --body "$EC_PAYLOAD" >/dev/null \
+    || fail "EC 对象写入失败"
+  aws_at "$LAST" s3api get-object --bucket "$BUCKET" --key ec/object.bin "$TMP_DIR/ec.got" >/dev/null \
+    || fail "EC 对象跨节点读取失败"
+  cmp -s "$EC_PAYLOAD" "$TMP_DIR/ec.got" \
+    || fail "EC 对象跨节点读回不一致"
+
+  echo "==> 校验 EC meta 与分片布局"
+  EC_META="$(grep -rlF '"key":"ec/object.bin"' "$TMP_DIR"/node*/data/buckets | head -1 || true)"
+  [[ -n "$EC_META" ]] || fail "找不到 EC 对象的 meta"
+  # 依次输出 layout、k、m、k+m 个组员、首块 k+m 个分片哈希，各占一行。
+  # 不用 mapfile：macOS 自带 bash 3.2 没有它，而这些脚本要在开发机上跑。
+  EC_LINES=()
+  while IFS= read -r ec_line; do
+    EC_LINES+=("$ec_line")
+  done < <(python3 - "$EC_META" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+ec = m.get("ec") or {}
+print(m.get("layout", ""))
+print(ec.get("k", ""))
+print(ec.get("m", ""))
+for gid in ec.get("group", []):
+    print(gid)
+for s in m["blocks"][0].get("shards", []):
+    print(s["hash"])
+PY
+)
+  [[ "${#EC_LINES[@]}" -eq 15 ]] \
+    || fail "EC meta 解析出 ${#EC_LINES[@]} 行，期望 15 行（layout/k/m/6 组员/6 分片）"
+  [[ "${EC_LINES[0]}" == "ec" ]] || fail "EC 对象 layout=${EC_LINES[0]}，期望 ec"
+  [[ "${EC_LINES[1]}" == "4" && "${EC_LINES[2]}" == "2" ]] \
+    || fail "EC 参数=${EC_LINES[1]}+${EC_LINES[2]}，期望 4+2"
+  EC_GROUP=("${EC_LINES[@]:3:6}")
+  EC_SHARDS=("${EC_LINES[@]:9:6}")
+
+  echo "==> 删掉 2 个数据片，仍从剩余 4 片重建读取"
+  declare -a EC_SHARD_FILE=()
+  for idx in 0 1; do
+    owner="${EC_GROUP[$idx]}"
+    node_idx=$(( ${owner#node} - 1 ))
+    hash="${EC_SHARDS[$idx]}"
+    ec_file="$TMP_DIR/node${node_idx}/data/cas/${hash:0:2}/${hash}"
+    [[ -f "$ec_file" ]] || fail "分片 ${idx} 不在 ${owner} 的 CAS 目录：${ec_file}"
+    rm -f "$ec_file"
+    EC_SHARD_FILE[$idx]="$ec_file"
+  done
+  aws_at 1 s3api get-object --bucket "$BUCKET" --key ec/object.bin "$TMP_DIR/ec.rebuilt" >/dev/null \
+    || fail "删 2 片后 EC 对象读取失败"
+  cmp -s "$EC_PAYLOAD" "$TMP_DIR/ec.rebuilt" \
+    || fail "删 2 片后重建的内容与写入不一致"
+
+  # 读路径会把缺片交给修复队列；分片应被重建回原节点。
+  EC_REPAIR_DEADLINE=$((SECONDS + 60))
+  while :; do
+    ec_missing=0
+    for idx in 0 1; do
+      if [[ ! -f "${EC_SHARD_FILE[$idx]}" ]]; then
+        ec_missing=1
+      fi
+    done
+    if (( ec_missing == 0 )); then
+      break
+    fi
+    (( SECONDS < EC_REPAIR_DEADLINE )) || fail "删片后 60 秒内未重建分片"
+    sleep 0.2
+  done
+fi
+
 echo "==> 杀掉 1 个节点后仍可读写"
-kill -9 "${PIDS[2]}" 2>/dev/null || true
-wait "${PIDS[2]}" 2>/dev/null || true
-PIDS[2]=""
+DEAD=$LAST
+kill -9 "${PIDS[DEAD]}" 2>/dev/null || true
+wait "${PIDS[DEAD]}" 2>/dev/null || true
+PIDS[DEAD]=""
 
 aws_at 0 s3api put-object --bucket "$BUCKET" --key degraded.bin --body "$TMP_DIR/small.bin" >/dev/null \
   || fail "1 个节点宕机后写入失败（W=2 应仍可满足）"
@@ -409,11 +512,35 @@ cmp -s "$TMP_DIR/small.bin" "$TMP_DIR/degraded.got" \
 # 而不是靠 CAS 去重"碰巧"命中已有块。
 OUTAGE_PAYLOAD="$TMP_DIR/outage.bin"
 dd if=/dev/urandom of="$OUTAGE_PAYLOAD" bs=1024 count=1024 2>/dev/null
-aws_at 0 s3api put-object --bucket "$BUCKET" --key outage.bin --body "$OUTAGE_PAYLOAD" >/dev/null \
-  || fail "1 个节点宕机后写入 outage.bin 失败"
+
+# 副本集按 key 哈希选出 3 个节点，宕机节点未必在其中。逐个写候选 key，
+# 用"存活节点上的 meta 份数"反推：宕机节点是副本目标时只会有 REPLICA_COUNT-1
+# 份 meta 落盘（写不进去的那份进了 hint），否则 3 份齐全。选中第一个命中
+# 的 key 作为修复断言的样本，3 节点与 6 节点因此共用同一份逻辑。
+REPLICA_COUNT=3
+OUTAGE_KEY=""
+for j in $(seq 0 7); do
+  key="outage-${j}.bin"
+  aws_at 0 s3api put-object --bucket "$BUCKET" --key "$key" --body "$OUTAGE_PAYLOAD" >/dev/null \
+    || fail "1 个节点宕机后写入 ${key} 失败"
+  holders=0
+  for i in $(seq 0 "$LAST"); do
+    if [[ "$i" == "$DEAD" ]]; then
+      continue
+    fi
+    if grep -rqF "\"key\":\"${key}\"" "$TMP_DIR/node${i}/data/buckets" 2>/dev/null; then
+      holders=$((holders + 1))
+    fi
+  done
+  if (( holders == REPLICA_COUNT - 1 )); then
+    OUTAGE_KEY="$key"
+    break
+  fi
+done
+[[ -n "$OUTAGE_KEY" ]] || fail "8 次尝试内未选到副本集包含宕机节点的 key"
 
 # 宕机节点此刻不该有这份副本——否则后面的"修复补齐"断言没有意义。
-if grep -rqF '"key":"outage.bin"' "$TMP_DIR/node2/data/buckets" 2>/dev/null; then
+if grep -rqF "\"key\":\"${OUTAGE_KEY}\"" "$TMP_DIR/node${DEAD}/data/buckets" 2>/dev/null; then
   fail "宕机节点不应持有宕机期间写入的副本"
 fi
 
@@ -425,10 +552,10 @@ fi
 grep -q "ServiceUnavailable\|503" <<<"$OUT" \
   || fail "节点宕机时删桶错误不是 503: ${OUT}"
 
-echo "==> 重启节点 3，验证自动修复补齐"
+echo "==> 重启节点 ${N}，验证自动修复补齐"
 # 同一数据目录 + 同一节点 ID：模拟 Pod 原地重启（StatefulSet 的常态）。
-start_node 2
-wait_node_ready 2 || fail "节点 3 重启后未在 10 秒内就绪"
+start_node "$DEAD"
+wait_node_ready "$DEAD" || fail "节点 ${N} 重启后未在 10 秒内就绪"
 
 # pending_hints：任一节点上仍有未完成的修复任务就输出文件名。
 pending_hints() {
@@ -439,29 +566,29 @@ pending_hints() {
 # 随机失败。
 REPAIR_DEADLINE=$((SECONDS + 30))
 while :; do
-  if grep -rqF '"key":"outage.bin"' "$TMP_DIR/node2/data/buckets" 2>/dev/null \
+  if grep -rqF "\"key\":\"${OUTAGE_KEY}\"" "$TMP_DIR/node${DEAD}/data/buckets" 2>/dev/null \
     && [[ -z "$(pending_hints)" ]]; then
     break
   fi
-  ((SECONDS < REPAIR_DEADLINE)) || fail "节点 3 重启 30 秒后仍未补齐副本/清空 hint"
+  ((SECONDS < REPAIR_DEADLINE)) || fail "节点 ${N} 重启 30 秒后仍未补齐副本/清空 hint"
   sleep 0.1
 done
 
 # 不只核对 meta：块也必须真的落到重启节点上。读路径会从远端兜底，
 # 只读一次无法区分"本地已修复"和"每次都走远端搬块"。
-META_FILE="$(grep -rlF '"key":"outage.bin"' "$TMP_DIR/node2/data/buckets" | head -1 || true)"
+META_FILE="$(grep -rlF "\"key\":\"${OUTAGE_KEY}\"" "$TMP_DIR/node${DEAD}/data/buckets" | head -1 || true)"
 for hash in $(grep -o '"hash":"[0-9a-f]\{64\}"' "$META_FILE" | cut -d'"' -f4); do
-  [[ -f "$TMP_DIR/node2/data/cas/${hash:0:2}/$hash" ]] \
+  [[ -f "$TMP_DIR/node${DEAD}/data/cas/${hash:0:2}/$hash" ]] \
     || fail "重启节点缺少修复块 ${hash}"
 done
 
-aws_at 2 s3api get-object --bucket "$BUCKET" --key outage.bin "$TMP_DIR/outage.got" >/dev/null \
-  || fail "修复后节点 3 读取 outage.bin 失败"
+aws_at "$DEAD" s3api get-object --bucket "$BUCKET" --key "$OUTAGE_KEY" "$TMP_DIR/outage.got" >/dev/null \
+  || fail "修复后节点 ${N} 读取 ${OUTAGE_KEY} 失败"
 cmp -s "$OUTAGE_PAYLOAD" "$TMP_DIR/outage.got" \
-  || fail "修复后节点 3 读到的内容与写入不一致"
+  || fail "修复后节点 ${N} 读到的内容与写入不一致"
 
-echo "==> 杀掉其余 2 个节点后应返回 503"
-for idx in 1 2; do
+echo "==> 只留节点 1 后读响应返回 503"
+for idx in $(seq 1 "$LAST"); do
   kill -9 "${PIDS[$idx]}" 2>/dev/null || true
   wait "${PIDS[$idx]}" 2>/dev/null || true
   PIDS[$idx]=""
@@ -481,4 +608,8 @@ grep -q "ServiceUnavailable\|503" <<<"$OUT" \
   || fail "写入错误不是 503: ${OUT}"
 
 echo
-echo "PASS: 集群冒烟通过（${N} 节点，N=3 W=2 R=2）"
+if [[ "$EC_ENABLED" == "true" ]]; then
+  echo "PASS: 集群冒烟通过（${N} 节点，N=3 W=2 R=2，EC 4+2 丢 2 片仍可读）"
+else
+  echo "PASS: 集群冒烟通过（${N} 节点，N=3 W=2 R=2）"
+fi

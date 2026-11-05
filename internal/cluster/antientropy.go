@@ -120,26 +120,78 @@ func (r *repairer) scrubEntry(bucket string, ent store.ReplicaEntry) {
 		if latest.Deleted {
 			continue
 		}
-		if r.targetHasAllBlocks(res.id, latest.Blocks) {
+		if r.targetHasAllBlocks(res.id, latest) {
 			continue
 		}
 		r.enqueue(res.id, repairBlocks, bucket, ent.Key, latest.ObjVersion)
 	}
+
+	// EC 分片组里可能有不在副本集上的节点：它们只持有分片、没有 meta，
+	// 上面的探测循环根本看不到它们。缺片必须在这里发现 —— 一个只做分片
+	// 存储的节点掉线再恢复后不会收到任何 hint，只能靠这一轮扫描。
+	if latest.Layout == store.LayoutEC && latest.EC != nil {
+		replicas := make(map[string]bool, len(ts))
+		for _, t := range ts {
+			replicas[t.id] = true
+		}
+		for _, gid := range latest.EC.Group {
+			if r.isClosed() {
+				return
+			}
+			if replicas[gid] {
+				// 副本成员已在上一轮按分片下标检查过。
+				continue
+			}
+			if r.targetHasAllBlocks(gid, latest) {
+				continue
+			}
+			r.enqueue(gid, repairBlocks, bucket, ent.Key, latest.ObjVersion)
+		}
+	}
 }
 
-// targetHasAllBlocks 检查某副本是否持有全部块。
+// targetHasAllBlocks 检查某节点是否持有该版本要求它持有的全部数据。
+//
+// 副本布局下是"全部整块"；EC 布局下只检查该节点在分片组里的那一片。
+// 副本节点本身不持有 EC 的整块，按整块检查会让每个副本永远被判缺块，
+// 反熵每轮都重复入队。不在分片组里的节点没有数据要检查，直接视为齐全。
 //
 // 本地目标直接读盘；远端走 HEAD。探测失败按"缺块"处理而不是跳过：
 // 一次网络抖动导致漏检没有意义，而入队本身是幂等的。
-func (r *repairer) targetHasAllBlocks(id string, blocks []store.BlockDesc) bool {
+func (r *repairer) targetHasAllBlocks(id string, meta *store.ObjectMeta) bool {
+	idx := ecShardIndex(meta, id)
+	if meta.Layout == store.LayoutEC && idx < 0 {
+		return true
+	}
+
 	t := r.c.targetFor(id)
-	for _, b := range blocks {
-		ok, err := t.blockExists(context.Background(), b.Hash)
+	for i, b := range meta.Blocks {
+		hash := b.Hash
+		if meta.Layout == store.LayoutEC {
+			if i >= len(b.Shards) {
+				return false
+			}
+			hash = b.Shards[idx].Hash
+		}
+		ok, err := t.blockExists(context.Background(), hash)
 		if err != nil || !ok {
 			return false
 		}
 	}
 	return true
+}
+
+// ecShardIndex 返回 id 在 meta 分片组中的下标；非 EC 或不在组里返回 -1。
+func ecShardIndex(meta *store.ObjectMeta, id string) int {
+	if meta == nil || meta.Layout != store.LayoutEC || meta.EC == nil {
+		return -1
+	}
+	for i, gid := range meta.EC.Group {
+		if gid == id {
+			return i
+		}
+	}
+	return -1
 }
 
 // isClosed 供长循环在关闭时提前退出。

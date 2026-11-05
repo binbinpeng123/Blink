@@ -39,6 +39,12 @@ const (
 	// 超过之后仍失败的副本不再重试，交给反熵的周期扫描重新发现。
 	DefaultHintTTL = 72 * time.Hour
 
+	// DefaultECMinSize 是启用 EC 后走纠删码的最小对象大小。
+	//
+	// 小对象继续走副本：k+m 个分片即使每个只有几百字节，也会在 meta 中
+	// 留下 k+m 份描述与 k+m 个 CAS 文件，修复与 LIST 的放大不划算。
+	DefaultECMinSize = 32 << 20
+
 	// MinSecretLen 是集群共享密钥的最小长度（字节）。
 	//
 	// HMAC-SHA256 的密钥短于 32 字节不降低理论强度，但短密钥通常意味着
@@ -108,6 +114,20 @@ type Config struct {
 	// 默认 false：副本不足时回 503 而不是给出"可能是旧版本"的数据。
 	// 打开后读可用性优先于一致性，错误日志会标明降级读。
 	ReadDegraded bool
+
+	// ECEnabled 开启对象级纠删码：对象 ≥ECMinSize 时按 k+m 分片存放。
+	//
+	// 默认关闭。EC 改变的是对象布局，滚动升级期间必须全集群同时启用。
+	ECEnabled bool
+	// ECK / ECM 是数据片与校验片数。
+	//
+	// 两者都为 0 时按成员数选默认 profile：3 节点 2+1，≥6 节点 4+2。
+	// 4–5 节点没有默认值，必须显式指定，避免"以为开了 EC 其实还是副本"
+	// 或反之的部署歧义。
+	ECK int
+	ECM int
+	// ECMinSize 是走 EC 的最小对象字节数；0 表示 DefaultECMinSize。
+	ECMinSize int64
 }
 
 // ParsePeers 解析 id@host:port,... 形式的成员表。
@@ -244,6 +264,15 @@ func (c Config) Validate() error {
 		problems = append(problems, "hint-ttl 不能为负数（0 表示使用默认值）")
 	}
 
+	if c.ECEnabled {
+		if _, _, err := c.ecParams(); err != nil {
+			problems = append(problems, err.Error())
+		}
+		if c.ECMinSize < 0 {
+			problems = append(problems, "ec-min-size 不能为负数（0 表示使用默认值）")
+		}
+	}
+
 	if len(problems) == 0 {
 		return nil
 	}
@@ -268,6 +297,47 @@ func (c *Config) normalize() {
 	if c.HintTTL <= 0 {
 		c.HintTTL = DefaultHintTTL
 	}
+	if c.ECEnabled {
+		if k, m, err := c.ecParams(); err == nil {
+			c.ECK, c.ECM = k, m
+		}
+		if c.ECMinSize == 0 {
+			c.ECMinSize = DefaultECMinSize
+		}
+	}
+}
+
+// ecParams 返回生效的 (k, m)，必要时按成员数选择默认 profile。
+//
+// 只做纯计算：normalize 与 Validate 共用同一份规则，避免"校验通过但
+// 运行时用了另一组参数"这类只在生产才暴露的分歧。
+func (c Config) ecParams() (int, int, error) {
+	if !c.ECEnabled {
+		return 0, 0, nil
+	}
+	k, m := c.ECK, c.ECM
+	if k == 0 && m == 0 {
+		switch n := len(c.Peers); {
+		case n == 3:
+			k, m = 2, 1
+		case n >= 6:
+			k, m = 4, 2
+		default:
+			return 0, 0, fmt.Errorf("ec 已启用但成员数 %d 没有默认 profile，请显式设置 ec-k/ec-m（3 节点 2+1，≥6 节点 4+2）", n)
+		}
+	} else if k == 0 || m == 0 {
+		return 0, 0, fmt.Errorf("ec-k 与 ec-m 必须同时设置（当前 k=%d m=%d）", k, m)
+	}
+	if k < 1 || m < 1 {
+		return 0, 0, fmt.Errorf("ec-k 与 ec-m 必须 ≥1（当前 k=%d m=%d）", k, m)
+	}
+	if k+m > len(c.Peers) {
+		return 0, 0, fmt.Errorf("ec-k(%d)+ec-m(%d)=%d 超过成员数 %d", k, m, k+m, len(c.Peers))
+	}
+	if k+m > 256 {
+		return 0, 0, fmt.Errorf("ec-k(%d)+ec-m(%d)=%d 超过 GF(2^8) 上限 256", k, m, k+m)
+	}
+	return k, m, nil
 }
 
 // PeerByID 返回指定 ID 的成员。
