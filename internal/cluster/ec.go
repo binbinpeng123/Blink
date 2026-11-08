@@ -143,10 +143,14 @@ func (c *Cluster) distributeECBlock(w *ecWriteState, b store.Block) ([]store.Sha
 	wg.Wait()
 
 	ok := 0
+	full := 0
 	deduped := true
 	for i, o := range out {
 		if o.err != nil {
 			w.failed[w.group[i].id] = struct{}{}
+			if isStorageFull(o.err) {
+				full++
+			}
 			c.logger.Warn("replica_shard_failed",
 				"peer", w.group[i].id, "shard", i,
 				"hash", descs[i].Hash, "err", o.err.Error())
@@ -158,6 +162,12 @@ func (c *Cluster) distributeECBlock(w *ecWriteState, b store.Block) ([]store.Sha
 		}
 	}
 	if ok < w.codec.K() {
+		// 满盘导致分片不足时回 507：这与"节点离线"不同，重试不会好转，
+		// 需要先扩容或清理。
+		if full > 0 {
+			return nil, false, fmt.Errorf("%w: 块 %s 仅 %d/%d 个分片写入成功（%d 个节点已满），需要 %d",
+				store.ErrStorageFull, b.Desc.Hash, ok, len(w.group), full, w.codec.K())
+		}
 		return nil, false, fmt.Errorf("%w: 块 %s 仅 %d/%d 个分片写入成功，需要 %d",
 			store.ErrUnavailable, b.Desc.Hash, ok, len(w.group), w.codec.K())
 	}

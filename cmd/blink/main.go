@@ -22,10 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/binbinpeng123/Blink/internal/authz"
 	"github.com/binbinpeng123/Blink/internal/buildinfo"
 	"github.com/binbinpeng123/Blink/internal/cluster"
 	"github.com/binbinpeng123/Blink/internal/config"
 	"github.com/binbinpeng123/Blink/internal/logx"
+	"github.com/binbinpeng123/Blink/internal/metrics"
 	"github.com/binbinpeng123/Blink/internal/s3api"
 	"github.com/binbinpeng123/Blink/internal/sigv4"
 	"github.com/binbinpeng123/Blink/internal/store"
@@ -97,12 +99,43 @@ func run(args []string, stderr io.Writer) error {
 		logTLSInfo(logger, cert)
 	}
 
-	// 凭据在 config.Validate 中已确保非空，这里的 Provider 必定含一组有效凭据。
-	// 单节点版本只有一组静态凭据；多租户/外部凭据源通过替换 Provider 接入。
-	provider := sigv4.NewStaticProvider(sigv4.Credentials{
-		AccessKeyID: cfg.AccessKey,
-		SecretKey:   cfg.SecretKey,
-	})
+	// 凭据在 config.Validate 中已确保非空，这里的 Provider 必定含至少一组凭据。
+	//
+	// 两类凭据的权限语义刻意不同（06 文档）：
+	//   - 环境变量/命令行凭据：全权限，保证既有部署升级后行为不变；
+	//   - 文件凭据：各自带显式规则，构造时已校验，缺规则即启动失败。
+	// 策略表与 Provider 必须由同一份配置生成，否则会出现"签名能过、
+	// 策略查不到"的凭据 —— 那种凭据在请求期会被拒绝，问题却暴露得很晚。
+	creds := make([]sigv4.Credentials, 0, cfg.CredentialCount())
+	policies := make(map[string]*authz.Policy, cfg.CredentialCount())
+	if cfg.AccessKey != "" && cfg.SecretKey != "" {
+		creds = append(creds, sigv4.Credentials{
+			AccessKeyID: cfg.AccessKey,
+			SecretKey:   cfg.SecretKey,
+		})
+		policies[cfg.AccessKey] = authz.AllowAll()
+	}
+	for _, fc := range cfg.FileCredentials {
+		creds = append(creds, sigv4.Credentials{
+			AccessKeyID: fc.AccessKeyID,
+			SecretKey:   fc.SecretKey,
+		})
+		policies[fc.AccessKeyID] = fc.Policy
+	}
+	provider := sigv4.NewStaticProvider(creds...)
+
+	logger.Info("credentials_loaded",
+		slog.Int("total", len(policies)),
+		slog.Int("from_file", len(cfg.FileCredentials)),
+	)
+	if cfg.AccessKey != "" {
+		// 全权限凭据存在这一事实必须出现在启动日志里：它是部署审计中
+		// 最需要被注意到的一条，而 Redacted() 只显示"已设置"。
+		logger.Warn("env_credential_full_access",
+			slog.String("access_key", logx.RedactKeyID(cfg.AccessKey)),
+			slog.String("detail", "环境变量凭据拥有全部权限；生产环境建议改用 --credentials-file"),
+		)
+	}
 
 	// 打开存储。失败即拒绝启动 —— 与凭据缺失同样处理：
 	// "存储不可用但 HTTP 起来了"会让所有请求拿到 500，
@@ -113,6 +146,8 @@ func run(args []string, stderr io.Writer) error {
 		BlockSize:       cfg.BlockSize,
 		InlineThreshold: cfg.InlineThreshold,
 		VerifyOnRead:    cfg.VerifyOnRead,
+		HighWatermark:   cfg.HighWatermark,
+		LowWatermark:    cfg.LowWatermark,
 	})
 	if err != nil {
 		return fmt.Errorf("打开存储失败: %w", err)
@@ -149,12 +184,23 @@ func run(args []string, stderr io.Writer) error {
 		internalHandler = cl.InternalHandler()
 	}
 
+	// 容量信息供 /readyz 与 /metrics 使用。集群后端内嵌 *store.Store，
+	// 类型断言对两种模式都成立；将来若出现不提供容量的后端，
+	// /readyz 会如实返回 disk.available=false，而不是编造数值。
+	capacity, _ := backend.(s3api.Capacity)
+
 	srv := s3api.New(s3api.Options{
-		Logger:       logger,
-		Region:       cfg.Region,
-		Provider:     provider,
-		MaxClockSkew: cfg.MaxClockSkew,
-		Store:        backend,
+		Logger:          logger,
+		Region:          cfg.Region,
+		Provider:        provider,
+		MaxClockSkew:    cfg.MaxClockSkew,
+		Store:           backend,
+		Policies:        policies,
+		Metrics:         metrics.NewRegistry(),
+		Capacity:        capacity,
+		HighWatermark:   cfg.HighWatermark,
+		LowWatermark:    cfg.LowWatermark,
+		CredentialCount: len(policies),
 	})
 
 	httpSrv := &http.Server{
@@ -178,6 +224,12 @@ func run(args []string, stderr io.Writer) error {
 	logger.Info("blink_listening",
 		slog.String("addr", ln.Addr().String()),
 		slog.String("scheme", scheme),
+	)
+	// /metrics 免签名是刻意的取舍：Prometheus 抓取器通常不带 SigV4。
+	// 代价必须让运维在启动日志里就看到，而不是等到日志评审时才发现。
+	logger.Warn("metrics_endpoint_anonymous",
+		slog.String("path", "/metrics"),
+		slog.String("detail", "指标端点免签名，请用 NetworkPolicy 或反向代理限制来源"),
 	)
 
 	servers := []serving{{name: "s3", srv: httpSrv, ln: ln, tls: tlsCfg != nil}}

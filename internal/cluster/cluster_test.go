@@ -82,6 +82,13 @@ func newTestNodesWithBlockSize(t *testing.T, count int, blockSize int64) []*test
 // 关闭后台反熵扫描），用于验证单机测试不需要感知的修复参数。
 func newTestNodesWithOptions(t *testing.T, count int, blockSize int64, tweak func(*Config)) []*testNode {
 	t.Helper()
+	return newTestNodesFull(t, count, blockSize, tweak, nil)
+}
+
+// newTestNodesFull 在 newTestNodesWithOptions 之上再允许微调节点存储选项，
+// 用于注入容量读数等无法在运行期修改的构造参数。
+func newTestNodesFull(t *testing.T, count int, blockSize int64, tweak func(*Config), storeTweak func(*store.Options)) []*testNode {
+	t.Helper()
 	if count < 3 {
 		t.Fatalf("集成测试至少需要 3 个节点，当前 %d", count)
 	}
@@ -102,12 +109,16 @@ func newTestNodesWithOptions(t *testing.T, count int, blockSize int64, tweak fun
 	for _, n := range nodes {
 		// 小块 + 禁用内联，让测试对象必然跨多个块，
 		// 从而覆盖块切分、跨块 Range 与远端块拼装。
-		st, err := store.Open(store.Options{
+		stOpts := store.Options{
 			Root:            filepath.Join(t.TempDir(), "data"),
 			BlockSize:       blockSize,
 			InlineThreshold: -1,
 			VerifyOnRead:    true,
-		})
+		}
+		if storeTweak != nil {
+			storeTweak(&stOpts)
+		}
+		st, err := store.Open(stOpts)
 		if err != nil {
 			t.Fatalf("打开节点 %s 的存储失败: %v", n.id, err)
 		}

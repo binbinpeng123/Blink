@@ -83,6 +83,12 @@ var (
 	// 与 ErrInvalidKey 分开：key 本身合法，被拒绝的是这次操作的组合。
 	// 协议层据此返回 400 InvalidRequest。
 	ErrInvalidRequest = errors.New("store: 请求语义不合法")
+	// ErrStorageFull 表示磁盘使用率已达高水位，写入被主动拒绝。
+	//
+	// 与 syscall.ENOSPC 区分：这是**预防性**拒绝（高水位），ENOSPC 是
+	// 内核已经写不进去。协议层把两者都映射为 507 InsufficientStorage，
+	// 但对内可以据此区分"该扩容了"与"已经满了"。
+	ErrStorageFull = errors.New("store: 磁盘使用率已达高水位")
 	// ErrNotImplemented 表示当前存储后端不具备完成该操作的能力。
 	//
 	// 目前唯一的用途是单机路径拒绝复制纠删码布局的对象：EC 分片只存在于

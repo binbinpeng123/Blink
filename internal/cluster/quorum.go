@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"sync"
 
 	"github.com/binbinpeng123/Blink/internal/store"
@@ -135,8 +136,10 @@ func firstError(results []metaResult) error {
 // 缓冲，回调返回后内容就不再属于本次写入。
 //
 // 第二个返回值表示该块是否在所有仍存活的目标上都是去重命中
-// （即本次没有产生任何新块文件）。
-func (c *Cluster) distributeBlock(alive map[string]bool, ts []target, b store.Block) (bool, error) {
+// （即本次没有产生任何新块文件）；第三个返回值是本次因满盘失败的目标数。
+// 调用方在存活目标跌破 W 时用它区分 507 与 503：满盘是容量问题，
+// 让客户端"稍后重试"毫无意义，应当明确告知存储空间不足。
+func (c *Cluster) distributeBlock(alive map[string]bool, ts []target, b store.Block) (bool, int, error) {
 	type outcome struct {
 		id    string
 		wrote bool
@@ -159,12 +162,16 @@ func (c *Cluster) distributeBlock(alive map[string]bool, ts []target, b store.Bl
 	wg.Wait()
 
 	deduped := true
+	full := 0
 	for _, o := range out {
 		if o.id == "" {
 			continue
 		}
 		if o.err != nil {
 			delete(alive, o.id)
+			if isStorageFull(o.err) {
+				full++
+			}
 			c.logger.Warn("replica_block_failed",
 				"peer", o.id, "hash", b.Desc.Hash, "err", o.err.Error())
 			continue
@@ -173,7 +180,19 @@ func (c *Cluster) distributeBlock(alive map[string]bool, ts []target, b store.Bl
 			deduped = false
 		}
 	}
-	return deduped, nil
+	return deduped, full, nil
+}
+
+// isStorageFull 判断副本写入失败是否由容量不足引起。
+//
+// 本地目标直接返回 store.ErrStorageFull；远端目标由内部协议映射为
+// 507 InsufficientStorage，PeerError 保留状态码供这里判断。
+func isStorageFull(err error) bool {
+	if errors.Is(err, store.ErrStorageFull) {
+		return true
+	}
+	var pe *PeerError
+	return errors.As(err, &pe) && pe.Status == http.StatusInsufficientStorage
 }
 
 // putMetaToAll 并行向 targets 提交副本元数据，返回成功数。

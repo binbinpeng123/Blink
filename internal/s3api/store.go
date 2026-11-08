@@ -89,7 +89,7 @@ func toS3Error(err error) *s3err.Error {
 		// 损坏绝不伪装成 404：用户必须知道自己该去查盘，而不是以为对象本来就不存在。
 		return s3err.New(s3err.CodeInternalError).
 			WithMessage("存储层数据损坏：" + err.Error())
-	case errors.Is(err, syscall.ENOSPC):
+	case errors.Is(err, store.ErrStorageFull), errors.Is(err, syscall.ENOSPC):
 		// 磁盘写满：507 InsufficientStorage。
 		//
 		// 这是 S3 兼容实现的主流语义：MinIO 返回 507 XMinioStorageFull，
@@ -100,6 +100,8 @@ func toS3Error(err error) *s3err.Error {
 		//
 		// 507 仍是 5xx，SDK 的退避重试依然生效；但错误码明确指向
 		// "扩容或删除数据"，而不是"降低请求速率"。
+		// 水位拦截（ErrStorageFull）与真实 ENOSPC 用同一答复：
+		// 对客户端而言都是"这台服务器暂时写不下了"，区别只在运维侧。
 		return s3err.New(s3err.CodeInsufficientStorage).WithMessage("磁盘空间不足。")
 	case errors.Is(err, fs.ErrPermission):
 		return s3err.New(s3err.CodeAccessDenied).WithMessage("数据目录权限不足。")

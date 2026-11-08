@@ -345,7 +345,9 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 认证凭据为静态 Access Key / Secret Key，从配置或环境变量读取；**不提供硬编码默认值**，缺失则拒绝启动。
 - 支持 **Presigned URL**（GET 与 PUT），`X-Amz-Expires` 范围 1–604800 秒。
 - 时钟偏移容差 **15 分钟**，超限返回 `403 RequestTimeTooSkewed` 并附 `ServerTime`。
-- 免签名端点：`/healthz`、`/readyz`、`/version`。
+- 凭据来源：环境变量（单凭据，全权限）或凭据文件（多凭据，每个凭据可限定桶、key 前缀与动作）。签名通过但动作不允许时返回 `403 AccessDenied`；未签名的数据请求返回 `403 AccessDenied`。授权范围与语义见 06 文档。
+- `CopyObject` / `UploadPartCopy` 同时要求**源对象 `read`** 与**目标 `write`** 权限；任一不满足即 `403 AccessDenied`，且不执行复制。
+- 免签名端点：`/healthz`、`/readyz`、`/version`、`/metrics`。
 - **CORS 预检（`OPTIONS`）在签名校验之前处理**：浏览器发预检时不会携带 `Authorization`，若先验签则所有跨源请求都会在预检阶段失败。这是浏览器规范要求的顺序，不是鉴权缺口——真正的 `PUT`/`GET`/`DELETE` 请求仍必须签名（回归测试 `TestCORSBypassesAuthOnlyForPreflight` 固定这一点）。
 
 ### SigV4 实现的四个易错点

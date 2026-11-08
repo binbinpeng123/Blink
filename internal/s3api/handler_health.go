@@ -1,14 +1,12 @@
 package s3api
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/binbinpeng123/Blink/internal/buildinfo"
 )
 
-// TODO(slice-3): 磁盘水位接入后，readyz 返回真实 usage/watermark 字段。
-// 在此之前 ready 恒为 true（除数据目录不可写外无其它不可用条件）。
-//
 // "满盘时 /readyz 保持 200"是已确认决策：主流对象存储的健康检查只反映
 // 进程/后端可用性，容量作为独立指标监控。若满盘返回 503，Kubernetes 会
 // 摘除唯一实例，连读取与删除都无法进行，用户就失去了"删数据自救"的途径。
@@ -20,11 +18,26 @@ type healthzResponse struct {
 
 // readyzResponse 是 /readyz 的响应体。
 //
-// 字段为前向兼容预留：切片 3 接入磁盘水位后会新增 disk 子对象，
-// 客户端应忽略未知字段。
+// disk 反映数据卷容量与写入阻断状态，但**不参与** ready 的判定。
+// 客户端应忽略未知字段，以便后续切片继续扩展。
 type readyzResponse struct {
-	Status string `json:"status"`
-	Ready  bool   `json:"ready"`
+	Status string     `json:"status"`
+	Ready  bool       `json:"ready"`
+	Disk   readyzDisk `json:"disk"`
+}
+
+// readyzDisk 是 /readyz 的容量子对象。
+//
+// available=false 表示 statfs 失败或未接入容量统计，此时其余数值为 0。
+// 高/低水位原样回显配置值，让运维不必查启动参数就能核对滞回区间。
+type readyzDisk struct {
+	Available     bool    `json:"available"`
+	TotalBytes    uint64  `json:"total_bytes"`
+	FreeBytes     uint64  `json:"free_bytes"`
+	UsedRatio     float64 `json:"used_ratio"`
+	HighWatermark float64 `json:"high_watermark"`
+	LowWatermark  float64 `json:"low_watermark"`
+	WriteBlocked  bool    `json:"write_blocked"`
 }
 
 // handleHealthz 是存活探针：只要进程还能响应就返回 200。
@@ -43,12 +56,33 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 //
 // 按已记录的设计决策，满盘时仍返回 200，只通过字段反映状态，
 // 避免 Kubernetes 摘除流量后用户无法通过删除对象自救。
-func handleReadyz(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		s3errMethodNotAllowed(w, r)
 		return
 	}
-	writeJSON(w, r, http.StatusOK, readyzResponse{Status: "ok", Ready: true})
+
+	disk := readyzDisk{
+		HighWatermark: s.highWatermark,
+		LowWatermark:  s.lowWatermark,
+	}
+	if s.capacity != nil {
+		usage := s.capacity.DiskUsage()
+		disk.Available = usage.Available
+		disk.TotalBytes = usage.Total
+		disk.FreeBytes = usage.Free
+		disk.UsedRatio = usage.UsedRatio
+		disk.WriteBlocked = s.capacity.WriteBlocked()
+		if !usage.Available && usage.Err != nil {
+			// 错误只进日志：探针响应不该把底层文件系统的错误细节
+			// 暴露给任何能访问该端口的人，接口本身仍保持 200。
+			loggerFrom(r.Context(), s.logger).Warn("readyz_disk_usage_unavailable",
+				slog.String("error", usage.Err.Error()),
+			)
+		}
+	}
+
+	writeJSON(w, r, http.StatusOK, readyzResponse{Status: "ok", Ready: true, Disk: disk})
 }
 
 // handleVersion 返回构建期注入的版本信息，便于排障与灰度核对。

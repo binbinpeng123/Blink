@@ -73,10 +73,12 @@ func (s *statusRecorder) statusCode() int {
 	return s.status
 }
 
-// withRequestContext 为每个请求生成请求 ID、注入 logger，并在结束时记录访问日志。
+// withRequestContext 为每个请求生成请求 ID、注入 logger，并在结束时记录访问日志与指标。
 //
 // 请求 ID 同时写入响应头，客户端报障时可直接提供该 ID 定位日志。
-func withRequestContext(logger *slog.Logger, next http.Handler) http.Handler {
+// 指标在这里统一更新：所有请求（含鉴权失败与探针）都要经过本中间件，
+// 且 statusRecorder 已经拿到最终状态码与字节数。
+func withRequestContext(logger *slog.Logger, m *serverMetrics, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := newRequestID()
 
@@ -98,11 +100,13 @@ func withRequestContext(logger *slog.Logger, next http.Handler) http.Handler {
 
 		next.ServeHTTP(rec, r.WithContext(ctx))
 
+		elapsed := time.Since(start)
 		reqLogger.Info("http_request",
 			slog.Int("status", rec.statusCode()),
 			slog.Int64("bytes", rec.written),
-			slog.Duration("elapsed", time.Since(start)),
+			slog.Duration("elapsed", elapsed),
 		)
+		m.observeRequest(r.Method, rec.statusCode(), rec.written, elapsed)
 	})
 }
 

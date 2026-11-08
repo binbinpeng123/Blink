@@ -5,11 +5,13 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"sync"
 
+	"github.com/binbinpeng123/Blink/internal/authz"
 	"github.com/binbinpeng123/Blink/internal/s3err"
 )
 
@@ -150,7 +152,15 @@ func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, buc
 		go func() {
 			defer wg.Done()
 			for j := range idx {
-				errs[j] = s.store.DeleteObject(bucket, req.Objects[j].Key)
+				key := req.Objects[j].Key
+				// 请求级只检查了桶，这里逐 key 再查：一条策略通常是
+				// "某前缀可删"，批量请求完全可能混入前缀外的 key。
+				// 拒绝项作为该 key 的独立结果返回，不影响同批其他 key。
+				if !s.accessAllowed(r, authz.ActionDelete, bucket, key) {
+					errs[j] = errAccessDenied
+					continue
+				}
+				errs[j] = s.store.DeleteObject(bucket, key)
 			}
 		}()
 	}
@@ -163,6 +173,17 @@ func (s *Server) handleDeleteObjects(w http.ResponseWriter, r *http.Request, buc
 	out := deleteObjectsResult{}
 	for i, o := range req.Objects {
 		if errs[i] != nil {
+			// 无权限不是存储错误，toS3Error 会把它当成未知错误回 500；
+			// 这里单独映射为 AccessDenied，与单对象 DELETE 的答复一致。
+			if errors.Is(errs[i], errAccessDenied) {
+				se := s3err.New(s3err.CodeAccessDenied)
+				out.Errors = append(out.Errors, deleteError{
+					Key:     o.Key,
+					Code:    string(se.Code),
+					Message: se.Message,
+				})
+				continue
+			}
 			// 单条错误用与普通 DELETE 相同的翻译，客户端看到的 Code
 			// 不会因为走了批量接口而变样。
 			se := toS3Error(errs[i])

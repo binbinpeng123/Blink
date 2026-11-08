@@ -102,11 +102,15 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 			}
 			return nil
 		}
-		deduped, err := c.distributeBlock(alive, ts, b)
+		deduped, full, err := c.distributeBlock(alive, ts, b)
 		if err != nil {
 			return err
 		}
 		if len(alive) < c.cfg.WriteQuorum {
+			if full > 0 {
+				return fmt.Errorf("%w: 块 %s 仅落在 %d 个副本上（%d 个节点已满），需要 %d",
+					store.ErrStorageFull, b.Desc.Hash, len(alive), full, c.cfg.WriteQuorum)
+			}
 			return fmt.Errorf("%w: 某数据块仅落在 %d 个副本上，需要 %d（%v）",
 				store.ErrUnavailable, len(alive), c.cfg.WriteQuorum, b.Desc.Hash)
 		}

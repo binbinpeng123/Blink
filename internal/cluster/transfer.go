@@ -713,6 +713,9 @@ func (s *Server) writeStoreError(w http.ResponseWriter, op string, err error) {
 	case errors.Is(err, store.ErrCorrupt):
 		s.logger.Error("internal_store_corrupt", "op", op, "err", err.Error())
 		writeJSON(w, http.StatusInternalServerError, errorBody{Error: "corrupt", Message: err.Error()})
+	case errors.Is(err, store.ErrStorageFull):
+		// 507 让协调者把"容量不足"与"节点故障"分开：前者重试无用。
+		writeJSON(w, http.StatusInsufficientStorage, errorBody{Error: "storage_full", Message: err.Error()})
 	case errors.Is(err, store.ErrUnavailable):
 		writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: "unavailable", Message: err.Error()})
 	default:

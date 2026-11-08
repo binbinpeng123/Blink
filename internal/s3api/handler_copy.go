@@ -140,6 +140,13 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	// 源的 read 必须在任何存储访问之前检查：CopyObject 的源可以是
+	// 另一个桶，只校验目标上的 write 会让"能写自己的桶"升级成
+	// "能读整个集群"。
+	if !s.authorizeSource(w, r, src, reqID) {
+		return
+	}
+
 	if sc := r.Header.Get("x-amz-storage-class"); sc != "" && !strings.EqualFold(sc, storageClassStandard) {
 		s3err.New(s3err.CodeNotImplemented).
 			WithMessage("本版本只支持 STANDARD 存储类型。").
@@ -158,7 +165,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 	} {
 		if r.Header.Get(h) != "" {
 			s3err.New(s3err.CodeNotImplemented).
-				WithMessage("复制请求暂不支持 " + h + "。").
+				WithMessage("复制请求暂不支持 "+h+"。").
 				Write(w, r, reqID)
 			return
 		}
