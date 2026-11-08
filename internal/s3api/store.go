@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"strings"
 	"syscall"
 	"time"
 
@@ -40,6 +41,14 @@ func toS3Error(err error) *s3err.Error {
 		return s3err.New(s3err.CodeInvalidBucketName)
 	case errors.Is(err, store.ErrInvalidKey):
 		return s3err.New(s3err.CodeInvalidArgument).WithMessage("对象 key 不合法。")
+	case errors.Is(err, store.ErrInvalidRequest):
+		// 请求语义不成立（自复制却要求 COPY、源对象超过 5 GiB 等）：
+		// key 与桶都合法，被拒绝的是这次操作的组合。
+		return s3err.New(s3err.CodeInvalidRequest).WithMessage(detailOf(err, store.ErrInvalidRequest))
+	case errors.Is(err, store.ErrNotImplemented):
+		// 后端能力缺失（当前唯一来源：单机路径复制 EC 布局对象）。
+		// 501 而不是 400/500：请求本身没问题，是这台服务器做不到。
+		return s3err.New(s3err.CodeNotImplemented).WithMessage(detailOf(err, store.ErrNotImplemented))
 	case errors.Is(err, store.ErrNoSuchKey):
 		return s3err.New(s3err.CodeNoSuchKey)
 	case errors.Is(err, store.ErrPreconditionFailed):
@@ -96,6 +105,24 @@ func toS3Error(err error) *s3err.Error {
 		return s3err.New(s3err.CodeAccessDenied).WithMessage("数据目录权限不足。")
 	}
 	return s3err.New(s3err.CodeInternalError)
+}
+
+// detailOf 返回包装在哨兵错误之后的补充说明，去掉哨兵自身的内部文案。
+//
+// store 层的哨兵统一带 "store: " 前缀（日志里便于识别来源），直接把它
+// 写进 S3 错误响应会把内部实现细节暴露给客户端：
+//
+//	fmt.Errorf("%w: 源与目标相同", ErrInvalidRequest).Error()
+//	→ "store: 请求语义不合法: 源与目标相同"
+//
+// 客户端只需要后半句。没有补充说明时回落到哨兵原文，避免空消息。
+func detailOf(err, sentinel error) string {
+	detail := strings.TrimPrefix(err.Error(), sentinel.Error())
+	detail = strings.TrimPrefix(detail, ": ")
+	if detail == "" {
+		return sentinel.Error()
+	}
+	return detail
 }
 
 // noSuchBucketIfMissing 把"读取时桶目录不存在"统一归为 NoSuchBucket。

@@ -77,6 +77,18 @@ var (
 	// CAS 路径直接用哈希的前两位做目录名，因此哈希必须先过格式校验，
 	// 否则短字符串会让路径截取 panic。
 	ErrInvalidBlock = errors.New("store: 数据块参数不合法")
+	// ErrInvalidRequest 表示请求在语义上不成立（例如自复制却要求 COPY
+	// 元数据、复制超过 5 GiB 的源对象）。
+	//
+	// 与 ErrInvalidKey 分开：key 本身合法，被拒绝的是这次操作的组合。
+	// 协议层据此返回 400 InvalidRequest。
+	ErrInvalidRequest = errors.New("store: 请求语义不合法")
+	// ErrNotImplemented 表示当前存储后端不具备完成该操作的能力。
+	//
+	// 目前唯一的用途是单机路径拒绝复制纠删码布局的对象：EC 分片只存在于
+	// 集群的多个节点上，单机 meta 直接引用块表会指向不存在的分片。
+	// 协议层据此返回 501 NotImplemented，而不是把它伪装成 404/500。
+	ErrNotImplemented = errors.New("store: 当前后端不支持该操作")
 )
 
 // fsErr 把文件系统错误包装成带上下文的错误。

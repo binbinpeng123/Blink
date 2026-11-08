@@ -112,29 +112,19 @@ func parseListParams(r *http.Request) (*listParams, *s3err.Error) {
 		Prefix:     q.Get("prefix"),
 		Delimiter:  q.Get("delimiter"),
 		StartAfter: q.Get("start-after"),
-		MaxKeys:    defaultMaxKeys,
 	}
 
-	if q.Has("max-keys") {
-		n, err := strconv.Atoi(q.Get("max-keys"))
-		if err != nil || n < 0 {
-			return nil, invalidArg("max-keys 必须是非负整数。")
-		}
-		// 超出上限按上限截断，与 S3 行为一致 —— 报错会让
-		// `--max-keys 5000` 这样的请求直接失败，而它本意就是"尽量多"。
-		if n > maxMaxKeys {
-			n = maxMaxKeys
-		}
-		p.MaxKeys = n
+	maxKeys, perr := parseMaxKeys(q)
+	if perr != nil {
+		return nil, perr
 	}
+	p.MaxKeys = maxKeys
 
-	if q.Has("encoding-type") {
-		v := q.Get("encoding-type")
-		if v != "url" {
-			return nil, invalidArg(`encoding-type 只支持 "url"。`)
-		}
-		p.EncodingType = v
+	encType, perr := parseEncodingType(q.Get("encoding-type"))
+	if perr != nil {
+		return nil, perr
 	}
+	p.EncodingType = encType
 
 	if q.Has("fetch-owner") {
 		switch strings.ToLower(q.Get("fetch-owner")) {
@@ -163,6 +153,26 @@ func parseListParams(r *http.Request) (*listParams, *s3err.Error) {
 	}
 
 	return p, nil
+}
+
+// parseMaxKeys 解析 max-keys，缺省为 1000。
+//
+// V1/V2 共用：两条列举路径对同一个参数必须给出同一个答复，
+// 否则同一个 `--max-keys 5000` 在带不带 list-type 时行为不同。
+func parseMaxKeys(q url.Values) (int, *s3err.Error) {
+	if !q.Has("max-keys") {
+		return defaultMaxKeys, nil
+	}
+	n, err := strconv.Atoi(q.Get("max-keys"))
+	if err != nil || n < 0 {
+		return 0, invalidArg("max-keys 必须是非负整数。")
+	}
+	// 超出上限按上限截断，与 S3 行为一致 —— 报错会让
+	// `--max-keys 5000` 这样的请求直接失败，而它本意就是"尽量多"。
+	if n > maxMaxKeys {
+		n = maxMaxKeys
+	}
+	return n, nil
 }
 
 // invalidArg 构造 400 InvalidArgument。
@@ -232,11 +242,31 @@ func decodeListToken(s string) (*store.ListCursor, string, string, error) {
 
 // s3URLEncode 按 S3 的 encoding-type=url 规则编码。
 //
-// url.QueryEscape 把空格编成 `+`，而 XML 里的值需要的是 `%20`；
-// 其余（包括 `/` 编成 `%2F`）保持 QueryEscape 的行为，与 MinIO 一致 ——
-// 这是被 AWS CLI 与主流 SDK 长期验证过的编码方式。
+// 规则是"RFC 3986 unreserved 字符 + 路径分隔符 `/` 原样保留，其余按字节
+// 百分号编码"：`/` 必须保留，因为客户端（AWS CLI 的 unquote、各语言 SDK）
+// 会拿编码后的值和原始 key 做字符串比较，`models%2Fsource.bin` 与
+// `models/source.bin` 对不上；AWS 与 MinIO 的响应也都保留 `/`。
+//
+// 不能用 url.QueryEscape：它把空格编成 `+`、把 `/` 编成 `%2F`；也不能
+// 直接用 url.PathEscape，它不编码 `+`、`&`、`,` 等在 S3 key 中合法但
+// 在 URL 中有特殊含义的字符，各客户端解码行为不一致。
 func s3URLEncode(s string) string {
-	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
+	const hexDigits = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9',
+			c == '-', c == '_', c == '.', c == '~', c == '/':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(hexDigits[c>>4])
+			b.WriteByte(hexDigits[c&0x0F])
+		}
+	}
+	return b.String()
 }
 
 // listBucketResult 是 ListObjectsV2 的响应体。

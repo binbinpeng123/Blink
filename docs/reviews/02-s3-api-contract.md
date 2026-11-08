@@ -52,6 +52,14 @@
 
 **为什么需要 CORS**：浏览器控制台（Blink-web）直接跨源访问 S3 端点时，带 `Authorization` 的请求必然先触发预检，而预检由浏览器发出、**不带任何凭据**。只要预检被认证中间件拦下，前端就只能退回同源代理。桶级 CORS 让浏览器可以直连，且语义与 AWS S3 一致。
 
+### 对象级兼容操作（v0.3.0）
+
+| # | 方法 | 路径 | 说明 |
+| --- | --- | --- | --- |
+| 21 | `GET` | `/{bucket}?marker=...`（不带 `list-type` 或 `list-type=1`） | ListObjects V1 |
+| 22 | `PUT` | `/{bucket}/{key}` + `x-amz-copy-source` | CopyObject（服务端复制） |
+| 23 | `POST` | `/{bucket}?delete` | DeleteObjects（单次最多 1000 个） |
+
 ## 明确不支持的接口
 
 **必须显式返回 `501 NotImplemented`，不得落到泛化的 404 或 500。**
@@ -60,7 +68,6 @@
 | --- | --- |
 | `PUT /{bucket}/?acl`、`?tagging`、`?lifecycle`、`?encryption`、`?versioning`、`?policy`、`?replication`、`?object-lock` | `501 NotImplemented` |
 | `GET /{bucket}/?versions` | `501 NotImplemented` |
-| `POST /{bucket}?delete`（批量删除） | `501 NotImplemented` |
 | `PUT /{bucket}/{key}?acl`、`?tagging`、`?legal-hold`、`?retention` | `501 NotImplemented` |
 | `POST /{bucket}/{key}?restore`、`?select` | `501 NotImplemented` |
 | `GET /{bucket}/{key}?torrent` | `501 NotImplemented` |
@@ -95,6 +102,7 @@
 | `BucketNotEmpty` | 409 | 删除非空桶 |
 | `InvalidBucketName` | 400 | 桶名违反命名约束 |
 | `InvalidArgument` | 400 | 参数非法 |
+| `InvalidRequest` | 400 | 请求语义不成立（如自复制且未 `REPLACE`、超过 CopyObject 大小上限） |
 | `InvalidRange` | 416 | Range 超出对象范围 |
 | `NoSuchUpload` | 404 | 分片上传不存在或已中止 |
 | `EntityTooSmall` | 400 | 分片小于最小允许值 |
@@ -181,7 +189,42 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - `delimiter` 折叠为 `<CommonPrefixes>`。
 - `continuation-token` 为不透明值（`base64(json)`），客户端不得解析。
 - `encoding-type=url` 时 Key/Prefix/Delimiter/StartAfter 均需 URL 编码。
+- 编码字符集：RFC 3986 unreserved 字符（`A-Za-z0-9-_.~`）与路径分隔符 `/` 原样保留，其余按字节大写百分号编码。**`/` 必须保留**——客户端会拿编码后的值与原始 key 做字符串比较，`models%2Fsource.bin` 会被判成不存在（AWS、MinIO 亦保留 `/`）。
 - 空桶 → `200` 且 `KeyCount=0`（**不是** 404）；桶不存在 → `404 NoSuchBucket`。
+
+### ListObjects V1 `GET /{bucket}`、`GET /{bucket}?list-type=1`
+
+- 与 V2 共用同一份扫描/折叠实现，差别只在起点的表示与续页协议。
+- 参数：`prefix`、`delimiter`、`marker`、`max-keys`（默认与上限均为 1000）、`encoding-type=url`。
+- `marker` 是上一页最后一条的明文 Key；**以 `delimiter` 结尾时视为公共前缀游标**，下一页跳过该前缀下的全部 key。
+- `NextMarker` **只在 `delimiter` 非空且发生截断时返回**；无 `delimiter` 时客户端用最后一条 `Contents` 的 Key 续页。
+- `encoding-type=url` 时 Key/Prefix/Delimiter/Marker/NextMarker 均编码，字符集与 V2 相同（`/` 原样保留）。
+- `list-type` 只接受空、`1`、`2`；其他值 → `400 InvalidArgument`。
+
+### CopyObject `PUT /{bucket}/{key}`（带 `x-amz-copy-source`）
+
+- 源路径格式：`/{srcBucket}/{srcKey}` 或 `{srcBucket}/{srcKey}`，按 URL 路径规则解码；先按**未解码**的路径切分桶与 key，`%2F` 不会被误判为分隔符。
+- 带 `?versionId` → `501 NotImplemented`（无版本控制，不静默忽略）。
+- 元数据指令：`x-amz-metadata-directive` 为空或 `COPY` 时保留源 `Content-Type` 与 `x-amz-meta-*`；`REPLACE` 时以请求头为准，缺省 `Content-Type` 落 `application/octet-stream`；其他值 → `400 InvalidArgument`。
+- 源条件：`x-amz-copy-source-if-match` / `if-none-match` / `if-modified-since` / `if-unmodified-since`，不满足 → `412 PreconditionFailed`；源不存在时优先 `404 NoSuchKey`。
+- 目标条件：仅 `If-None-Match: *`；目标已存在 → `412 PreconditionFailed`。
+- 自复制：源与目标相同且 `COPY` → `400 InvalidRequest`；`REPLACE` 允许，用于原地更新元数据。
+- 大小上限：源对象 > 5 GiB → `400 InvalidRequest`。
+- `x-amz-storage-class` 只接受 `STANDARD`（缺省同义），其余 → `501 NotImplemented`。
+- `x-amz-copy-source-range`、加密/标签相关头部 → `501 NotImplemented`。
+- 响应：`200` + `<CopyObjectResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyObjectResult>`。
+- 单机模式是 **O(1) 元数据复制**（目标 meta 直接引用源块表，CAS 文件数不变）；集群模式为流式复制（源经 quorum 读、目标经 quorum 写），**不宣称零拷贝**。
+- 客户端注意：aws-cli 的 `s3 cp s3://… s3://…` 在对象超过 `s3.multipart_threshold`（默认 8 MiB）时改用 `UploadPartCopy`，本版本返回 `501`；须把该阈值调大（≤5 GiB 对象建议 `5GB`）才会走 `CopyObject`。`UploadPartCopy` 不在本版本范围内。
+
+### DeleteObjects `POST /{bucket}?delete`
+
+- 请求体 `<Delete>`，单次最多 1000 个 `<Object>`；超过或 XML 非法 → `400 MalformedXML`；请求体上限 1 MiB。
+- 可选 `Content-MD5`：格式非法 → `400 InvalidDigest`，不匹配 → `400 BadDigest`。
+- `<VersionId>` 非空 → `501 NotImplemented`（整请求拒绝，不静默忽略）。
+- 桶不存在 → 整请求 `404 NoSuchBucket`，不逐条返回。
+- **部分成功是正常响应**：单条失败只出现在 `<Error>` 里，HTTP 仍为 `200`；`<Deleted>`/`<Error>` 按请求顺序返回。
+- `<Quiet>true</Quiet>` 时只返回 `<Error>`。
+- 删除是幂等的：删除不存在的 key 计入 `<Deleted>`。
 
 ### 校验和（checksum）
 

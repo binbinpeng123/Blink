@@ -21,6 +21,7 @@ const (
 	CodeBucketNotEmpty               Code = "BucketNotEmpty"
 	CodeInvalidBucketName            Code = "InvalidBucketName"
 	CodeInvalidArgument              Code = "InvalidArgument"
+	CodeInvalidRequest               Code = "InvalidRequest"
 	CodeInvalidRange                 Code = "InvalidRange"
 	CodeNoSuchUpload                 Code = "NoSuchUpload"
 	CodeEntityTooSmall               Code = "EntityTooSmall"
@@ -109,6 +110,7 @@ var table = map[Code]*Error{
 	CodeBucketNotEmpty:               {Code: CodeBucketNotEmpty, Message: "The bucket you tried to delete is not empty.", HTTPStatus: http.StatusConflict},
 	CodeInvalidBucketName:            {Code: CodeInvalidBucketName, Message: "The specified bucket is not valid.", HTTPStatus: http.StatusBadRequest},
 	CodeInvalidArgument:              {Code: CodeInvalidArgument, Message: "Invalid Argument.", HTTPStatus: http.StatusBadRequest},
+	CodeInvalidRequest:               {Code: CodeInvalidRequest, Message: "The request is semantically invalid.", HTTPStatus: http.StatusBadRequest},
 	CodeInvalidRange:                 {Code: CodeInvalidRange, Message: "The requested range is not satisfiable.", HTTPStatus: http.StatusRequestedRangeNotSatisfiable},
 	CodeNoSuchUpload:                 {Code: CodeNoSuchUpload, Message: "The specified upload does not exist.", HTTPStatus: http.StatusNotFound},
 	CodeEntityTooSmall:               {Code: CodeEntityTooSmall, Message: "Your proposed upload is smaller than the minimum allowed object size.", HTTPStatus: http.StatusBadRequest},
