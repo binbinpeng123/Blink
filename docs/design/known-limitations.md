@@ -2,7 +2,7 @@
 
 本文件记录 Blink 在开发过程中**刻意接受或无法验证**的限制。目的是避免把未验证的能力描述成已交付功能。每条限制都注明来源（设计决策或环境约束）与当前状态。
 
-最后更新：2026-11-04
+最后更新：2026-11-07
 
 ## 环境约束导致的未验证项
 
@@ -15,6 +15,8 @@
 | **镜像构建依赖可访问的基础镜像仓库** | 本机 Docker Hub 不可达（`registry-1.docker.io` 超时），Podman 虚拟机可访问镜像站 | 已用 `GO_IMAGE=docker.m.daocloud.io/library/golang:1.27-alpine` 构建成功；默认仍指向 `golang:1.27-alpine` |
 | **真实硬件性能未测量** | 尚无目标边端设备 | 未验证。现有数字仅为本机回归基线 |
 | **跨平台文件系统语义差异未验证** | 仅在 macOS/APFS 上开发 | 未验证。`F_FULLFSYNC` 语义与 Linux 不同，性能与崩溃行为可能不同 |
+| **1 KiB PUT P50 < 2 ms、64 并发 1 MiB PUT > 300 MB/s 在本机不可达** | APFS `F_FULLFSYNC`：单次 write+fsync ≈ 4.0 ms、rename+dirsync ≈ 8.1 ms，一次 PUT 至少 2+2 次；设备层串行化使并发无法转化为吞吐 | 实测 14.0–18.4 ms 与 97–104 MB/s（09 文档）。**Linux/NVMe 是否可达未验证，不得外推，也不得因此下调 05 文档目标** |
+| **16 MiB 对象写入受 MD5 计算上限约束** | ETag 必须在写 meta 前算出；本机 `crypto/md5` 约 250 MB/s | 实测 16 MiB PUT 64–69 ms、242–262 MB/s。并行块写入实测无收益已回滚；更高吞吐需重新设计 ETag 计算时序并另设基准 |
 | **签名分块（`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`）未用真实客户端验证** | aws-cli 2.36.2 在 HTTPS 下实测只发送未签名流式载荷（`STREAMING-UNSIGNED-PAYLOAD-TRAILER`） | 签名分块已实现，并用独立 Python 实现生成的签名向量单测覆盖（含 trailer 签名）；但**没有真实客户端走过该路径，不得声称互操作已验证**。未签名流式上传（PutObject 与 UploadPart）已用 aws-cli 实测通过 |
 | **TLS 仅以自签证书 + `--no-verify-ssl` 验证** | 无生产 CA、无证书轮换机制 | 服务端 TLS 1.2+ 已验证可启动并完成上传/下载；**客户端信任链、证书续期与生产 CA 场景未验证** |
 

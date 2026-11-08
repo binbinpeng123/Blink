@@ -49,6 +49,10 @@ func (s *Store) LoadReplicaMeta(bucket, key string) (*ObjectMeta, bool, error) {
 	if err := ValidateObjectPath(bucket, key); err != nil {
 		return nil, false, err
 	}
+	ck := metaCacheKey{bucket: bucket, key: key}
+	if m, ok := s.metaCache.get(ck); ok {
+		return m, true, nil
+	}
 	m, err := s.readObjectMetaAt(s.objectMetaPath(bucket, key))
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -56,6 +60,7 @@ func (s *Store) LoadReplicaMeta(bucket, key string) (*ObjectMeta, bool, error) {
 	case err != nil:
 		return nil, false, fsErr("读取副本元数据", key, err)
 	}
+	s.metaCache.put(ck, m)
 	return m, true, nil
 }
 
@@ -89,6 +94,7 @@ func (s *Store) PutReplicaMeta(bucket, key string, m *ObjectMeta) error {
 	if err := s.writeFileAtomic(s.objectMetaPath(bucket, key), mustJSON(m)); err != nil {
 		return fsErr("写入副本元数据", key, err)
 	}
+	s.metaCache.put(metaCacheKey{bucket: bucket, key: key}, m)
 	return nil
 }
 
@@ -104,6 +110,10 @@ func (s *Store) DeleteReplicaMeta(bucket, key string) (bool, error) {
 
 	unlock := s.LockObject(bucket, key)
 	defer unlock()
+
+	// 先失效缓存再查盘：即使下面发现文件不存在，缓存里也绝不能留下
+	// 一份"看起来还在"的旧元数据。
+	s.metaCache.delete(metaCacheKey{bucket: bucket, key: key})
 
 	if _, err := s.fs.Stat(s.objectMetaPath(bucket, key)); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {

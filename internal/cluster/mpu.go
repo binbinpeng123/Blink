@@ -137,7 +137,7 @@ func (c *Cluster) UploadPart(bucket, key, uploadID string, partNumber int, body 
 	}
 
 	dedupedBlocks := 0
-	summary, err := c.Store.StreamBlocks(body, alg, tag, func(b store.Block) error {
+	summary, err := c.Store.StreamBlocksSized(body, alg, tag, opt.ExpectedSize, func(b store.Block) error {
 		deduped, err := c.distributeBlock(alive, ts, b)
 		if err != nil {
 			return err

@@ -134,13 +134,13 @@
 ### 基准测试清单
 
 ```text
-BenchmarkPutObjectSizes/{1KiB,64KiB,1MiB,8MiB,128MiB,1GiB}
+BenchmarkPutObjectSizes/{1KiB,64KiB,1MiB,16MiB}
 BenchmarkGetObjectSizes/{同上}
 BenchmarkGetRangeRandom/1GiB              模拟随机读
-BenchmarkGetRangeSequential/1GiB           模拟模型顺序加载
+BenchmarkGetRangeSequential               模拟模型顺序加载
 BenchmarkPutSmallObject10k                 创新 D 对照组
 BenchmarkList100kObjects                   创新 D 对照组
-BenchmarkConcurrentPut/{4,16,64}
+BenchmarkConcurrentPut/{4,16,64}（当前实现：BenchmarkConcurrentPut1MiB，64 worker）
 BenchmarkConcurrentGet/{4,16,64}
 BenchmarkDedupSecondCopy/1GiB              创新 A 验收
 BenchmarkCompleteMultipart20GB             创新 B 验收
@@ -148,6 +148,12 @@ BenchmarkCRC64NVME/1GiB                    校验开销量化
 BenchmarkCRC32C/1GiB                       对照组
 BenchmarkSigV4Verify                       签名开销
 ```
+
+**实际执行范围（2026-11-07）**：写入档位为 1 KiB / 64 KiB / 1 MiB / 16 MiB。
+8 MiB 并入 16 MiB 档（16 MiB 同样跨 4 个 4 MiB 块）；128 MiB / 1 GiB 受
+"本机压测总写入 ≤ 512 MiB"约束未执行，不得写成已通过。上表中
+`BenchmarkGetRangeRandom/1GiB`、`BenchmarkDedupSecondCopy/1GiB`、
+`BenchmarkCompleteMultipart20GB` 目前仍是**计划项**，未实现为可执行基准。
 
 每个基准使用 `b.ReportAllocs()` 与 `b.SetBytes(n)` 输出吞吐，并额外用 `b.ReportMetric` 记录每操作写入字节数 —— 使创新 A 与 B 的验收（写入量不增长）能被基准直接断言，而不依赖人工观察。
 
@@ -170,6 +176,24 @@ BenchmarkSigV4Verify                       签名开销
 上述数字均在 macOS 上测得，`F_FULLFSYNC` 语义与 Linux 不同，会低估 Linux 上的表现。跨平台结论必须在目标平台上重新测量。
 
 **当前实测与目标差距（不得省略）**：切片 9 后，10 万对象 LIST 在本机（Apple M4 / APFS，Go 1.27.2，`-count=5` 中位数）为 **4.1 s**，未达到表中的 `< 500 ms` 目标。切片 9 前的同一基准为 17.8 s。差距根因与后续方向见 `known-limitations.md`（每对象 JSON + 小对象打包未实施）。该目标继续保留，不因未达成而下调。
+
+**性能切片 09 的实测结果**（Apple M4 / APFS / Go 1.27.2，完整条件与前后对照见
+[09 文档](./09-edge-io-performance.md)）：
+
+| 本机回归基线 | 目标 | 实测（优化后） | 结论 |
+| --- | --- | --- | --- |
+| 1 KiB PUT P50 | < 2 ms | 14.0–18.4 ms | **未达标**：APFS 上 2×fsync + 2×dirsync ≈ 9–16 ms，物理下限，非代码路径 |
+| 1 MiB GET 吞吐 | > 500 MB/s | 5.8–5.9 GB/s（177–180 µs） | 达标 |
+| 1 GiB 顺序 GET | 显著高于用户态拷贝 | 未测（写入量约束） | 未验证 |
+| 64 并发 1 MiB PUT | > 300 MB/s | 97–104 MB/s | **未达标**：`F_FULLFSYNC` 设备层串行化，本机不可达 |
+| 100 万对象启动 | < 500 ms | 未测 | 未验证 |
+| 10 万对象 LIST（单机） | < 500 ms | 3.90–4.27 s | **未达标**，根因同上 |
+| 完成后写入量 | 不随对象大小增长 | 实测等于对象大小（去重后反而更少） | 达标 |
+
+同时记录**内存**回归基线（05 文档要求的"不同对象大小的内存"）：1 KiB PUT 从
+4.22 MB/op 降到 10.5–11.6 KB，64 KiB 从 4.29 MB 降到 75–80 KB，1 MiB 从
+≈4.2 MB 降到 1.13 MB。该收益是确定的，不依赖 fsync 语义，可外推到其它平台；
+延迟数字则不可外推。
 
 ## 验收原则
 

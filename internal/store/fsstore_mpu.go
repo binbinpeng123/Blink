@@ -715,7 +715,7 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, body io
 	}
 
 	tag := fmt.Sprintf("upload %s part %d", uploadID, partNumber)
-	res, err := s.streamBlocks(body, alg, tag)
+	res, err := s.streamBlocks(body, alg, tag, opt.ExpectedSize)
 	if err != nil {
 		return nil, err
 	}
@@ -881,6 +881,7 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 	if err := s.writeFileAtomic(s.objectMetaPath(bucket, key), mustJSON(meta)); err != nil {
 		return nil, fsErr("写入对象元数据", key, err)
 	}
+	s.metaCache.put(metaCacheKey{bucket: bucket, key: key}, &meta)
 	if err := s.fs.RemoveAll(s.multipartUploadDir(uploadID)); err != nil {
 		// 对象已经提交成功，这里失败不能报错 —— 客户端会以为上传失败
 		// 而重试，但重试只会得到 NoSuchUpload。残留目录由启动清扫回收。

@@ -89,7 +89,7 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 
 	var blockCount, dedupedBlocks int
 	var shardBlocks [][]store.ShardDesc
-	summary, err := c.Store.StreamBlocks(body, opt.ChecksumAlgorithm, key, func(b store.Block) error {
+	summary, err := c.Store.StreamBlocksSized(body, opt.ChecksumAlgorithm, key, opt.ExpectedSize, func(b store.Block) error {
 		if ecw != nil {
 			descs, deduped, err := c.distributeECBlock(ecw, b)
 			if err != nil {

@@ -268,6 +268,10 @@ type ShardDesc struct {
 // 调用方若需要区分"桶不存在"，必须先自己确认桶存在 —— 本函数只看
 // 对象路径，桶缺失时同样会得到 fs.ErrNotExist，进而报 ErrNoSuchKey。
 func (s *Store) loadObjectMeta(bucket, key string) (*objectMeta, error) {
+	ck := metaCacheKey{bucket: bucket, key: key}
+	if m, ok := s.metaCache.get(ck); ok {
+		return m, nil
+	}
 	m, err := s.readObjectMetaAt(s.objectMetaPath(bucket, key))
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -275,6 +279,7 @@ func (s *Store) loadObjectMeta(bucket, key string) (*objectMeta, error) {
 	case err != nil:
 		return nil, fsErr("读取对象元数据", key, err)
 	}
+	s.metaCache.put(ck, m)
 	return m, nil
 }
 

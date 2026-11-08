@@ -211,6 +211,10 @@ func (s *Store) DeleteObject(bucket, key string) error {
 	unlock := s.locks.Lock(bucket + "\x00" + key)
 	defer unlock()
 
+	// 先失效缓存再删盘：即便 RemoveAll 失败，后续读取也必须回到盘上
+	// 确认，而不是继续返回一份内存里的旧元数据。
+	s.metaCache.delete(metaCacheKey{bucket: bucket, key: key})
+
 	// RemoveAll 对不存在的路径返回 nil，正好就是"幂等删除"需要的语义。
 	if err := s.fs.RemoveAll(s.objectDir(bucket, key)); err != nil {
 		return fsErr("删除对象", key, err)
