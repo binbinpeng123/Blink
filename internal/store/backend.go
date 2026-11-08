@@ -44,6 +44,12 @@ type Backend interface {
 	// 对象读写。
 	PutObject(bucket, key string, body io.Reader, opt PutOptions) (*ObjectInfo, error)
 	OpenObject(bucket, key string) (Reader, error)
+	// CopyObject 把源对象的内容复制到目标 key。
+	//
+	// 单机实现是元数据级的：目标 meta 直接共享源对象的 CAS 块表，
+	// 不搬运数据。集群实现必须显式覆盖（见 Cluster.CopyObject），
+	// 因为副本分布按目标 key 的环位置重新计算，无法共享单机块表。
+	CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt CopyOptions) (*ObjectInfo, error)
 	DeleteObject(bucket, key string) error
 	ListObjects(bucket string, opt ListOptions) (*ListResult, error)
 

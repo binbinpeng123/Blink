@@ -149,9 +149,8 @@ func TestS3RoutesReturnNotImplemented(t *testing.T) {
 		method string
 		target string
 	}{
-		{http.MethodGet, "/my-bucket"},
-		// ListObjects V1 未实现；切片的清单每片缩短一项，这是刻意的。
-		{http.MethodGet, "/my-bucket/?list-type=1"},
+		// 子资源类操作仍未实现（切片 10 之后清单里主要是这些）。
+		{http.MethodGet, "/my-bucket/?acl"},
 		// 对象级的仍未实现方法：POST 对象（无子资源）不在 S3 契约内。
 		{http.MethodPost, "/my-bucket/object.txt"},
 	}

@@ -378,6 +378,27 @@ func TestListObjectsV2EncodingTypeURL(t *testing.T) {
 	}
 }
 
+// TestS3URLEncodeKeepsSlash 固化 encoding-type=url 的字符集。
+//
+// `/` 必须原样保留：AWS CLI 与各 SDK 会把响应里的 Key 直接和本地记录的
+// key 做字符串比较，`models%2Fsource.bin` 会判成"不存在"。其余非
+// unreserved 字符（含 `+`、`&`、`%`、空格、非 ASCII）逐字节百分号编码。
+func TestS3URLEncodeKeepsSlash(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"models/source.bin", "models/source.bin"},
+		{"a/b/c", "a/b/c"},
+		{"报告 1.txt", "%E6%8A%A5%E5%91%8A%201.txt"},
+		{"a+b&c=d.txt", "a%2Bb%26c%3Dd.txt"},
+		{"100%.txt", "100%25.txt"},
+		{"-_.~/", "-_.~/"},
+	}
+	for _, c := range cases {
+		if got := s3URLEncode(c.in); got != c.want {
+			t.Errorf("s3URLEncode(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestListObjectsV2FetchOwner(t *testing.T) {
 	h := objectTestServer(t)
 	putObject(t, h, "/bkt/a", "x", nil)
@@ -440,4 +461,340 @@ func TestListObjectsV2IgnoresUnknownParams(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("状态码 = %d，期望 200 (%s)", rec.Code, rec.Body.String())
 	}
+}
+
+// v1Target 构造 ListObjects V1 的请求目标；listType 为空表示完全不带
+// list-type 参数（老客户端就是这样请求的）。
+func v1Target(bucket string, q url.Values, listType string) string {
+	v := url.Values{}
+	for k, vals := range q {
+		for _, val := range vals {
+			v.Add(k, val)
+		}
+	}
+	if listType != "" {
+		v.Set("list-type", listType)
+	}
+	if len(v) == 0 {
+		return "/" + bucket
+	}
+	return "/" + bucket + "?" + v.Encode()
+}
+
+// decodeListV1 发一次 V1 请求并解析响应。
+func decodeListV1(t *testing.T, h http.Handler, target string) (int, listBucketResultV1) {
+	t.Helper()
+	rec := do(t, h, http.MethodGet, target)
+	var body listBucketResultV1
+	if rec.Code == http.StatusOK {
+		if err := xml.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("响应不是合法 XML: %v (%s)", err, rec.Body.String())
+		}
+	}
+	return rec.Code, body
+}
+
+// listAllPagesV1 按 V1 的续页规则翻到底。
+//
+// 无 delimiter 时客户端用最后一条 Contents 的 Key 当 marker；
+// 有 delimiter 时服务端必须回 NextMarker —— 两种情况都覆盖。
+func listAllPagesV1(t *testing.T, h http.Handler, bucket string, q url.Values, listType string) (entries []string, pages int) {
+	t.Helper()
+	q = url.Values(q)
+	for {
+		code, body := decodeListV1(t, h, v1Target(bucket, q, listType))
+		if code != http.StatusOK {
+			t.Fatalf("状态码 = %d，期望 200", code)
+		}
+		pages++
+		for _, c := range body.Contents {
+			entries = append(entries, c.Key)
+		}
+		for _, p := range body.CommonPrefixes {
+			entries = append(entries, p.Prefix)
+		}
+		if !body.IsTruncated {
+			if body.NextMarker != "" {
+				t.Error("未截断却返回了 NextMarker")
+			}
+			return entries, pages
+		}
+		if q.Get("delimiter") != "" {
+			if body.NextMarker == "" {
+				t.Fatal("带 delimiter 且截断时必须返回 NextMarker")
+			}
+			q.Set("marker", body.NextMarker)
+		} else {
+			if len(body.Contents) == 0 {
+				t.Fatal("无 delimiter 且截断时，页内至少应有一条 Contents")
+			}
+			q.Set("marker", body.Contents[len(body.Contents)-1].Key)
+		}
+		if pages > 100 {
+			t.Fatal("翻页次数异常，疑似死循环")
+		}
+	}
+}
+
+// TestListObjectsV1Basic 验证不带 list-type 与 list-type=1 的等价性。
+func TestListObjectsV1Basic(t *testing.T) {
+	keys := []string{"a.txt", "b/1", "c"}
+	for _, listType := range []string{"", "1"} {
+		t.Run("list-type="+listType, func(t *testing.T) {
+			h := objectTestServer(t)
+			for _, k := range keys {
+				if rec := putObject(t, h, escapedPath("/bkt/"+k), "x", nil); rec.Code != http.StatusOK {
+					t.Fatalf("PUT %q 状态码 = %d", k, rec.Code)
+				}
+			}
+
+			code, body := decodeListV1(t, h, v1Target("bkt", nil, listType))
+			if code != http.StatusOK {
+				t.Fatalf("状态码 = %d，期望 200", code)
+			}
+			if body.Name != "bkt" {
+				t.Errorf("Name = %q，期望 bkt", body.Name)
+			}
+			if body.MaxKeys != defaultMaxKeys {
+				t.Errorf("MaxKeys = %d，期望 %d", body.MaxKeys, defaultMaxKeys)
+			}
+			if body.Marker != "" {
+				t.Errorf("未传 marker 时 Marker = %q，期望空", body.Marker)
+			}
+			if body.IsTruncated || body.NextMarker != "" {
+				t.Errorf("3 条 key 不应截断: truncated=%v next=%q", body.IsTruncated, body.NextMarker)
+			}
+			var got []string
+			for _, c := range body.Contents {
+				got = append(got, c.Key)
+				if want := `"` + md5Hex("x") + `"`; c.ETag != want {
+					t.Errorf("ETag = %s，期望 %s", c.ETag, want)
+				}
+			}
+			if strings.Join(got, ",") != strings.Join(keys, ",") {
+				t.Errorf("列举结果 = %v，期望 %v", got, keys)
+			}
+		})
+	}
+}
+
+// TestListObjectsV1PaginationNoLossNoDup 是 V1 的翻页验收：
+// 无 delimiter 时靠最后一条 Key 续页，有 delimiter 时靠 NextMarker。
+func TestListObjectsV1PaginationNoLossNoDup(t *testing.T) {
+	keys := []string{
+		"a.txt",
+		"b/1", "b/2", "b/sub/3",
+		"c",
+		"logs/2026/01.log", "logs/2026/02.log", "logs/2026/03.log",
+		"z.txt",
+	}
+	cases := []struct {
+		name     string
+		q        url.Values
+		want     []string
+		wantPage int
+	}{
+		{
+			name:     "无 delimiter 全量",
+			q:        url.Values{"max-keys": {"2"}},
+			want:     keys,
+			wantPage: 5,
+		},
+		{
+			name:     "delimiter 折叠",
+			q:        url.Values{"max-keys": {"2"}, "delimiter": {"/"}},
+			want:     []string{"a.txt", "b/", "c", "logs/", "z.txt"},
+			wantPage: 3,
+		},
+		{
+			name:     "prefix + delimiter",
+			q:        url.Values{"max-keys": {"2"}, "prefix": {"logs/"}, "delimiter": {"/"}},
+			want:     []string{"logs/2026/"},
+			wantPage: 1,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := objectTestServer(t)
+			for _, k := range keys {
+				if rec := putObject(t, h, escapedPath("/bkt/"+k), "x", nil); rec.Code != http.StatusOK {
+					t.Fatalf("PUT %q 状态码 = %d (%s)", k, rec.Code, rec.Body.String())
+				}
+			}
+
+			got, pages := listAllPagesV1(t, h, "bkt", c.q, "")
+			if strings.Join(got, "\x00") != strings.Join(c.want, "\x00") {
+				t.Errorf("翻页结果 = %v，期望 %v", got, c.want)
+			}
+			if pages != c.wantPage {
+				t.Errorf("页数 = %d，期望 %d", pages, c.wantPage)
+			}
+			seen := make(map[string]bool, len(got))
+			for _, e := range got {
+				if seen[e] {
+					t.Errorf("条目 %q 重复出现", e)
+				}
+				seen[e] = true
+			}
+		})
+	}
+}
+
+// TestListObjectsV1Marker 覆盖手工 marker 的两类语义。
+func TestListObjectsV1Marker(t *testing.T) {
+	h := objectTestServer(t)
+	for _, k := range []string{"a", "b", "b/1", "b/2", "c"} {
+		putObject(t, h, escapedPath("/bkt/"+k), "x", nil)
+	}
+
+	t.Run("普通 marker 跳过自身", func(t *testing.T) {
+		code, body := decodeListV1(t, h, v1Target("bkt", url.Values{"marker": {"b"}}, "1"))
+		if code != http.StatusOK {
+			t.Fatalf("状态码 = %d，期望 200", code)
+		}
+		var got []string
+		for _, c := range body.Contents {
+			got = append(got, c.Key)
+		}
+		if want := []string{"b/1", "b/2", "c"}; strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("结果 = %v，期望 %v", got, want)
+		}
+	})
+
+	t.Run("以 delimiter 结尾的 marker 是公共前缀游标", func(t *testing.T) {
+		code, body := decodeListV1(t, h, v1Target("bkt", url.Values{
+			"marker":    {"b/"},
+			"delimiter": {"/"},
+		}, "1"))
+		if code != http.StatusOK {
+			t.Fatalf("状态码 = %d，期望 200", code)
+		}
+		if len(body.CommonPrefixes) != 0 {
+			t.Errorf("b/ 之后的下一页不应再出现 b/ 前缀: %+v", body.CommonPrefixes)
+		}
+		var got []string
+		for _, c := range body.Contents {
+			got = append(got, c.Key)
+		}
+		if want := []string{"c"}; strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("结果 = %v，期望 %v", got, want)
+		}
+	})
+}
+
+// TestListObjectsV1EncodingType 验证 encoding-type=url 对 Key 与 Marker 的编码。
+func TestListObjectsV1EncodingType(t *testing.T) {
+	h := objectTestServer(t)
+	keys := []string{"a b", "模型.bin"}
+	for _, k := range keys {
+		if rec := putObject(t, h, escapedPath("/bkt/"+k), "x", nil); rec.Code != http.StatusOK {
+			t.Fatalf("PUT %q 状态码 = %d (%s)", k, rec.Code, rec.Body.String())
+		}
+	}
+
+	code, body := decodeListV1(t, h, v1Target("bkt", url.Values{
+		"encoding-type": {"url"},
+		"max-keys":      {"1"},
+	}, "1"))
+	if code != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200", code)
+	}
+	if body.EncodingType != "url" {
+		t.Errorf("EncodingType = %q，期望 url", body.EncodingType)
+	}
+	if len(body.Contents) != 1 || body.Contents[0].Key != "a%20b" {
+		t.Fatalf("首条 Key = %+v，期望编码后的 a%%20b", body.Contents)
+	}
+	// 无 delimiter 时 S3 不回 NextMarker：客户端拿最后一条 Contents 的 Key
+	// 当下一页的 marker。_encoding-type=url_ 下这个值也是编码过的，客户端
+	// 必须解码后才能回传 —— 这里就按客户端的做法走一遍。
+	if !body.IsTruncated {
+		t.Fatal("max-keys=1 且有 2 条 key，应当截断")
+	}
+	if body.NextMarker != "" {
+		t.Errorf("无 delimiter 时 NextMarker = %q，期望为空", body.NextMarker)
+	}
+	marker, err := url.PathUnescape(body.Contents[0].Key)
+	if err != nil {
+		t.Fatalf("解码 Key %q 失败: %v", body.Contents[0].Key, err)
+	}
+
+	code, body = decodeListV1(t, h, v1Target("bkt", url.Values{
+		"encoding-type": {"url"},
+		"marker":        {marker},
+	}, "1"))
+	if code != http.StatusOK {
+		t.Fatalf("第二页状态码 = %d，期望 200", code)
+	}
+	if want := s3URLEncode("模型.bin"); len(body.Contents) != 1 || body.Contents[0].Key != want {
+		t.Fatalf("第二页 Contents = %+v，期望 %s", body.Contents, want)
+	}
+	// 回显的 Marker 与 Key 一样按 encoding-type 编码。
+	if got := body.Marker; got != "a%20b" {
+		t.Errorf("回显 Marker = %q，期望编码后的 a%%20b", got)
+	}
+}
+
+// TestListObjectsV1UnencodedKeyRoundTrip 验证未带 encoding-type 时 Key 原样返回。
+func TestListObjectsV1UnencodedKeyRoundTrip(t *testing.T) {
+	h := objectTestServer(t)
+	const key = "模型 v1.bin"
+	putObject(t, h, escapedPath("/bkt/"+key), "x", nil)
+
+	code, body := decodeListV1(t, h, v1Target("bkt", nil, "1"))
+	if code != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200", code)
+	}
+	if len(body.Contents) != 1 || body.Contents[0].Key != key {
+		t.Fatalf("Key = %+v，期望原样返回 %q", body.Contents, key)
+	}
+}
+
+// TestListObjectsV1ParamValidation 验证 V1 与 V2 对同一参数给同一答复。
+func TestListObjectsV1ParamValidation(t *testing.T) {
+	h := objectTestServer(t)
+
+	t.Run("非法 max-keys", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, v1Target("bkt", url.Values{"max-keys": {"abc"}}, "1"))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("状态码 = %d，期望 400", rec.Code)
+		}
+		if got := decodeError(t, rec).Code; got != string(s3err.CodeInvalidArgument) {
+			t.Errorf("Code = %q，期望 InvalidArgument", got)
+		}
+	})
+
+	t.Run("max-keys 超上限按上限截断", func(t *testing.T) {
+		code, body := decodeListV1(t, h, v1Target("bkt", url.Values{"max-keys": {"5000"}}, "1"))
+		if code != http.StatusOK {
+			t.Fatalf("状态码 = %d，期望 200", code)
+		}
+		if body.MaxKeys != maxMaxKeys {
+			t.Errorf("MaxKeys = %d，期望 %d", body.MaxKeys, maxMaxKeys)
+		}
+	})
+
+	t.Run("非法 encoding-type", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, v1Target("bkt", url.Values{"encoding-type": {"base64"}}, "1"))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("状态码 = %d，期望 400", rec.Code)
+		}
+	})
+
+	t.Run("桶不存在", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/nope")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("状态码 = %d，期望 404", rec.Code)
+		}
+		if got := decodeError(t, rec).Code; got != string(s3err.CodeNoSuchBucket) {
+			t.Errorf("Code = %q，期望 NoSuchBucket", got)
+		}
+	})
+
+	t.Run("非法 list-type", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, "/bkt?list-type=3")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("状态码 = %d，期望 400", rec.Code)
+		}
+	})
 }

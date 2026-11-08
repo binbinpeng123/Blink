@@ -113,8 +113,8 @@ func (s *Server) Handler() http.Handler {
 // 子资源必须显式回 501 NotImplemented，绝不能落到泛化 404 ——
 // 后者会让用户以为"这个桶不存在"，而不是"这个功能没实现"。
 //
-// 当前已实现桶生命周期、对象 CRUD、ListObjectsV2 与分片上传；
-// ListObjects V1 等仍未实现的组合回 501，将在后续切片替换。
+// 当前已实现桶生命周期、对象 CRUD、服务端复制、批量删除、
+// ListObjects V1/V2 与分片上传；其余组合回 501，将在后续切片替换。
 func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 	reqID := requestIDFrom(r.Context())
 	logger := loggerFrom(r.Context(), s.logger)
@@ -180,10 +180,9 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 			s.handleHeadBucket(w, r, bucket, reqID)
 			return
 		case http.MethodGet:
-			// GET /{bucket} 只在 list-type=2 时是合法操作（ListObjectsV2）。
-			// list-type=1（ListObjects V1）不在 02 文档的契约内，回 501；
-			// 其他值不是合法参数，回 400 而不是 501 —— 前者是"这个版本
-			// 没实现"，后者是"你写错了"，两者对客户端的意义不同。
+			// GET /{bucket} 是列举：list-type=2 走 V2，缺省与 list-type=1
+			// 走 V1（S3 的默认行为）。其他值不是合法参数，回 400 而不是
+			// 501 —— 后者是"这个版本没实现"，前者是"你写错了"。
 			switch r.URL.Query().Get("list-type") {
 			case "2":
 				if !s.requireStore(w, r, reqID) {
@@ -192,10 +191,24 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 				s.handleListObjectsV2(w, r, bucket, reqID)
 				return
 			case "", "1":
-				// 落到兜底 501。
+				if !s.requireStore(w, r, reqID) {
+					return
+				}
+				s.handleListObjectsV1(w, r, bucket, reqID)
+				return
 			default:
-				invalidArg("list-type 只支持 \"2\"。").
+				invalidArg("list-type 只支持 \"1\" 或 \"2\"。").
 					Write(w, r, reqID)
+				return
+			}
+		case http.MethodPost:
+			// POST /{bucket}?delete 是 DeleteObjects（批量删除）。
+			// 没有 ?delete 的桶级 POST 不是 S3 的合法操作，落到兜底 501。
+			if r.URL.Query().Has("delete") {
+				if !s.requireStore(w, r, reqID) {
+					return
+				}
+				s.handleDeleteObjects(w, r, bucket, reqID)
 				return
 			}
 		}
@@ -204,6 +217,12 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut:
 			if !s.requireStore(w, r, reqID) {
+				return
+			}
+			// 服务端复制与普通上传共用 PUT 同一个路径，唯一区分是
+			// x-amz-copy-source 是否存在（02/10 文档）。
+			if r.Header.Get("x-amz-copy-source") != "" {
+				s.handleCopyObject(w, r, bucket, key, reqID)
 				return
 			}
 			s.handlePutObject(w, r, bucket, key, reqID)

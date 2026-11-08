@@ -244,8 +244,8 @@ func TestNoStoreStillReturns501ForUnimplemented(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := New(Options{Logger: logger, Region: "us-east-1", DisableAuth: true}).Handler()
 
-	// ListObjects V1（list-type=1）不在契约内，且与 store 是否就绪无关。
-	rec := do(t, h, http.MethodGet, "/my-bucket/?list-type=1")
+	// ?acl 不在契约内，且与 store 是否就绪无关。
+	rec := do(t, h, http.MethodGet, "/my-bucket/?acl")
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("状态码 = %d，期望 501（不应受 store 缺失影响）", rec.Code)
 	}
@@ -263,6 +263,9 @@ func TestNoStoreReturns500ForImplementedRoutes(t *testing.T) {
 		{http.MethodDelete, "/my-bucket/object.txt"},
 		{http.MethodPut, "/my-bucket/object.txt"},
 		{http.MethodGet, "/my-bucket?list-type=2"},
+		{http.MethodGet, "/my-bucket?list-type=1"},
+		{http.MethodGet, "/my-bucket"},
+		{http.MethodPost, "/my-bucket?delete"},
 	} {
 		t.Run(c.method+" "+c.target, func(t *testing.T) {
 			rec := do(t, h, c.method, c.target)

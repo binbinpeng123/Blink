@@ -19,6 +19,7 @@ func TestTableMatchesContract(t *testing.T) {
 		CodeBucketNotEmpty:               http.StatusConflict,
 		CodeInvalidBucketName:            http.StatusBadRequest,
 		CodeInvalidArgument:              http.StatusBadRequest,
+		CodeInvalidRequest:               http.StatusBadRequest,
 		CodeInvalidRange:                 http.StatusRequestedRangeNotSatisfiable,
 		CodeNoSuchUpload:                 http.StatusNotFound,
 		CodeEntityTooSmall:               http.StatusBadRequest,
