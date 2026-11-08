@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -704,4 +705,197 @@ func BenchmarkCompleteMultipartBlockTable(b *testing.B) {
 		b.Fatalf("Complete 写入 %d 字节，超过 1 MiB 上限", fi.Size())
 	}
 	b.ReportMetric(float64(fi.Size()), "meta-B/op")
+}
+
+// TestMultipartPartBoundsPersisted 验证 Complete 把分片边界写进 meta.json，
+// 并在重启后原样恢复。
+//
+// 分片下载（GetObject?partNumber=N）只依赖这份边界，会话在 Complete 时
+// 已被删除；边界丢失会让客户端拿到错误区间，而不是一个明确的错误。
+func TestMultipartPartBoundsPersisted(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "data")
+	open := func() *Store {
+		s, err := Open(Options{Root: root, BlockSize: 64 << 10, InlineThreshold: 16})
+		if err != nil {
+			t.Fatalf("Open 失败: %v", err)
+		}
+		return s
+	}
+	s := open()
+	if err := s.CreateBucket("bkt"); err != nil {
+		t.Fatalf("CreateBucket 失败: %v", err)
+	}
+
+	const key = "parts/obj"
+	up := createUpload(t, s, key, "", "")
+	p1 := mpuBytes(minPartSize, 0x11)
+	p2 := mpuBytes(1234, 0x22)
+	i1 := uploadPart(t, s, key, up.UploadID, 1, p1, UploadPartOptions{})
+	i2 := uploadPart(t, s, key, up.UploadID, 2, p2, UploadPartOptions{})
+	info, err := s.CompleteMultipartUpload("bkt", key, up.UploadID,
+		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, "", false)
+	if err != nil {
+		t.Fatalf("Complete 失败: %v", err)
+	}
+
+	want := []ObjectPart{
+		{Number: 1, Offset: 0, Size: minPartSize},
+		{Number: 2, Offset: minPartSize, Size: int64(len(p2))},
+	}
+	if len(info.Parts) != len(want) {
+		t.Fatalf("Complete 返回的分片边界 = %+v", info.Parts)
+	}
+	for i := range want {
+		if info.Parts[i] != want[i] {
+			t.Fatalf("第 %d 片边界 = %+v，期望 %+v", i+1, info.Parts[i], want[i])
+		}
+	}
+
+	// 重启后从盘上恢复，并验证跨片区间读取：分片边界不能改变读取语义。
+	s2 := open()
+	r, err := s2.OpenObject("bkt", key)
+	if err != nil {
+		t.Fatalf("重启后 OpenObject 失败: %v", err)
+	}
+	got := r.Info().Parts
+	if len(got) != len(want) {
+		t.Fatalf("重启后分片边界 = %+v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("重启后第 %d 片边界 = %+v，期望 %+v", i+1, got[i], want[i])
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := r.WriteRangeTo(&buf, want[1].Offset, want[1].Size); err != nil {
+		t.Fatalf("读取第二片失败: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), p2) {
+		t.Fatal("第二片内容与上传内容不一致")
+	}
+	buf.Reset()
+	const overlap = 10
+	if err := r.WriteRangeTo(&buf, minPartSize-overlap, 2*overlap); err != nil {
+		t.Fatalf("读取跨片区间失败: %v", err)
+	}
+	cross := append(append([]byte{}, p1[minPartSize-overlap:]...), p2[:overlap]...)
+	if !bytes.Equal(buf.Bytes(), cross) {
+		t.Fatal("跨片区间内容不一致")
+	}
+
+	// 普通对象没有分片边界：客户端传 partNumber=1 时按整对象处理。
+	if _, err := s2.PutObject("bkt", "plain", bytes.NewReader([]byte("hello")),
+		PutOptions{ExpectedSize: 5}); err != nil {
+		t.Fatalf("写入普通对象失败: %v", err)
+	}
+	pr, err := s2.OpenObject("bkt", "plain")
+	if err != nil {
+		t.Fatalf("OpenObject(plain) 失败: %v", err)
+	}
+	if pr.Info().Parts != nil {
+		t.Fatalf("普通对象不应有分片边界: %+v", pr.Info().Parts)
+	}
+}
+
+// TestCopyObjectDropsPartBounds 固定"CopyObject 不复制分片边界"的契约。
+//
+// 复制出的对象是一个全新的单段对象：保留源分片边界会让 partNumber
+// 指向目标对象并不存在的语义边界。
+func TestCopyObjectDropsPartBounds(t *testing.T) {
+	s := openMPUStore(t)
+	const srcKey, dstKey = "src", "dst"
+	up := createUpload(t, s, srcKey, "", "")
+	p1 := mpuBytes(minPartSize, 0x33)
+	p2 := mpuBytes(99, 0x44)
+	i1 := uploadPart(t, s, srcKey, up.UploadID, 1, p1, UploadPartOptions{})
+	i2 := uploadPart(t, s, srcKey, up.UploadID, 2, p2, UploadPartOptions{})
+	if _, err := s.CompleteMultipartUpload("bkt", srcKey, up.UploadID,
+		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, "", false); err != nil {
+		t.Fatalf("Complete 失败: %v", err)
+	}
+
+	info, err := s.CopyObject("bkt", dstKey, "bkt", srcKey, CopyOptions{})
+	if err != nil {
+		t.Fatalf("CopyObject 失败: %v", err)
+	}
+	if len(info.Parts) != 0 {
+		t.Fatalf("CopyObject 结果不应带分片边界: %+v", info.Parts)
+	}
+	dst, err := s.OpenObject("bkt", dstKey)
+	if err != nil {
+		t.Fatalf("OpenObject(dst) 失败: %v", err)
+	}
+	if dst.Info().Parts != nil {
+		t.Fatalf("目标对象不应有分片边界: %+v", dst.Info().Parts)
+	}
+	src, err := s.OpenObject("bkt", srcKey)
+	if err != nil {
+		t.Fatalf("OpenObject(src) 失败: %v", err)
+	}
+	if len(src.Info().Parts) != 2 {
+		t.Fatalf("复制的源对象边界被改动: %+v", src.Info().Parts)
+	}
+}
+
+// TestPartsValidation 覆盖副本元数据里分片边界的自洽性校验。
+//
+// 校验失败必须是 ErrCorrupt：把损坏的边界当作"没有边界"会让
+// partNumber 静默读到错误区间。
+func TestPartsValidation(t *testing.T) {
+	s := newTestStore(t)
+	const bucket, key = "bkt", "obj"
+	// 块表固定为 5 字节，因此分片总长必须恰好是 5。
+	mk := func(parts ...PartDesc) *ObjectMeta {
+		m := replicaMeta(key, 1, "node-a", singleBlock(BlockHash([]byte("hello")), 5))
+		m.Parts = parts
+		return m
+	}
+
+	// 正例：编号升序、总长一致。
+	if err := s.PutReplicaMeta(bucket, key,
+		mk(PartDesc{Number: 1, Size: 3}, PartDesc{Number: 2, Size: 2})); err != nil {
+		t.Fatalf("合法的分片边界被拒: %v", err)
+	}
+
+	cases := []struct {
+		name  string
+		parts []PartDesc
+	}{
+		{"编号为 0", []PartDesc{{Number: 0, Size: 5}}},
+		{"编号超过上限", []PartDesc{{Number: maxPartNumber + 1, Size: 5}}},
+		{"编号非升序", []PartDesc{{Number: 2, Size: 2}, {Number: 1, Size: 3}}},
+		{"编号重复", []PartDesc{{Number: 1, Size: 2}, {Number: 1, Size: 3}}},
+		{"长度为负", []PartDesc{{Number: 1, Size: -1}, {Number: 2, Size: 6}}},
+		{"总长不符", []PartDesc{{Number: 1, Size: 4}}},
+	}
+
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := mk(c.parts...)
+			// 每个用例独立 key，避开版本比较对结果的干扰。
+			m.Key = fmt.Sprintf("%s-%d", key, i)
+			if err := s.PutReplicaMeta(bucket, m.Key, m); !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("应返回 ErrCorrupt，实际 %v", err)
+			}
+		})
+	}
+}
+
+// TestPartsMetadataSize 固化评审文档的元数据体积门槛：10000 分片时
+// meta.json 增量必须小于 500 KiB，否则大对象会显著拖慢 LIST 与仲裁。
+func TestPartsMetadataSize(t *testing.T) {
+	parts := make([]PartDesc, maxPartNumber)
+	for i := range parts {
+		parts[i] = PartDesc{Number: i + 1, Size: 5 << 20}
+	}
+	raw, err := json.Marshal(ObjectMeta{Parts: parts})
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	const limit = 500 << 10
+	if len(raw) >= limit {
+		t.Errorf("10000 分片的 meta.json = %d 字节，超过门槛 %d", len(raw), limit)
+	}
+	t.Logf("10000 分片的 meta.json = %d 字节（门槛 %d）", len(raw), limit)
 }

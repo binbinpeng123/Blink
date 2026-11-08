@@ -16,6 +16,7 @@
 | 08 | [分布式存储设计](./08-distributed-storage.md) | 跨节点读写、多副本 quorum、纠删码、故障修复与集群部署 | 待评审 | v0.2.0 分布式版本 |
 | 09 | [边端读写性能优化](./09-edge-io-performance.md) | 惰性块缓冲与长度提示、元数据 LRU、并行写回滚、未达标项归因 | **实现完成，待评审**（2026-11-07） | 单机/边端读写性能 |
 | 10 | [对象级核心操作](./10-object-operations.md) | CopyObject（单机元数据级零拷贝）、DeleteObjects、ListObjects V1 | 待评审（2026-11-08） | v0.3.0 对象级兼容 |
+| 11 | [大对象工具：UploadPartCopy 与分片下载](./11-multipart-tools.md) | UploadPartCopy、GetObject/HeadObject `partNumber`、`ObjectMeta.Parts` | **实现完成，待评审**（2026-11-08） | v0.4.0 大对象互操作 |
 
 ## 当前进展
 

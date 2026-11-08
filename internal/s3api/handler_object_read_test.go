@@ -414,11 +414,44 @@ func TestDeleteObjectOverHTTP(t *testing.T) {
 }
 
 // 对象级 GET 上的 multipart 子资源仍要明确 501，不能被读路径吞掉。
-func TestGetObjectPartNumberStillNotImplemented(t *testing.T) {
+// TestGetObjectPartNumberOnPlainObject 覆盖非分片对象上的 partNumber 语义：
+// 整体即第一片，返回 200 完整对象；更大编号 416，且不伪造 Content-Range。
+func TestGetObjectPartNumberOnPlainObject(t *testing.T) {
 	h := objectTestServer(t)
-	rec := objectRequest(t, h, http.MethodGet, "/bkt/key?partNumber=1", nil)
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("状态码 = %d，期望 501", rec.Code)
+	const body = "hello world"
+	if rec := putObject(t, h, "/bkt/plain", body, nil); rec.Code != http.StatusOK {
+		t.Fatalf("写入失败: %d", rec.Code)
+	}
+
+	rec := objectRequest(t, h, http.MethodGet, "/bkt/plain?partNumber=1", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("partNumber=1 状态码 = %d，期望 200：%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != body {
+		t.Errorf("响应体 = %q，期望 %q", got, body)
+	}
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Errorf("非分片对象不应带 Content-Range: %q", got)
+	}
+	if got := rec.Header().Get("x-amz-mp-parts-count"); got != "" {
+		t.Errorf("非分片对象不应带 x-amz-mp-parts-count: %q", got)
+	}
+
+	rec = objectRequest(t, h, http.MethodGet, "/bkt/plain?partNumber=2", nil)
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("partNumber=2 状态码 = %d，期望 416", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "<Code>InvalidPartNumber</Code>") {
+		t.Errorf("错误码不是 InvalidPartNumber：%s", rec.Body.String())
+	}
+
+	// 编号格式错误属于"请求写错了"，与"编号合法但分片不存在"的 416 区分。
+	rec = objectRequest(t, h, http.MethodGet, "/bkt/plain?partNumber=abc", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("partNumber=abc 状态码 = %d，期望 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "<Code>InvalidArgument</Code>") {
+		t.Errorf("错误码不是 InvalidArgument：%s", rec.Body.String())
 	}
 }
 

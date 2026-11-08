@@ -84,15 +84,43 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 	h := w.Header()
 	setObjectHeaders(h, info)
 
-	start, length, partial, rangeErr := objectRange(r, info)
+	// partNumber 把响应的"单位"从对象换成单个分片：Range 在分片内解析，
+	// 但 Content-Range 仍用对象绝对偏移，客户端才能按分片拼回完整对象。
+	part, partErr := objectPart(r, info)
+	if partErr != nil {
+		partErr.Write(w, r, reqID)
+		return
+	}
+	base, span := int64(0), info.Size
+	if part != nil {
+		base, span = part.Offset, part.Size
+		// 只有分片请求才回传分片总数：普通 GET 不需要它，
+		// 给所有响应加头部只会增加无谓的字节。
+		h.Set("x-amz-mp-parts-count", strconv.Itoa(len(info.Parts)))
+	}
+
+	start, length, partial, rangeErr := objectRange(r, info, span)
 	if rangeErr != nil {
 		if rangeErr.Code == s3err.CodeInvalidRange {
 			// 02 文档要求 416 带 Content-Range: bytes */<size>，
 			// 让客户端知道对象的真实大小、从而修正下一次请求。
-			h.Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size))
+			// 分片请求里这个"大小"是分片大小：Range 是相对分片解析的。
+			h.Set("Content-Range", fmt.Sprintf("bytes */%d", span))
 		}
 		rangeErr.Write(w, r, reqID)
 		return
+	}
+
+	// 状态码在这里就要定下来：校验和是否回传取决于最终是 200 还是 206，
+	// 而头部必须在 WriteHeader 之前写完。
+	//
+	// 分片请求只要分片非空就是 206 —— 即使客户端没带 Range，
+	// 返回的也只是对象的一部分，用 200 会让"部分内容"伪装成完整响应。
+	// 空分片是唯一的例外：构造 bytes x-y/0 是非法的 Content-Range，
+	// 只能回 200 + Content-Length: 0（正常客户端不会产生这种分片）。
+	status := http.StatusOK
+	if (part != nil && part.Size > 0) || (part == nil && partial) {
+		status = http.StatusPartialContent
 	}
 
 	// 只有客户端明确要求时才回传校验和：头部不是免费的，
@@ -101,7 +129,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 	// 部分响应（206）**不**回传校验和：存储的是整个对象的校验和，
 	// 附在一段字节上会让按规范校验的客户端（如 aws-cli 的 Range 下载）
 	// 判定"校验和不匹配"而报错。校验和只对完整对象有意义。
-	if !partial && checksumModeEnabled(r) && info.ChecksumAlgorithm != "" {
+	if status == http.StatusOK && checksumModeEnabled(r) && info.ChecksumAlgorithm != "" {
 		h.Set(info.ChecksumAlgorithm.Header(), info.Checksum)
 		// checksum-type 必须一起回传：FULL_OBJECT 与 COMPOSITE 的校验值
 		// 形状完全不同（后者带 `-N` 后缀），客户端不知道类型就无法复算。
@@ -116,10 +144,10 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 	// 响应处理有缺陷（02 文档）。
 	h.Set("Content-Length", strconv.FormatInt(length, 10))
 
-	status := http.StatusOK
-	if partial {
-		status = http.StatusPartialContent
-		h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, info.Size))
+	if status == http.StatusPartialContent {
+		// 绝对偏移：base 是分片起点（非分片请求为 0）。
+		h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d",
+			base+start, base+start+length-1, info.Size))
 	}
 	w.WriteHeader(status)
 
@@ -133,14 +161,14 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 		return
 	}
 
-	if err := reader.WriteRangeTo(w, start, length); err != nil {
+	if err := reader.WriteRangeTo(w, base+start, length); err != nil {
 		// 响应头（含 Content-Length）已经发出，此时无法再改成错误状态码。
 		// 只能记录日志：客户端会因收到的字节数与 Content-Length 不符而
 		// 判定传输失败，这比静默截断可发现得多。
 		logger.Error("object_read_failed",
 			slog.String("bucket", bucket),
 			slog.String("key", key),
-			slog.Int64("offset", start),
+			slog.Int64("offset", base+start),
 			slog.Int64("length", length),
 			slog.String("err", err.Error()),
 		)
@@ -151,7 +179,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 		slog.String("bucket", bucket),
 		slog.String("key", key),
 		slog.Int("status", status),
-		slog.Int64("offset", start),
+		slog.Int64("offset", base+start),
 		slog.Int64("length", length),
 		slog.Int64("size", info.Size),
 	)
@@ -187,20 +215,59 @@ func checksumModeEnabled(r *http.Request) bool {
 	return strings.EqualFold(strings.TrimSpace(r.Header.Get("x-amz-checksum-mode")), "ENABLED")
 }
 
+// objectPart 解析 partNumber 子资源，返回目标分片的绝对边界。
+//
+// 返回 (nil, nil) 有两种含义，调用方都按完整响应处理：
+//   - 请求没有 partNumber；
+//   - 对象不是分片上传产生的，且客户端请求 partNumber=1（整体即第一片）。
+//
+// 后一种情况刻意不构造 Content-Range，也不回 x-amz-mp-parts-count：
+// 对象只有一个"隐含分片"，把它伪装成分片响应会让客户端以为存在分片元数据。
+func objectPart(r *http.Request, info store.ObjectInfo) (*store.ObjectPart, *s3err.Error) {
+	q := r.URL.Query()
+	if !q.Has("partNumber") {
+		return nil, nil
+	}
+	// 编号格式与 UploadPart 用同一套校验：非整数或越界都是 400，
+	// 属于"请求写错了"，与"编号合法但对象里没有这一片"的 416 区分开。
+	n, e := parsePartNumber(q.Get("partNumber"))
+	if e != nil {
+		return nil, e
+	}
+
+	if len(info.Parts) == 0 {
+		if n == 1 {
+			return nil, nil
+		}
+		return nil, s3err.New(s3err.CodeInvalidPartNumber).
+			WithMessage(fmt.Sprintf("对象不是分片上传产生的，只有 partNumber=1 有效（请求 %d）。", n))
+	}
+	for i := range info.Parts {
+		if info.Parts[i].Number == n {
+			return &info.Parts[i], nil
+		}
+	}
+	return nil, s3err.New(s3err.CodeInvalidPartNumber).
+		WithMessage(fmt.Sprintf("对象不存在分片 %d（共 %d 个分片）。", n, len(info.Parts)))
+}
+
 // objectRange 计算本次响应要发送的字节区间。
 //
-// 返回 partial=false 表示发送整个对象（无 Range，或 If-Range 不成立）。
-// If-Range 的作用是"只有对象没变才给部分内容"：对象已被覆盖时回退为
-// 完整响应，避免客户端把新版本的一段拼到旧版本的缓存里。
-func objectRange(r *http.Request, info store.ObjectInfo) (start, length int64, partial bool, e *s3err.Error) {
+// span 是本次响应的"逻辑大小"：普通请求是对象大小，分片请求是分片大小。
+// Range 相对它解析 —— 分片下载的 Range 描述的是分片内的偏移，不是对象偏移。
+// If-Range 仍按对象 ETag/修改时间求值（分片不改变条件语义），不成立时
+// 回退为整个 span（分片请求回退整个分片，而不是整个对象）。
+//
+// 返回 partial=false 表示发送整个 span（无 Range，或 If-Range 不成立）。
+func objectRange(r *http.Request, info store.ObjectInfo, span int64) (start, length int64, partial bool, e *s3err.Error) {
 	spec := strings.TrimSpace(r.Header.Get("Range"))
 	if spec == "" {
-		return 0, info.Size, false, nil
+		return 0, span, false, nil
 	}
 	if !ifRangeApplies(r.Header.Get("If-Range"), info) {
-		return 0, info.Size, false, nil
+		return 0, span, false, nil
 	}
-	start, length, e = parseRange(spec, info.Size)
+	start, length, e = parseRange(spec, span)
 	if e != nil {
 		return 0, 0, false, e
 	}

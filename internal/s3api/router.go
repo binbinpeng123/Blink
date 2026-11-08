@@ -282,14 +282,14 @@ var unsupportedSubresources = map[string]bool{
 //
 //	POST /{bucket}/{key}?uploads          CreateMultipartUpload
 //	PUT  /{bucket}/{key}?partNumber&uploadId  UploadPart
+//	       同一路由带 x-amz-copy-source 时为 UploadPartCopy
 //	POST /{bucket}/{key}?uploadId         CompleteMultipartUpload
 //	DELETE /{bucket}/{key}?uploadId       AbortMultipartUpload
 //	GET  /{bucket}/{key}?uploadId         ListParts
 //	GET  /{bucket}?uploads                ListMultipartUploads
 //
-// `?partNumber` 单独出现是 GetObject 的分片下载子资源，本版本仍回 501；
-// 明确拒绝而不是让请求落到普通 GET —— 否则客户端会拿到整个对象，
-// 却以为那是第 N 片，拼出重复数据。
+// `?partNumber` 单独出现是 GetObject/HeadObject 的分片下载子资源，
+// 交回通用分派由对象读路径处理。
 func (s *Server) dispatchMultipart(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) bool {
 	q := r.URL.Query()
 
@@ -320,8 +320,13 @@ func (s *Server) dispatchMultipart(w http.ResponseWriter, r *http.Request, bucke
 
 	if !q.Has("uploadId") {
 		if q.Has("partNumber") {
-			// 分片下载（GetObject partNumber）不在本版本范围内。
-			notImplemented("暂不支持按 partNumber 下载对象分片。").
+			// GET/HEAD 是分片下载，交回通用分派；其他方法上的 partNumber
+			// 没有定义（UploadPart 必须同时带 uploadId），明确拒绝而不是
+			// 让请求落到普通写入 —— 那会把一个"编号"当成无关查询参数忽略。
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				return false
+			}
+			invalidArg("partNumber 只能用于 UploadPart（需同时提供 uploadId）或 GET/HEAD 分片下载。").
 				Write(w, r, reqID)
 			return true
 		}
@@ -340,7 +345,14 @@ func (s *Server) dispatchMultipart(w http.ResponseWriter, r *http.Request, bucke
 		if !s.requireStore(w, r, reqID) {
 			return true
 		}
-		s.handleUploadPart(w, r, bucket, key, reqID)
+		// 同一条 PUT 路由由 x-amz-copy-source 分流：非空是 UploadPartCopy，
+		// 为空是普通 UploadPart。判据必须与 CopyObject 一致（只看头是否
+		// 非空），否则分片复制会被当成"用空/异常请求体上传分片"。
+		if r.Header.Get("x-amz-copy-source") != "" {
+			s.handleUploadPartCopy(w, r, bucket, key, reqID)
+		} else {
+			s.handleUploadPart(w, r, bucket, key, reqID)
+		}
 	case http.MethodPost:
 		if !s.requireStore(w, r, reqID) {
 			return true

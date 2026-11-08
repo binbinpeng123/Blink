@@ -73,6 +73,7 @@ func objectInfoFromMeta(m *objectMeta) ObjectInfo {
 		ChecksumType:      m.ChecksumType,
 		BlockCount:        len(m.Blocks),
 		Version:           m.ObjVersion,
+		Parts:             PartBounds(m.Parts),
 	}
 }
 

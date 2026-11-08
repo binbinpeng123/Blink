@@ -24,6 +24,7 @@ func TestTableMatchesContract(t *testing.T) {
 		CodeNoSuchUpload:                 http.StatusNotFound,
 		CodeEntityTooSmall:               http.StatusBadRequest,
 		CodeInvalidPart:                  http.StatusBadRequest,
+		CodeInvalidPartNumber:            http.StatusRequestedRangeNotSatisfiable,
 		CodeInvalidPartOrder:             http.StatusBadRequest,
 		CodeBadDigest:                    http.StatusBadRequest,
 		CodeInvalidDigest:                http.StatusBadRequest,

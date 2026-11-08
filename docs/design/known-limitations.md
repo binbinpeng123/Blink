@@ -32,13 +32,13 @@
 | **删除对象后空间可能不立即释放** | 内容寻址去重共享块 + GC 宽限期 | 用户可能误以为删除未生效；需通过可回收空间指标解释 |
 | **重复内容不重复占用磁盘** | 内容寻址的天然结果 | 空间释放语义不是"一对象一份空间"，与部分用户直觉不符 |
 | **不支持 ACL、Tagging、Lifecycle、Versioning、Replication、Object Lock** | 首个版本范围外，显式返回 `501` | 依赖这些特性的客户端或脚本会失败（但错误明确） |
-| **CopyObject 单次上限 5 GiB，且不实现 `UploadPartCopy`** | 与 S3 单次复制契约一致；分片复制需要新的内部协议，单列后续切片 | 源对象 > 5 GiB → `400 InvalidRequest`；`x-amz-copy-source-range` → `501`。**aws-cli 的 `s3 cp s3://… s3://…` 对超过 `s3.multipart_threshold`（默认 8 MiB）的对象会自动改用 UploadPartCopy，因此在默认配置下大对象服务端复制失败**；需把阈值调大（≤5 GiB 建议 `5GB`）才会走 CopyObject |
+| **CopyObject 单次上限 5 GiB；更大对象须走 `UploadPartCopy`** | 与 S3 单次复制契约一致；分片复制在切片 11 实现，单分片上限同为 5 GiB | 源对象 > 5 GiB → `400 InvalidRequest`；客户端可用 `UploadPartCopy` 按 ≤5 GiB 区间复制。**aws-cli 2.36.2 的 `s3 cp s3://… s3://…` 默认 `--copy-props default` 会先调用 `GetObjectTagging`（本版本 `501`），因此大对象服务端复制必须加 `--copy-props none`** |
 | **单机模式不能复制 EC 布局的源对象** | 单机路径复制只搬运元数据，无法保证目标节点上存在对应分片 | 返回 `501 NotImplemented`。集群模式走流式重写，不受此限制 |
 | **集群 CopyObject 不是零拷贝** | 目标副本需按目标 key 的环位置重新分布，数据必须经协调者流式读一次、写一次 | 耗时与对象大小线性相关。**O(1) 元数据复制只对单机模式成立**，文档与响应均不得宣称集群复制零拷贝 |
 | **CopyObject 的条件检查与写入非原子** | 源条件在读取源后求值，目标 `If-None-Match: *` 在写入前检查，期间无全局锁 | 并发复制到同一目标时，条件可能被同时满足（与集群条件写的"尽力而为"同源）；单客户端顺序操作不受影响 |
 | **DeleteObjects 单次最多 1000 个对象** | 与 S3 契约一致，防止单请求占用过多 worker 与内存 | 超过 1000 或 XML 非法 → `400 MalformedXML`；更大批量需客户端分批 |
 | **Range 不支持多区间** | 简化实现，S3 客户端极少使用 | 多区间请求返回 `501` |
-| **分片下载（`partNumber=N`）未实现** | 简化；主流客户端用 Range 而非该参数 | 显式返回 `501` |
+| **分片下载（`partNumber=N`）只对分片上传对象生效** | 边界来自 Complete 时写入 `meta.json` 的 `parts`；`PutObject`/`CopyObject` 不产生该字段 | 非分片对象 `partNumber=1` 返回 `200` 整对象，`partNumber>1` → `416 InvalidPartNumber`；复制后的对象不保留源分片边界 |
 | **启动时不做 CAS 全盘完整性扫描** | 保证启动代价与对象数量弱相关 | 已损坏但未被访问的块不会在启动时被发现 |
 | **TLS 默认不启用，且安全体系未定稿** | TLS 需显式配置证书/私钥；认证策略属 06 文档范围，尚未评审 | 默认仍以 HTTP 启动；即使启用 TLS，也不得用于生产环境，须等待 06 文档的认证与密钥管理定稿 |
 

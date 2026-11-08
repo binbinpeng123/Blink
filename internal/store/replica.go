@@ -276,9 +276,9 @@ func validateReplicaMeta(key string, m *ObjectMeta) error {
 	// 墓碑只有版本，没有内容。ETag/ContentType/块表的校验必须放在
 	// 这之后：墓碑本来就不该有它们，先判空会把每一次删除都判成损坏。
 	if m.Deleted {
-		if m.Size != 0 || len(m.Blocks) != 0 {
-			return fmt.Errorf("%w: 删除墓碑不应携带内容（size=%d，blocks=%d）",
-				ErrCorrupt, m.Size, len(m.Blocks))
+		if m.Size != 0 || len(m.Blocks) != 0 || len(m.Parts) != 0 {
+			return fmt.Errorf("%w: 删除墓碑不应携带内容（size=%d，blocks=%d，parts=%d）",
+				ErrCorrupt, m.Size, len(m.Blocks), len(m.Parts))
 		}
 		return nil
 	}
@@ -310,8 +310,48 @@ func validateReplicaMeta(key string, m *ObjectMeta) error {
 	if m.Size > 0 && len(m.Blocks) == 0 {
 		return fmt.Errorf("%w: 非空对象没有块表", ErrCorrupt)
 	}
+	if err := validateParts(m); err != nil {
+		return err
+	}
 	if err := validateECMeta(m); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateParts 校验分片边界与对象大小自洽。
+//
+// 校验失败必须是 ErrCorrupt，绝不降级成"没有分片边界"：后者会让
+// partNumber 静默返回错误区间（例如把第 2 片读成第 1 片的内容），
+// 比明确报错危险得多。
+func validateParts(m *ObjectMeta) error {
+	if len(m.Parts) == 0 {
+		return nil
+	}
+	var (
+		last  int
+		total int64
+	)
+	for _, p := range m.Parts {
+		if p.Number < 1 || p.Number > maxPartNumber {
+			return fmt.Errorf("%w: 分片编号 %d 不在 1–%d 之间",
+				ErrCorrupt, p.Number, maxPartNumber)
+		}
+		// 编号必须严格升序：S3 的 Complete 只接受升序列表，落盘后的
+		// 边界也应保持同一顺序，读取时才能用下标二分/前缀和。
+		if p.Number <= last {
+			return fmt.Errorf("%w: 分片编号 %d 出现在 %d 之后",
+				ErrCorrupt, p.Number, last)
+		}
+		if p.Size < 0 {
+			return fmt.Errorf("%w: 分片 %d 长度 %d 为负", ErrCorrupt, p.Number, p.Size)
+		}
+		last = p.Number
+		total += p.Size
+	}
+	if total != m.Size {
+		return fmt.Errorf("%w: 分片总长 %d 与对象大小 %d 不符",
+			ErrCorrupt, total, m.Size)
 	}
 	return nil
 }

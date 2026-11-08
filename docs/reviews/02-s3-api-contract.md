@@ -34,6 +34,7 @@
 | --- | --- | --- | --- |
 | 11 | `POST` | `/{bucket}/{key}?uploads` | CreateMultipartUpload |
 | 12 | `PUT` | `/{bucket}/{key}?partNumber=N&uploadId=X` | UploadPart |
+| 12a | `PUT` | `/{bucket}/{key}?partNumber=N&uploadId=X` + `x-amz-copy-source` | UploadPartCopy（服务端分片复制，单分片 ≤ 5 GiB） |
 | 13 | `POST` | `/{bucket}/{key}?uploadId=X` | CompleteMultipartUpload |
 | 14 | `DELETE` | `/{bucket}/{key}?uploadId=X` | AbortMultipartUpload |
 | 15 | `GET` | `/{bucket}/{key}?uploadId=X` | ListParts |
@@ -71,7 +72,6 @@
 | `PUT /{bucket}/{key}?acl`、`?tagging`、`?legal-hold`、`?retention` | `501 NotImplemented` |
 | `POST /{bucket}/{key}?restore`、`?select` | `501 NotImplemented` |
 | `GET /{bucket}/{key}?torrent` | `501 NotImplemented` |
-| `GET /{bucket}/{key}?partNumber=N`（分片下载） | `501 NotImplemented` |
 | `PUT`/`GET`/`DELETE /{bucket}/{key}?cors`（对象级 CORS，S3 无此语义） | `501 NotImplemented` |
 | Range 请求含多个区间（逗号分隔） | `501 NotImplemented` |
 | 任意未知查询参数组合 | `501 NotImplemented` |
@@ -104,6 +104,7 @@
 | `InvalidArgument` | 400 | 参数非法 |
 | `InvalidRequest` | 400 | 请求语义不成立（如自复制且未 `REPLACE`、超过 CopyObject 大小上限） |
 | `InvalidRange` | 416 | Range 超出对象范围 |
+| `InvalidPartNumber` | 416 | 请求的 `partNumber` 在对象中不存在（或非分片对象请求 `partNumber > 1`） |
 | `NoSuchUpload` | 404 | 分片上传不存在或已中止 |
 | `EntityTooSmall` | 400 | 分片小于最小允许值 |
 | `InvalidPart` | 400 | 分片不存在或 ETag 不匹配 |
@@ -176,6 +177,18 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 空对象必须显式 `Content-Length: 0`，不发送 `Transfer-Encoding: chunked`。
 - HeadObject 不存在 → `404` 且**无响应体**。
 
+#### 分片下载 `GET`/`HEAD /{bucket}/{key}?partNumber=N`
+
+- 仅对分片上传产生的对象有意义：完成时把分片边界写入 `meta.json` 的 `parts`（`{number,size}`，偏移由累计和推导），不提升 `format_version`。
+- 分片存在 → `206`，`Content-Range: bytes <start>-<end>/<对象总大小>`（绝对偏移），并带 `x-amz-mp-parts-count: <分片数>`。
+- `Range` 相对**分片**解析，`Content-Range` 仍用对象绝对偏移；分片内越界 → `416 InvalidRange`，`Content-Range: bytes */<分片大小>`。
+- 分片号不在对象的 `parts` 中 → `416 InvalidPartNumber`；`partNumber` 非整数或不在 1–10000 → `400 InvalidArgument`（与 `UploadPart` 同一套编号校验）。
+- 非分片对象：`partNumber=1` 返回 `200` 完整对象（不伪造 `Content-Range`）；`partNumber>1` → `416 InvalidPartNumber`。
+- 空分片（长度为 0）→ `200` + `Content-Length: 0`，不构造非法 `Content-Range`。
+- `206` 分片响应不回传对象级校验和；普通 `GET`/`HEAD` 不带 `x-amz-mp-parts-count`。
+- 带 `uploadId` 的 `GET` 仍走 `ListParts`；`uploadId` + `partNumber` 继续 `501`。
+- **复制后的对象不保留分片边界**：`CopyObject` 与 `UploadPartCopy` 的目标边界由本次上传决定，源对象边界不继承。
+
 ### DeleteObject `DELETE /{bucket}/{key}`
 
 - **幂等**：对象不存在也返回 `204 No Content`（S3 语义，客户端依赖）。
@@ -214,7 +227,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - `x-amz-copy-source-range`、加密/标签相关头部 → `501 NotImplemented`。
 - 响应：`200` + `<CopyObjectResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyObjectResult>`。
 - 单机模式是 **O(1) 元数据复制**（目标 meta 直接引用源块表，CAS 文件数不变）；集群模式为流式复制（源经 quorum 读、目标经 quorum 写），**不宣称零拷贝**。
-- 客户端注意：aws-cli 的 `s3 cp s3://… s3://…` 在对象超过 `s3.multipart_threshold`（默认 8 MiB）时改用 `UploadPartCopy`，本版本返回 `501`；须把该阈值调大（≤5 GiB 对象建议 `5GB`）才会走 `CopyObject`。`UploadPartCopy` 不在本版本范围内。
+- 客户端注意：aws-cli 的 `s3 cp s3://… s3://…` 在对象超过 `s3.multipart_threshold`（默认 8 MiB）时改用 `UploadPartCopy`，本版本已支持。但 aws-cli 2.36.2 的默认 `--copy-props default` 会在复制前调用 `GetObjectTagging`（本版本 `501`），因此**大对象服务端复制需显式加 `--copy-props none`**；这与 UploadPartCopy 能力无关。
 
 ### DeleteObjects `POST /{bucket}?delete`
 
@@ -238,6 +251,8 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - `UploadId` 使用 `crypto/rand` 生成。
 - `CreateMultipartUpload` 必须持久化客户端声明的 checksum 算法，它决定后续分片与完成的校验行为。
 - `UploadPart`：`partNumber` 范围 1–10000；除最后一个分片外，每片不小于 5 MiB。
+- `UploadPartCopy`：与 `UploadPart` 同路由，以 `x-amz-copy-source` 非空为唯一判据分流。支持 `x-amz-copy-source-range: bytes=first-last`（两端必填，不支持开放/后缀/多区间）；缺省复制整个源对象。源条件与 CopyObject 同一套 `x-amz-copy-source-if-*`；源不存在 → `404 NoSuchKey`；区间越界 → `416 InvalidRange` 且带 `Content-Range: bytes */<源大小>`；单次复制 > 5 GiB → `400 InvalidRequest`。响应 `<CopyPartResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyPartResult>`，ETag 按目标分片内容重算，与随后 `ListParts` 一致。
+- 单机与集群的 `UploadPartCopy` 都走 `OpenObject` + `io.Pipe` + `UploadPart`：**不是零拷贝**，数据经协调者读一次、写一次（与集群 CopyObject 同理）。
 - `CompleteMultipartUpload` 必须校验分片序号升序（否则 `400 InvalidPartOrder`）、分片存在且 ETag 匹配（否则 `400 InvalidPart`）、尺寸约束（否则 `400 EntityTooSmall`）。
 - 完成后的 `ETag` 为 `"<md5(各分片 MD5 拼接)>-<N>"`。
 - 完成后先原子提交元数据与块表，再删除分片上传的临时状态。
