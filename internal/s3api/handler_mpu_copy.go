@@ -49,6 +49,11 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
+	// 与 CopyObject 相同：源对象需要 read 权限，检查先于任何存储访问。
+	if !s.authorizeSource(w, r, src, reqID) {
+		return
+	}
+
 	// 存储类型、加密与标签头与 CopyObject 同一套规则：分片本身不携带
 	// 这些属性，出现即 501，绝不静默忽略。x-amz-metadata-directive 在
 	// 分片复制上没有定义，按 S3 行为忽略。

@@ -139,6 +139,11 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 	if _, err := s.loadBucketMeta(bucket); err != nil {
 		return nil, err
 	}
+	// 高水位在入口拒绝，而不是等写到一半 ENOSPC：半途失败会留下
+	// 无法回收的临时对象，且客户端已经上传了部分字节。
+	if err := s.checkWriteAllowed(); err != nil {
+		return nil, err
+	}
 	if opt.ExpectedSize < 0 {
 		return nil, fmt.Errorf("%w: 缺少 Content-Length", ErrIncompleteBody)
 	}
@@ -302,6 +307,12 @@ func (s *Store) putBlock(hash string, data []byte) (bool, error) {
 		return false, nil
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return false, fsErr("检查块", hash, err)
+	}
+
+	// 去重命中不占新空间，因此水位检查放在 Stat 之后：已存在的块
+	// 即使在阻断期也允许命中，否则重复上传同一份模型会莫名失败。
+	if err := s.checkWriteAllowed(); err != nil {
+		return false, err
 	}
 
 	w, err := s.newAtomicWriter(final, false)

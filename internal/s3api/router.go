@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/binbinpeng123/Blink/internal/authz"
+	"github.com/binbinpeng123/Blink/internal/metrics"
 	"github.com/binbinpeng123/Blink/internal/s3err"
 	"github.com/binbinpeng123/Blink/internal/sigv4"
 	"github.com/binbinpeng123/Blink/internal/store"
@@ -31,6 +33,32 @@ type Options struct {
 	// Store 是存储引擎。为 nil 时所有 S3 数据操作返回
 	// 500 InternalError 而非 panic —— 见 requireStore。
 	Store store.Backend
+	// Policies 按 Access Key 提供授权策略。
+	//
+	// 为 nil 时所有通过签名校验的凭据获得全权限，仅用于嵌入式调用与
+	// 测试；生产入口（cmd/blink）总会填满该表，环境变量凭据对应
+	// authz.AllowAll()，文件凭据对应各自的显式策略。
+	Policies map[string]*authz.Policy
+	// Metrics 是 Prometheus 指标注册表；nil 时不暴露 /metrics 指标。
+	Metrics *metrics.Registry
+	// Capacity 提供磁盘容量与写入阻断状态，供 /readyz 与指标使用。
+	// 为 nil 时 /readyz 的 disk.available 恒为 false。
+	Capacity Capacity
+	// HighWatermark / LowWatermark 是写入阻断的滞回水位，仅用于
+	// /readyz 的展示；实际拦截发生在 store 层。<=0 表示未启用。
+	HighWatermark float64
+	LowWatermark  float64
+	// CredentialCount 是已配置的凭据数量，仅用于暴露 blink_credentials_total。
+	CredentialCount int
+}
+
+// Capacity 是 /readyz 与指标所需的容量信息。
+//
+// 只抽取两个方法而不是直接依赖 *store.Store：集群后端也实现它们
+// （内嵌 *store.Store），而测试可以注入确定性数值。
+type Capacity interface {
+	DiskUsage() store.DiskUsage
+	WriteBlocked() bool
 }
 
 // Server 承载路由与共享依赖。
@@ -39,6 +67,14 @@ type Server struct {
 	region string
 	auth   AuthOptions
 	store  store.Backend
+
+	metrics  *serverMetrics
+	capacity Capacity
+	// highWatermark / lowWatermark 只用于 /readyz 展示。
+	highWatermark float64
+	lowWatermark  float64
+	// startedAt 用于 blink_uptime_seconds。
+	startedAt time.Time
 }
 
 // New 构造 Server。logger 为 nil 时使用 slog 默认 logger，避免调用方崩溃。
@@ -47,15 +83,24 @@ func New(opt Options) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	m := newServerMetrics(opt.Metrics, opt.CredentialCount)
 	return &Server{
-		logger: logger,
-		region: opt.Region,
-		store:  opt.Store,
+		logger:    logger,
+		region:    opt.Region,
+		store:     opt.Store,
+		metrics:   m,
+		capacity:  opt.Capacity,
+		startedAt: time.Now(),
+
+		highWatermark: opt.HighWatermark,
+		lowWatermark:  opt.LowWatermark,
 		auth: AuthOptions{
 			Provider:     opt.Provider,
 			Region:       opt.Region,
 			MaxClockSkew: opt.MaxClockSkew,
 			Disabled:     opt.DisableAuth,
+			Policies:     opt.Policies,
+			Metrics:      m,
 		},
 	}
 }
@@ -80,28 +125,36 @@ func (s *Server) requireStore(w http.ResponseWriter, r *http.Request, reqID stri
 //
 // 中间件顺序（由外到内）：
 //
-//	withRequestContext → recoverPanic → withCORS → withAuth → mux
+//	withRequestContext → recoverPanic → withCORS → withAuth → withAudit → mux
 //
 // request_id 必须在最外层生成，否则鉴权失败的响应里没有可对照的 ID；
 // recoverPanic 必须在鉴权之前，否则签名代码里的 panic 会变成连接中断而非 500；
-// withCORS 必须在 withAuth 之前，因为浏览器的预检请求不携带 Authorization。
+// withCORS 必须在 withAuth 之前，因为浏览器的预检请求不携带 Authorization；
+// withAudit 必须在 withAuth 之内，否则拿不到已验证的 Access Key 与策略。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	// 非 S3 端点，免签名，白名单见 unauthenticatedPaths。
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.HandleFunc("/readyz", handleReadyz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/version", handleVersion)
+	// /metrics 同样免签：Prometheus 抓取器通常不带 SigV4。
+	// 代价是任何能连上端口的人都能读到运行指标，必须在
+	// NetworkPolicy / 反向代理层限制来源（见 06 文档）。
+	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	// S3 端点统一入口，路径解析在 dispatch 中完成。
 	mux.HandleFunc("/", s.dispatch)
 
 	var h http.Handler = mux
+	// 审计位于鉴权之内：这样才能拿到已验证的 Access Key 与策略，
+	// 而不是从请求头里"猜"身份。包装顺序与执行顺序相反，所以先装 audit。
+	h = s.withAudit(h)
 	h = withAuth(s.auth, h)
 	// CORS 在鉴权之外侧：预检请求不带 Authorization，必须先于签名校验处理。
 	h = s.withCORS(h)
 	h = recoverPanic(s.logger, h)
-	h = withRequestContext(s.logger, h)
+	h = withRequestContext(s.logger, s.metrics, h)
 	return h
 }
 
@@ -120,6 +173,13 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 	logger := loggerFrom(r.Context(), s.logger)
 
 	bucket, key := splitPath(r.URL.Path)
+
+	// 授权检查在路由分派之前统一完成：每个 handler 都能假定"走到
+	// 这里的人有权做这件事"，不存在"忘了加检查"的分支。
+	// 复制源对象、DeleteObjects 逐 key 等**附加**检查在各自 handler 内。
+	if !s.authorizeRequest(w, r, bucket, key, reqID) {
+		return
+	}
 
 	// 未实现的子资源先拦下，避免被后续分支误吞。
 	// 完整清单见 docs/02「不支持项」。

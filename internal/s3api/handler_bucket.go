@@ -82,6 +82,12 @@ func (s *Server) handleListBuckets(w http.ResponseWriter, r *http.Request, reqID
 	}
 	out := listAllMyBucketsResult{}
 	for _, name := range names {
+		// ListBuckets 没有单一动作可归类，按"该凭据是否有任何规则
+		// 能让这个桶产生可见性"过滤：看到不存在的桶比"看不到有权限的桶"
+		// 更糟 —— 前者会让客户端去探测一个它永远访问不了的资源。
+		if !s.bucketVisible(r, name) {
+			continue
+		}
 		created, err := s.store.BucketCreatedAt(name)
 		if err != nil {
 			// 桶在列举与读取之间被删除：跳过即可，不该让整个 LIST 失败。

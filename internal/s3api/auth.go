@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/binbinpeng123/Blink/internal/authz"
 	"github.com/binbinpeng123/Blink/internal/logx"
+	"github.com/binbinpeng123/Blink/internal/s3err"
 	"github.com/binbinpeng123/Blink/internal/sigv4"
 )
 
@@ -25,6 +27,12 @@ type AuthOptions struct {
 	// 该开关只为本地调试与集成测试提供，线上不得开启 ——
 	// 开启意味着任何能连上端口的人都能读写全部数据。
 	Disabled bool
+	// Policies 按 Access Key 查授权策略。为 nil 时通过签名的凭据
+	// 获得全权限（嵌入式/测试用法）；非 nil 时查不到的 AK 一律拒绝 ——
+	// 绝不默认放行。
+	Policies map[string]*authz.Policy
+	// Metrics 用于记录签名失败次数；nil 时跳过。
+	Metrics *serverMetrics
 }
 
 // authResult 是校验通过后注入上下文的产物。
@@ -32,6 +40,9 @@ type authResult struct {
 	AccessKeyID   string
 	ContentSHA256 string
 	Presigned     bool
+	// Policy 是本次请求的授权策略；签名通过但策略表缺失时为 nil，
+	// 此时 authorizeRequest 会拒绝（见 Policy.Allow 的 nil 语义）。
+	Policy *authz.Policy
 	// ChunkSigner 仅签名分块载荷（STREAMING-AWS4-HMAC-SHA256-PAYLOAD*）
 	// 非 nil；它是有状态的签名链，只能用于本次请求。
 	ChunkSigner *sigv4.ChunkSigner
@@ -49,12 +60,18 @@ func authFrom(r *http.Request) *authResult {
 
 // unauthenticatedPaths 是免签路径。
 //
-// 只放健康检查与版本信息：它们要么被 K8s 探针高频调用（不该要求签名），
-// 要么本来就不含敏感信息。S3 路由一律不在此列。
+// 只放健康检查、版本信息与指标：它们要么被 K8s 探针高频调用（不该要求
+// 签名），要么被 Prometheus 抓取器按固定间隔拉取（通常不带 SigV4）。
+// S3 路由一律不在此列。
+//
+// /metrics 免签意味着**任何能连上端口的人都能看到运行指标**：
+// 指标里没有 key、桶名与凭据，但仍暴露负载与错误率。部署时必须用
+// NetworkPolicy 或反向代理限制来源，启动日志会给出提示。
 var unauthenticatedPaths = map[string]bool{
 	"/healthz": true,
 	"/readyz":  true,
 	"/version": true,
+	"/metrics": true,
 }
 
 func (o AuthOptions) maxSkew() time.Duration {
@@ -90,8 +107,30 @@ func withAuth(opt AuthOptions, next http.Handler) http.Handler {
 				slog.String("message", serr.Message),
 				slog.String("access_key", redactKeyID(accessKeyOf(r))),
 			)
+			opt.Metrics.authFailed(string(serr.Code))
 			serr.Write(w, r, requestIDFrom(r.Context()))
 			return
+		}
+
+		// 策略表查不到 AK 时拒绝，而不是默认放行：Provider 被替换、
+		// 配置漏装策略等情况下，"签名有效"不等于"有权访问"。
+		// 这是 06 文档的明确契约，也是与"环境变量凭据全权限"的唯一区别。
+		var policy *authz.Policy
+		if opt.Policies != nil {
+			policy = opt.Policies[res.AccessKeyID]
+			if policy == nil {
+				loggerFrom(r.Context(), nil).Warn("s3_authz_denied",
+					slog.String("action", ""),
+					slog.String("reason", "credential has no policy"),
+					slog.String("access_key", redactKeyID(res.AccessKeyID)),
+				)
+				opt.Metrics.authorizationDenied("")
+				s3err.New(s3err.CodeAccessDenied).Write(w, r, requestIDFrom(r.Context()))
+				return
+			}
+		} else {
+			// 未提供策略表：嵌入式调用与测试沿用旧的"凭据即全权限"语义。
+			policy = authz.AllowAll()
 		}
 
 		loggerFrom(r.Context(), nil).Debug("auth_ok",
@@ -105,6 +144,7 @@ func withAuth(opt AuthOptions, next http.Handler) http.Handler {
 			ContentSHA256: res.ContentSHA256,
 			Presigned:     res.Presigned,
 			ChunkSigner:   res.ChunkSigner,
+			Policy:        policy,
 		})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

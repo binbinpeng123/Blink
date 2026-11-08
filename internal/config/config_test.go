@@ -16,7 +16,7 @@ func clearEnv(t *testing.T) {
 		EnvSecretKey, EnvLogLevel, EnvFsyncPolicy, EnvClusterMode,
 		EnvNodeID, EnvClusterPeers, EnvInternalAddr, EnvClusterSecret,
 		EnvReplicaCount, EnvWriteQuorum, EnvReadQuorum, EnvVNodes,
-		EnvPeerTimeout, EnvVerifyRead, "BLINK_MAX_CLOCK_SKEW",
+		EnvPeerTimeout, EnvVerifyRead, EnvCredentialsFile, "BLINK_MAX_CLOCK_SKEW",
 	} {
 		t.Setenv(k, "")
 	}

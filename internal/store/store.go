@@ -31,6 +31,12 @@ type Options struct {
 	// 关闭时吞吐最高（见 03 文档"校验读 vs 零拷贝读"）。
 	// 打开后只读路径多一次 CRC 计算，换"绝不把损坏数据发给客户端"。
 	VerifyOnRead bool
+	// HighWatermark 是拒绝写入的已用率上限；<=0 表示禁用容量保护。
+	HighWatermark float64
+	// LowWatermark 是恢复接受的已用率下限，必须小于 HighWatermark。
+	LowWatermark float64
+	// DiskSpace 测量根目录所在文件系统的容量；nil 时用 syscall.Statfs。
+	DiskSpace DiskSpace
 }
 
 // Store 是对象存储引擎的入口。
@@ -48,6 +54,8 @@ type Store struct {
 	inlineThreshold int64
 	// verifyOnRead 见 Options.VerifyOnRead。只读，不需要同步。
 	verifyOnRead bool
+	// disk 是容量水位状态；为 nil 表示未启用容量保护。
+	disk *diskState
 	// nodeID 是这块盘的稳定标识，写进每个对象的 meta.json。
 	//
 	// 单节点场景下它看似多余，但留的是分布式入口：多节点共享/迁移数据时，
@@ -153,6 +161,18 @@ func Open(opt Options) (*Store, error) {
 		cors:            make(map[string]*CORSConfiguration),
 		metaCache:       newObjectMetaCache(defaultMetaCacheBytes, defaultMetaCacheEntries),
 		locks:           newKeyLocker(),
+	}
+
+	// 水位只在启用时校验；high<=0 表示明确关闭容量保护。
+	if opt.HighWatermark > 0 {
+		if opt.HighWatermark > 1 {
+			return nil, fmt.Errorf("store: 高水位 %v 必须落在 (0, 1] 区间", opt.HighWatermark)
+		}
+		if opt.LowWatermark <= 0 || opt.LowWatermark >= opt.HighWatermark {
+			return nil, fmt.Errorf("store: 低水位 %v 必须落在 (0, %v) 区间",
+				opt.LowWatermark, opt.HighWatermark)
+		}
+		s.initDisk(opt.HighWatermark, opt.LowWatermark, opt.DiskSpace)
 	}
 
 	if err := s.fs.MkdirAll(s.root, dirPerm); err != nil {

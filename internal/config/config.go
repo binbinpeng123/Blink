@@ -8,16 +8,19 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/binbinpeng123/Blink/internal/authz"
 	"github.com/binbinpeng123/Blink/internal/cluster"
 	"github.com/binbinpeng123/Blink/internal/logx"
 )
@@ -73,17 +76,19 @@ const (
 
 // 环境变量名。
 const (
-	EnvAddr        = "BLINK_ADDR"
-	EnvDataDir     = "BLINK_DATA_DIR"
-	EnvRegion      = "BLINK_REGION"
-	EnvAccessKey   = "BLINK_ACCESS_KEY"
-	EnvSecretKey   = "BLINK_SECRET_KEY"
-	EnvLogLevel    = "BLINK_LOG_LEVEL"
-	EnvFsyncPolicy = "BLINK_FSYNC_POLICY"
-	EnvClusterMode = "BLINK_CLUSTER_MODE"
-	EnvVerifyRead  = "BLINK_VERIFY_READ"
-	EnvTLSCert     = "BLINK_TLS_CERT"
-	EnvTLSKey      = "BLINK_TLS_KEY"
+	EnvAddr      = "BLINK_ADDR"
+	EnvDataDir   = "BLINK_DATA_DIR"
+	EnvRegion    = "BLINK_REGION"
+	EnvAccessKey = "BLINK_ACCESS_KEY"
+	EnvSecretKey = "BLINK_SECRET_KEY"
+	// EnvCredentialsFile 指向多凭据 JSON 文件；文件中的凭据必须带 rules。
+	EnvCredentialsFile = "BLINK_CREDENTIALS_FILE"
+	EnvLogLevel        = "BLINK_LOG_LEVEL"
+	EnvFsyncPolicy     = "BLINK_FSYNC_POLICY"
+	EnvClusterMode     = "BLINK_CLUSTER_MODE"
+	EnvVerifyRead      = "BLINK_VERIFY_READ"
+	EnvTLSCert         = "BLINK_TLS_CERT"
+	EnvTLSKey          = "BLINK_TLS_KEY"
 
 	// 集群成员与内部协议。密钥只从环境变量读取，不提供命令行参数：
 	// 命令行会出现在进程列表与 shell 历史里，而共享密钥泄露等于全集群失守。
@@ -126,6 +131,15 @@ type Config struct {
 	AccessKey string
 	// SecretKey 是 S3 私钥。
 	SecretKey string
+	// CredentialsFile 是多凭据 JSON 文件路径；为空表示只用环境变量凭据。
+	//
+	// 文件内容在 Load 中解析并校验，Secret 只保留在内存；日志只输出路径
+	// 与凭据数量。
+	CredentialsFile string
+	// FileCredentials 是凭据文件解析后的结果，仅在 Load 成功后非空。
+	//
+	// 环境变量凭据（AccessKey/SecretKey）不在其中：它保留全权限语义。
+	FileCredentials []FileCredential
 	// LogLevel 是日志级别：debug、info、warn、error。
 	LogLevel string
 	// MaxClockSkew 是签名校验允许的客户端时钟偏移。
@@ -211,6 +225,145 @@ type Config struct {
 	clusterEnvErr error
 }
 
+// FileCredential 是凭据文件中的一个凭据。
+//
+// AccessKeyID/SecretKey 从不出现在日志、错误响应或 String() 中。
+type FileCredential struct {
+	// Name 是可读标识，仅用于日志与审计，不参与鉴权。
+	Name string
+	// AccessKeyID 是签名用的 Access Key。
+	AccessKeyID string
+	// SecretKey 是签名用的 Secret Key。
+	SecretKey string
+	// Policy 是该凭据的授权策略，构造时已校验。
+	Policy *authz.Policy
+}
+
+// 凭据文件的 JSON 形态（与 06 文档一致）：
+//
+//	{"credentials":[{"name":"ci","access_key":"…","secret_key":"…",
+//	  "rules":[{"bucket":"models","prefix":"llama/","actions":["read","write"]}]}]}
+//
+// 刻意不提供 YAML/TOML：标准库没有对应解析器，而多引入一个依赖对边端
+// 二进制体积的代价高于配置可读性的收益。
+type credentialsFile struct {
+	Credentials []rawCredential `json:"credentials"`
+}
+
+type rawCredential struct {
+	Name      string       `json:"name"`
+	AccessKey string       `json:"access_key"`
+	SecretKey string       `json:"secret_key"`
+	Rules     []authz.Rule `json:"rules"`
+}
+
+const (
+	// maxCredentialsFile 限制配置文件大小，防止把内存作为攻击面。
+	maxCredentialsFile = 1 << 20
+	// minSecretKeyLen 是 SigV4 HMAC 密钥的工程下限；更短的 secret
+	// 可被离线穷举，而 Blink 无法知道上游是否还有额外保护。
+	minSecretKeyLen = 16
+)
+
+// loadCredentialsFile 解析并校验 --credentials-file。
+func loadCredentialsFile(c *Config) error {
+	path := strings.TrimSpace(c.CredentialsFile)
+	if path == "" {
+		return nil
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("读取凭据文件 %s 失败: %w", path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("凭据文件 %s 是目录", path)
+	}
+	// 权限检查作用于解析后的目标文件：K8s Secret 卷中的 credentials.json
+	// 通常是指向 ..data 的符号链接，直接检查链接本身没有意义。
+	//
+	// Windows 没有等价的 POSIX 权限位，跳过检查（部署文档要求 ACL 限制）。
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf(
+			"凭据文件 %s 权限为 %#o，必须仅所有者可读写（0400 或 0600）；"+
+				"Kubernetes Secret 请设置 defaultMode: 0400",
+			path, info.Mode().Perm())
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("读取凭据文件 %s 失败: %w", path, err)
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(io.LimitReader(f, maxCredentialsFile+1))
+	dec.DisallowUnknownFields()
+	var raw credentialsFile
+	if err := dec.Decode(&raw); err != nil {
+		return fmt.Errorf("解析凭据文件 %s 失败: %w", path, err)
+	}
+	// 只允许一个顶层 JSON 值：多余内容通常意味着拼接错误或文件被截断后
+	// 又追加了内容，静默忽略会让"实际生效的凭据"与文件内容不一致。
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("凭据文件 %s 含多余内容（只允许一个 JSON 对象）", path)
+	}
+	if len(raw.Credentials) == 0 {
+		return fmt.Errorf("凭据文件 %s 至少需要一组 credentials", path)
+	}
+
+	seen := make(map[string]string, len(raw.Credentials)+1)
+	if c.AccessKey != "" {
+		seen[c.AccessKey] = "环境变量/命令行"
+	}
+	for i, rc := range raw.Credentials {
+		if strings.TrimSpace(rc.AccessKey) == "" {
+			return fmt.Errorf("凭据文件 %s 第 %d 组缺少 access_key", path, i+1)
+		}
+		if strings.TrimSpace(rc.SecretKey) == "" {
+			return fmt.Errorf("凭据文件 %s 第 %d 组缺少 secret_key", path, i+1)
+		}
+		if len(rc.SecretKey) < minSecretKeyLen {
+			return fmt.Errorf("凭据文件 %s 第 %d 组的 secret_key 少于 %d 字节", path, i+1, minSecretKeyLen)
+		}
+		if prev, dup := seen[rc.AccessKey]; dup {
+			return fmt.Errorf("凭据文件 %s 中的 access_key %q 与%s重复",
+				path, logx.RedactKeyID(rc.AccessKey), prev)
+		}
+		seen[rc.AccessKey] = "本文件中的其他凭据"
+		// 文件凭据必须显式授权；authz.New 对空规则集返回错误，
+		// 从而避免"忘了写 rules 就得到全权限"。
+		policy, err := authz.New(rc.Rules)
+		if err != nil {
+			return fmt.Errorf("凭据文件 %s 第 %d 组（%s）: %w",
+				path, i+1, nameOrIndex(rc.Name, i), err)
+		}
+		c.FileCredentials = append(c.FileCredentials, FileCredential{
+			Name:        strings.TrimSpace(rc.Name),
+			AccessKeyID: rc.AccessKey,
+			SecretKey:   rc.SecretKey,
+			Policy:      policy,
+		})
+	}
+	return nil
+}
+
+func nameOrIndex(name string, i int) string {
+	if strings.TrimSpace(name) != "" {
+		return name
+	}
+	return fmt.Sprintf("#%d", i+1)
+}
+
+// CredentialCount 返回生效的凭据总数（环境变量凭据 + 文件凭据）。
+func (c Config) CredentialCount() int {
+	n := len(c.FileCredentials)
+	if c.AccessKey != "" {
+		n++
+	}
+	return n
+}
+
 // Default 返回全部使用默认值的配置（凭据为空）。
 func Default() Config {
 	return Config{
@@ -264,6 +417,7 @@ func Load(args []string, out io.Writer) (Config, error) {
 	fs.StringVar(&cfg.Region, "region", cfg.Region, "S3 区域（环境变量 "+EnvRegion+"）")
 	fs.StringVar(&cfg.AccessKey, "access-key", cfg.AccessKey, "S3 Access Key（环境变量 "+EnvAccessKey+"）")
 	fs.StringVar(&cfg.SecretKey, "secret-key", cfg.SecretKey, "S3 Secret Key（环境变量 "+EnvSecretKey+"）")
+	fs.StringVar(&cfg.CredentialsFile, "credentials-file", cfg.CredentialsFile, "多凭据 JSON 文件路径；文件凭据必须带 rules（环境变量 "+EnvCredentialsFile+"）")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "日志级别：debug|info|warn|error（环境变量 "+EnvLogLevel+"）")
 	fs.StringVar(&cfg.FsyncPolicy, "fsync-policy", cfg.FsyncPolicy, "落盘策略：always|meta（环境变量 "+EnvFsyncPolicy+"）")
 	fs.StringVar(&cfg.ClusterMode, "cluster-mode", cfg.ClusterMode, "运行模式：single|cluster（环境变量 "+EnvClusterMode+"）")
@@ -297,6 +451,12 @@ func Load(args []string, out io.Writer) (Config, error) {
 		return Config{}, err
 	}
 
+	// 凭据文件在参数解析之后读取：重复 Access Key 检查需要最终生效的
+	// 环境变量凭据，而配置文件里的凭据不能在此之前被加载。
+	if err := loadCredentialsFile(&cfg); err != nil {
+		return Config{}, err
+	}
+
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -310,6 +470,7 @@ func applyEnv(cfg *Config) {
 	setIfPresent(EnvRegion, &cfg.Region)
 	setIfPresent(EnvAccessKey, &cfg.AccessKey)
 	setIfPresent(EnvSecretKey, &cfg.SecretKey)
+	setIfPresent(EnvCredentialsFile, &cfg.CredentialsFile)
 	setIfPresent(EnvLogLevel, &cfg.LogLevel)
 	setIfPresent(EnvFsyncPolicy, &cfg.FsyncPolicy)
 	setIfPresent(EnvClusterMode, &cfg.ClusterMode)
@@ -504,12 +665,26 @@ func (c Config) Validate() error {
 		problems = append(problems, "区域不能为空")
 	}
 
-	// 凭据没有默认值：缺失即拒绝启动。
-	if strings.TrimSpace(c.AccessKey) == "" {
-		problems = append(problems, "缺少 Access Key，请设置 --access-key 或 "+EnvAccessKey)
+	// 凭据没有默认值：一个都没有即拒绝启动。
+	//
+	// 环境变量凭据必须成对：只给 Access Key 意味着缺少 Secret；
+	// 只给 Secret Key 则永远无法用于签名。这与"误以为自己配好了"
+	// 的失败模式相比，启动期直接报错更可控。
+	envAK := strings.TrimSpace(c.AccessKey) != ""
+	envSK := strings.TrimSpace(c.SecretKey) != ""
+	switch {
+	case envAK && !envSK:
+		problems = append(problems, "提供了 Access Key 但缺少 Secret Key，请设置 --secret-key 或 "+EnvSecretKey)
+	case !envAK && envSK:
+		problems = append(problems, "提供了 Secret Key 但缺少 Access Key，请设置 --access-key 或 "+EnvAccessKey)
 	}
-	if strings.TrimSpace(c.SecretKey) == "" {
-		problems = append(problems, "缺少 Secret Key，请设置 --secret-key 或 "+EnvSecretKey)
+	if c.CredentialsFile != "" && len(c.FileCredentials) == 0 {
+		// Load 已负责解析文件；走到这里说明 Config 被手工构造或加载失败后
+		// 仍继续启动，两种情况下都没有可用凭据。
+		problems = append(problems, "credentials-file 已设置但没有加载到任何凭据")
+	}
+	if !envAK && len(c.FileCredentials) == 0 {
+		problems = append(problems, "缺少 S3 凭据：请设置 --access-key（Access Key）与 --secret-key（Secret Key），或通过 --credentials-file 提供至少一组凭据")
 	}
 
 	switch c.FsyncPolicy {
@@ -647,21 +822,25 @@ func sameEndpoint(a, b string) bool {
 // Redacted 返回可安全写入日志的配置副本，凭据字段被替换为占位符。
 func (c Config) Redacted() map[string]string {
 	return map[string]string{
-		"addr":               c.Addr,
-		"data_dir":           c.DataDir,
-		"region":             c.Region,
-		"access_key":         logx.RedactKeyID(c.AccessKey),
-		"secret_key":         logx.Redact(c.SecretKey),
-		"log_level":          c.LogLevel,
-		"fsync_policy":       c.FsyncPolicy,
-		"cluster_mode":       c.ClusterMode,
-		"block_size":         strconv.FormatInt(c.BlockSize, 10),
-		"inline_threshold":   strconv.FormatInt(c.InlineThreshold, 10),
-		"verify_read":        strconv.FormatBool(c.VerifyOnRead),
-		"high_watermark":     strconv.FormatFloat(c.HighWatermark, 'f', 2, 64),
-		"low_watermark":      strconv.FormatFloat(c.LowWatermark, 'f', 2, 64),
-		"max_bucket_count":   strconv.Itoa(c.MaxBucketCount),
-		"max_clock_skew_sec": strconv.FormatInt(int64(c.MaxClockSkew.Seconds()), 10),
+		"addr":       c.Addr,
+		"data_dir":   c.DataDir,
+		"region":     c.Region,
+		"access_key": logx.RedactKeyID(c.AccessKey),
+		"secret_key": logx.Redact(c.SecretKey),
+		// 凭据文件只输出路径与数量：文件内容（含全部 secret）永远不进日志。
+		"credentials_file":       c.CredentialsFile,
+		"credential_count":       strconv.Itoa(c.CredentialCount()),
+		"full_access_credential": strconv.FormatBool(c.AccessKey != ""),
+		"log_level":              c.LogLevel,
+		"fsync_policy":           c.FsyncPolicy,
+		"cluster_mode":           c.ClusterMode,
+		"block_size":             strconv.FormatInt(c.BlockSize, 10),
+		"inline_threshold":       strconv.FormatInt(c.InlineThreshold, 10),
+		"verify_read":            strconv.FormatBool(c.VerifyOnRead),
+		"high_watermark":         strconv.FormatFloat(c.HighWatermark, 'f', 2, 64),
+		"low_watermark":          strconv.FormatFloat(c.LowWatermark, 'f', 2, 64),
+		"max_bucket_count":       strconv.Itoa(c.MaxBucketCount),
+		"max_clock_skew_sec":     strconv.FormatInt(int64(c.MaxClockSkew.Seconds()), 10),
 		// 集群字段：node_id / 成员表 / 端口都不是秘密，可用于排障；
 		// 共享密钥必须脱敏，且永远不输出长度或前缀。
 		"node_id":          c.NodeID,

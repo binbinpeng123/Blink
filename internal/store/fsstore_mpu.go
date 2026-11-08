@@ -680,6 +680,10 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, body io
 	if opt.ExpectedSize < 0 {
 		return nil, fmt.Errorf("%w: 缺少 Content-Length", ErrIncompleteBody)
 	}
+	// 与 PutObject 相同：在高水位直接拒绝，避免半个分片落盘。
+	if err := s.checkWriteAllowed(); err != nil {
+		return nil, err
+	}
 
 	st, err := s.loadUploadState(uploadID)
 	if err != nil {

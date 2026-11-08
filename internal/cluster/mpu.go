@@ -138,11 +138,15 @@ func (c *Cluster) UploadPart(bucket, key, uploadID string, partNumber int, body 
 
 	dedupedBlocks := 0
 	summary, err := c.Store.StreamBlocksSized(body, alg, tag, opt.ExpectedSize, func(b store.Block) error {
-		deduped, err := c.distributeBlock(alive, ts, b)
+		deduped, full, err := c.distributeBlock(alive, ts, b)
 		if err != nil {
 			return err
 		}
 		if len(alive) < c.cfg.WriteQuorum {
+			if full > 0 {
+				return fmt.Errorf("%w: 分片 %d 的块 %s 仅落在 %d 个副本上（%d 个节点已满），需要 %d",
+					store.ErrStorageFull, partNumber, b.Desc.Hash, len(alive), full, c.cfg.WriteQuorum)
+			}
 			return fmt.Errorf("%w: 分片 %d 的块 %s 仅落在 %d 个副本上，需要 %d",
 				store.ErrUnavailable, partNumber, b.Desc.Hash, len(alive), c.cfg.WriteQuorum)
 		}
