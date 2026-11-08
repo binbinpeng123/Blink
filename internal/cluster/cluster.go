@@ -12,14 +12,16 @@ import (
 
 // Cluster 是集群模式下的存储后端。
 //
-// 它嵌入 *store.Store，分片上传（MPU）等尚未分布化的能力沿用本节点的
-// 单机实现（切片 5 替换）。以下能力由本类型覆盖：
+// 它嵌入 *store.Store：本地磁盘上的单机实现构成"本节点副本"，所有跨节点
+// 能力都在其之上做扇出与法定人数。以下方法由本类型覆盖：
 //   - 对象读写（PutObject/OpenObject/DeleteObject）：按一致性哈希扇出到
 //     N 个副本，凑 W/R 法定人数；
 //   - 桶控制面（CreateBucket/DeleteBucket/BucketExists/ListBuckets/
 //     BucketCreatedAt/CORS）：跨节点广播，规则刻意与数据面不同 ——
 //     建桶/写 CORS 只要求可达节点 ack，删桶要求全部节点可达且集群范围为空；
-//   - LIST（ListObjects）：向全部节点要整桶清单，按 key 归并后分页。
+//   - LIST（ListObjects）：向全部节点要整桶清单，按 key 归并后分页；
+//   - 分片上传（MPU，见 mpu.go）：会话按 uploadId 放到 S、块按对象放到 O，
+//     Complete 只串接块表 —— 不搬数据，成本与对象体积无关。
 //
 // 每个节点的本地存储同时扮演两个角色：
 //   - 单机实现的持有者（桶、MPU 等）；
@@ -45,6 +47,13 @@ type Cluster struct {
 	locks *stripedLocks
 	clock *versionClock
 
+	// repair 是故障修复与反熵的执行器。它由 New 启动、Close 停止；
+	// 单机模式从不构造 Cluster，因此天然没有修复 goroutine。
+	repair *repairer
+
+	// closeOnce 让 Close 幂等：优雅关闭与测试清理可能各调一次。
+	closeOnce sync.Once
+
 	// now 允许测试注入时钟。
 	now func() time.Time
 }
@@ -54,6 +63,7 @@ type Cluster struct {
 // cfg 必须已通过 Validate（NewServer 会再校验一次）；local 是本节点的
 // 单机存储，绝不为 nil。任何构造失败都不应带着半配置启动。
 func New(cfg Config, local *store.Store, logger *slog.Logger) (*Cluster, error) {
+	cfg.normalize()
 	server, err := NewServer(cfg, local, logger)
 	if err != nil {
 		return nil, err
@@ -70,7 +80,7 @@ func New(cfg Config, local *store.Store, logger *slog.Logger) (*Cluster, error) 
 		return nil, errors.New("cluster: 成员表中缺少自身节点")
 	}
 
-	return &Cluster{
+	cl := &Cluster{
 		Store:  local,
 		cfg:    cfg,
 		ring:   server.Ring(),
@@ -80,7 +90,10 @@ func New(cfg Config, local *store.Store, logger *slog.Logger) (*Cluster, error) 
 		locks:  newStripedLocks(256),
 		clock:  &versionClock{},
 		now:    time.Now,
-	}, nil
+	}
+	cl.repair = newRepairer(cl)
+	cl.repair.start()
+	return cl, nil
 }
 
 // Ring 返回本节点的哈希环（只读）。
@@ -93,14 +106,22 @@ func (c *Cluster) InternalHandler() http.Handler {
 	return c.server.Handler()
 }
 
-// Close 释放到各节点的空闲连接。
+// Close 停止修复器并释放到各节点的空闲连接。
 //
 // 不做会随进程退出自动回收，但优雅关闭时先断开连接能让对端
 // 立刻看到 FIN，而不是等到 TCP keepalive 超时。
+//
+// 幂等：测试里"永久关闭"与 t.Cleanup 都会调用它，重复关闭
+// 不能 panic（关闭已关闭的 channel）。
 func (c *Cluster) Close() {
-	for _, p := range c.peers {
-		p.closeIdle()
-	}
+	c.closeOnce.Do(func() {
+		if c.repair != nil {
+			c.repair.close()
+		}
+		for _, p := range c.peers {
+			p.closeIdle()
+		}
+	})
 }
 
 // targetsFor 返回 key 的 N 个副本节点，顺序即副本偏序（第 1 个是 primary）。

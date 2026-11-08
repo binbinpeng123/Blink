@@ -1,0 +1,137 @@
+# 集群模式工作负载。
+#
+# 与 deploy/k8s/statefulset.yaml（单机）的关键差异：
+#   - replicas 必须等于 BLINK_CLUSTER_PEERS 中的节点数（此处 3）；
+#   - podManagementPolicy: Parallel，避免 OrderedReady 下每个 Pod 都要等
+#     前一个 Ready —— 集群节点互相发现，串行启动只会拉长故障恢复时间；
+#   - 每个 Pod 使用 volumeClaimTemplates 生成的独立 RWO 卷，绝不共享 PVC；
+#   - 增加内部端口 9100 与 downward API 注入的 BLINK_NODE_ID。
+#
+# 注意：本目录与单机清单位于同一 namespace 且资源同名，二者是**互斥的
+# 两种部署形态**，不要在同一 namespace 里先后应用。切换形态需要先导出
+# 数据并重建（见 README.md）。
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: blink
+  namespace: blink
+  labels:
+    app.kubernetes.io/name: blink
+spec:
+  replicas: 3
+  # Pod DNS 由 headless Service 提供：blink-0.blink-headless 等。
+  serviceName: blink-headless
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blink
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blink
+    spec:
+      # 服务收到 SIGTERM 后最多等 10s 让在途请求完成；必须大于它，
+      # 否则 SIGKILL 会打断正在提交的对象写入。
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # 软反亲和：尽量把副本分散到不同节点，单节点故障时仍有副本可读。
+      # 使用 preferred 而不是 required：单节点 K3s 或节点数少于副本数时
+      # 仍能调度（required 会让 Pod 永久 Pending）。
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: blink
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: blink
+          image: blink:dev
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - name: s3
+              containerPort: 9000
+              protocol: TCP
+            - name: internal
+              containerPort: 9100
+              protocol: TCP
+          env:
+            # 节点 ID 必须与 BLINK_CLUSTER_PEERS 中的 id 一致。
+            # StatefulSet 的 Pod 名稳定且唯一，直接用 metadata.name。
+            - name: BLINK_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - configMapRef:
+                name: blink-config
+            - secretRef:
+                name: blink-credentials
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/blink
+          # 启动探针负责"进程刚起来还没监听"的阶段；启动成功后不再运行。
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: s3
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          # /healthz 只表示进程存活，不触碰存储。
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: s3
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # /readyz 刻意不检查 quorum：2/3 节点故障时，K8s 若把最后一个
+          # 仍可读的节点也摘掉，用户会彻底失去自救途径。读写是否满足
+          # quorum 由请求本身返回 503。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: s3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+  # 每个 Pod 一块独立卷。共享 PVC 会破坏"每节点各存一份副本"的前提。
+  # 注意：删除 StatefulSet 时这些 PVC 默认保留；删除 PVC 或 namespace
+  # 会销毁数据。
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: blink
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 20Gi

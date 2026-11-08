@@ -126,7 +126,7 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 		return nil, err
 	}
 
-	res, err := s.streamBlocks(body, opt.ChecksumAlgorithm, key)
+	res, err := s.streamBlocks(body, opt.ChecksumAlgorithm, key, opt.ExpectedSize)
 	if err != nil {
 		return nil, err
 	}
@@ -189,6 +189,7 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 	if err := s.writeFileAtomic(s.objectMetaPath(bucket, key), mustJSON(meta)); err != nil {
 		return nil, fsErr("写入对象元数据", key, err)
 	}
+	s.metaCache.put(metaCacheKey{bucket: bucket, key: key}, &meta)
 
 	return &ObjectInfo{
 		Key:               key,
@@ -227,9 +228,12 @@ type streamResult struct {
 //
 // 切块与校验逻辑在导出的 StreamBlocks 中；这里只提供单机路径的落盘
 // 回调，集群路径用同一个 StreamBlocks 把块同时扇出到远端。
-func (s *Store) streamBlocks(body io.Reader, alg checksum.Algorithm, tag string) (*streamResult, error) {
+//
+// expected 是调用方已知的 Content-Length（< 0 表示未知），只用于决定
+// 临时缓冲大小，见 StreamBlocksSized。
+func (s *Store) streamBlocks(body io.Reader, alg checksum.Algorithm, tag string, expected int64) (*streamResult, error) {
 	res := &streamResult{}
-	summary, err := s.StreamBlocks(body, alg, tag, func(b Block) error {
+	summary, err := s.StreamBlocksSized(body, alg, tag, expected, func(b Block) error {
 		wrote, err := s.putBlock(b.Desc.Hash, b.Data)
 		if err != nil {
 			return err

@@ -78,6 +78,13 @@ type Store struct {
 	corsMu sync.RWMutex
 	cors   map[string]*CORSConfiguration
 
+	// metaCache 缓存对象元数据，见 metacache.go。
+	//
+	// 与 buckets/cors 一样只缓存成功结果；所有写路径（PutObject、
+	// CompleteMultipartUpload、PutReplicaMeta、Delete*）在元数据变化后
+	// 立即更新或失效对应条目。
+	metaCache *objectMetaCache
+
 	locks *keyLocker
 }
 
@@ -144,6 +151,7 @@ func Open(opt Options) (*Store, error) {
 		verifyOnRead:    opt.VerifyOnRead,
 		buckets:         make(map[string]*bucketMeta),
 		cors:            make(map[string]*CORSConfiguration),
+		metaCache:       newObjectMetaCache(defaultMetaCacheBytes, defaultMetaCacheEntries),
 		locks:           newKeyLocker(),
 	}
 

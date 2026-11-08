@@ -95,6 +95,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc(pathBucketState, s.handleBucketState)
 	mux.HandleFunc(pathBuckets, s.handleBuckets)
 	mux.HandleFunc(pathCORS, s.handleCORS)
+	mux.HandleFunc(pathMPUUpload, s.handleMPUUpload)
+	mux.HandleFunc(pathMPUPart, s.handleMPUPart)
+	mux.HandleFunc(pathMPUParts, s.handleMPUParts)
+	mux.HandleFunc(pathMPUUploads, s.handleMPUUploads)
 	mux.HandleFunc("/", s.handleUnknown)
 	return s.withAuth(mux)
 }

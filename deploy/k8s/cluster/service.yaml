@@ -1,0 +1,21 @@
+# 面向 S3 客户端的普通 ClusterIP Service。
+#
+# 只暴露 9000。内部端口 9100 不在这个 Service 上：它只用于节点间寻址，
+# 由 headless Service 提供 DNS + 直达 Pod，且被 NetworkPolicy 限制在
+# 同 namespace 内。
+apiVersion: v1
+kind: Service
+metadata:
+  name: blink
+  namespace: blink
+  labels:
+    app.kubernetes.io/name: blink
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: blink
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+      protocol: TCP

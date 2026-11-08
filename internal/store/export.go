@@ -42,6 +42,21 @@ type StreamSummary struct {
 //
 // tag 只用于错误信息（对象 key 或分片标识），不参与任何判断。
 func (s *Store) StreamBlocks(body io.Reader, alg checksum.Algorithm, tag string, fn func(Block) error) (*StreamSummary, error) {
+	return s.StreamBlocksSized(body, alg, tag, -1, fn)
+}
+
+// StreamBlocksSized 是 StreamBlocks 的"已知声明长度"版本。
+//
+// expected < 0 表示长度未知，缓冲按块大小分配；否则缓冲按
+// min(expected, blockSize) 分配。对 1 MiB 对象，这让每次写入的临时缓冲
+// 从 4 MiB 降到 1 MiB —— 边端设备上并发上传数十个对象时，这部分内存
+// 是实打实的 RSS 差异。
+//
+// 长度提示只影响缓冲大小，不改变块边界：只要 actual ≤ expected，
+// 以 expected 为上限切出的块与按 blockSize 切出的块完全一致（末尾一个
+// 不满块）。客户端声明的长度与实际不符时块边界可能不同，但那一次写入
+// 必然以 ErrIncompleteBody 失败，块表不会落盘（残块由 GC 回收）。
+func (s *Store) StreamBlocksSized(body io.Reader, alg checksum.Algorithm, tag string, expected int64, fn func(Block) error) (*StreamSummary, error) {
 	var objSum checksum.Sum
 	if alg != "" {
 		sum, ok := checksum.New(alg)
@@ -54,18 +69,62 @@ func (s *Store) StreamBlocks(body io.Reader, alg checksum.Algorithm, tag string,
 	res := &StreamSummary{Blocks: make([]BlockDesc, 0, 4)}
 	md5h := md5.New()
 
-	buf := make([]byte, s.blockSize)
-	// 小对象快路径：先读 inlineThreshold 字节。若流在此结束，对象只有一块，
-	// 省下 4 MiB 的缓冲分配 —— 边端常见的是几 KiB 的配置/清单文件，
-	// 为每个这样的对象分配一个块大小的缓冲是把内存当垃圾扔。
+	blockSize := int(s.blockSize)
+	inline := int(s.inlineThreshold)
+
+	// 本次流的块长上限：已知声明长度时不超过声明值，未知时就是块大小。
+	// expected == 0 时保持 blockSize —— 缓冲长度为 0 会让 readBlock
+	// 永远返回 (0, nil)，死循环。
+	limit := blockSize
+	if expected > 0 && expected < int64(blockSize) {
+		limit = int(expected)
+	}
+
+	// 小对象快路径：缓冲只按内联阈值分配，而不是无条件分配一个块大小。
+	//
+	// 边端常见的是几 KiB 的配置/清单文件；旧实现虽然只读阈值字节，
+	// 却先 make 了 4 MiB 缓冲，一次 1 KiB PUT 的内存分配超过 4 MiB。
+	// 这里先分配 min(阈值, limit)，只有确认流超过阈值时才增长到 limit：
+	// 1 MiB 对象因此分配 1 MiB 而不是 4 MiB，块边界不变。
+	bufLen := limit
+	if inline > 0 && inline < limit {
+		bufLen = inline
+	}
+	buf := make([]byte, bufLen)
 	prefill := 0
-	if s.inlineThreshold > 0 {
-		n, err := io.ReadFull(body, buf[:s.inlineThreshold])
+	if inline > 0 {
+		readLen := inline
+		if readLen > bufLen {
+			readLen = bufLen
+		}
+		n, err := io.ReadFull(body, buf[:readLen])
 		switch {
 		case err == nil, errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 			prefill = n
 		default:
 			return nil, fsErr("读取请求体", tag, err)
+		}
+		// 阈值恰好读满时，流可能刚好结束，也可能还有数据。
+		// 先 peek 一个字节：有数据就立刻增长到本次流的块长上限，把这一
+		// 字节放进新缓冲再继续读。必须在这里完成增长，不能等到循环里 ——
+		// 否则 >阈值的对象会被切成"阈值 + 块大小"的块，改变块边界，
+		// 也破坏 LIST/修复对既有块表的假设。
+		if err == nil && bufLen < limit {
+			var one [1]byte
+			m, perr := io.ReadFull(body, one[:])
+			switch {
+			case m == 1:
+				grown := make([]byte, limit)
+				copy(grown, buf[:prefill])
+				grown[prefill] = one[0]
+				buf = grown
+				prefill++
+			case errors.Is(perr, io.EOF):
+				// 恰好 threshold 字节：保持小缓冲，下一轮在 readBlock
+				// 里以 (0, EOF) 结束，只产出一个块。
+			case perr != nil:
+				return nil, fsErr("读取请求体", tag, perr)
+			}
 		}
 	}
 

@@ -49,6 +49,10 @@ func (s *Store) LoadReplicaMeta(bucket, key string) (*ObjectMeta, bool, error) {
 	if err := ValidateObjectPath(bucket, key); err != nil {
 		return nil, false, err
 	}
+	ck := metaCacheKey{bucket: bucket, key: key}
+	if m, ok := s.metaCache.get(ck); ok {
+		return m, true, nil
+	}
 	m, err := s.readObjectMetaAt(s.objectMetaPath(bucket, key))
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -56,6 +60,7 @@ func (s *Store) LoadReplicaMeta(bucket, key string) (*ObjectMeta, bool, error) {
 	case err != nil:
 		return nil, false, fsErr("读取副本元数据", key, err)
 	}
+	s.metaCache.put(ck, m)
 	return m, true, nil
 }
 
@@ -89,6 +94,7 @@ func (s *Store) PutReplicaMeta(bucket, key string, m *ObjectMeta) error {
 	if err := s.writeFileAtomic(s.objectMetaPath(bucket, key), mustJSON(m)); err != nil {
 		return fsErr("写入副本元数据", key, err)
 	}
+	s.metaCache.put(metaCacheKey{bucket: bucket, key: key}, m)
 	return nil
 }
 
@@ -104,6 +110,10 @@ func (s *Store) DeleteReplicaMeta(bucket, key string) (bool, error) {
 
 	unlock := s.LockObject(bucket, key)
 	defer unlock()
+
+	// 先失效缓存再查盘：即使下面发现文件不存在，缓存里也绝不能留下
+	// 一份"看起来还在"的旧元数据。
+	s.metaCache.delete(metaCacheKey{bucket: bucket, key: key})
 
 	if _, err := s.fs.Stat(s.objectMetaPath(bucket, key)); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -299,6 +309,80 @@ func validateReplicaMeta(key string, m *ObjectMeta) error {
 	}
 	if m.Size > 0 && len(m.Blocks) == 0 {
 		return fmt.Errorf("%w: 非空对象没有块表", ErrCorrupt)
+	}
+	if err := validateECMeta(m); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateECMeta 校验 EC 布局的元数据自洽性。
+//
+// 分片长度规则必须与 internal/ec 的编码规则完全一致：S=ceil(块长/k)，
+// 最后一片零填充。如果这里放宽成"各片长度一致即可"，一个 bug 就可能
+// 让截断错误的分片进入 CAS，直到读取时才以哈希不符暴露。
+func validateECMeta(m *ObjectMeta) error {
+	switch m.Layout {
+	case "", LayoutReplica:
+		if m.EC != nil {
+			return fmt.Errorf("%w: 副本布局不应携带 ec 信息", ErrCorrupt)
+		}
+		for _, b := range m.Blocks {
+			if len(b.Shards) != 0 {
+				return fmt.Errorf("%w: 副本布局的块 %s 不应携带分片表", ErrCorrupt, b.Hash)
+			}
+		}
+		return nil
+	case LayoutEC:
+	default:
+		return fmt.Errorf("%w: 未知数据布局 %q", ErrCorrupt, m.Layout)
+	}
+
+	if m.EC == nil {
+		return fmt.Errorf("%w: EC 对象缺少 ec 布局信息", ErrCorrupt)
+	}
+	k, mc := m.EC.K, m.EC.M
+	if k < 1 || mc < 1 || k+mc > 256 {
+		return fmt.Errorf("%w: EC 参数 k=%d m=%d 非法", ErrCorrupt, k, mc)
+	}
+	n := k + mc
+	if len(m.EC.Group) != n {
+		return fmt.Errorf("%w: EC 分片组有 %d 个节点，期望 %d", ErrCorrupt, len(m.EC.Group), n)
+	}
+	seen := make(map[string]struct{}, n)
+	for _, id := range m.EC.Group {
+		if id == "" {
+			return fmt.Errorf("%w: EC 分片组包含空节点 ID", ErrCorrupt)
+		}
+		if _, dup := seen[id]; dup {
+			return fmt.Errorf("%w: EC 分片组节点 %q 重复", ErrCorrupt, id)
+		}
+		seen[id] = struct{}{}
+	}
+	for _, b := range m.Blocks {
+		if len(b.Shards) != n {
+			return fmt.Errorf("%w: 块 %s 有 %d 个分片，期望 %d", ErrCorrupt, b.Hash, len(b.Shards), n)
+		}
+		var shardLen int64 = -1
+		for i, s := range b.Shards {
+			if err := validateBlockHash(s.Hash); err != nil {
+				return err
+			}
+			if s.Length <= 0 {
+				return fmt.Errorf("%w: 块 %s 的分片 %d 长度 %d 非正", ErrCorrupt, b.Hash, i, s.Length)
+			}
+			if shardLen < 0 {
+				shardLen = s.Length
+			} else if s.Length != shardLen {
+				return fmt.Errorf("%w: 块 %s 的分片长度不一致（%d 与 %d）",
+					ErrCorrupt, b.Hash, s.Length, shardLen)
+			}
+		}
+		want := (b.Length + int64(k) - 1) / int64(k)
+		if shardLen != want {
+			return fmt.Errorf("%w: 块 %s 的分片长度 %d，期望 ceil(%d/%d)=%d",
+				ErrCorrupt, b.Hash, shardLen, b.Length, k, want)
+		}
 	}
 	return nil
 }

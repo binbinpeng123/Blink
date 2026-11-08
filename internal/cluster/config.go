@@ -24,6 +24,27 @@ const (
 	DefaultVNodes       = 128
 	DefaultPeerTimeout  = 2 * time.Second
 
+	// 故障修复与反熵的默认值。
+	//
+	// RepairInterval 是调度器的兜底唤醒间隔，不是修复延迟：任务到点会被
+	// 精确唤醒，这个值只决定"没有事件时最多睡多久"。
+	DefaultRepairInterval = 30 * time.Second
+	// DefaultScrubInterval 是后台全量扫描的周期。24h 足够让"从未被读到
+	// 的冷数据"也被发现；扫描是顺序的，天然限速。
+	DefaultScrubInterval = 24 * time.Hour
+	// DefaultRepairMaxConcurrency 是每节点的修复并发上限。
+	// 修复是后台流量，压满 IO 会直接伤害在线请求。
+	DefaultRepairMaxConcurrency = 2
+	// DefaultHintTTL 是修复任务（hinted handoff）的最长保留时间。
+	// 超过之后仍失败的副本不再重试，交给反熵的周期扫描重新发现。
+	DefaultHintTTL = 72 * time.Hour
+
+	// DefaultECMinSize 是启用 EC 后走纠删码的最小对象大小。
+	//
+	// 小对象继续走副本：k+m 个分片即使每个只有几百字节，也会在 meta 中
+	// 留下 k+m 份描述与 k+m 个 CAS 文件，修复与 LIST 的放大不划算。
+	DefaultECMinSize = 32 << 20
+
 	// MinSecretLen 是集群共享密钥的最小长度（字节）。
 	//
 	// HMAC-SHA256 的密钥短于 32 字节不降低理论强度，但短密钥通常意味着
@@ -77,6 +98,36 @@ type Config struct {
 	VNodes int
 	// PeerTimeout 是单次节点间请求的超时。
 	PeerTimeout time.Duration
+	// RepairInterval 是修复调度器的兜底唤醒间隔。
+	//
+	// 零值表示使用 DefaultRepairInterval（New 会归一化），因此零值 Config
+	// 的测试无需感知修复参数。
+	RepairInterval time.Duration
+	// ScrubInterval 是反熵扫描周期；<0 表示禁用后台扫描。
+	ScrubInterval time.Duration
+	// RepairMaxConcurrency 是每节点的修复并发上限。
+	RepairMaxConcurrency int
+	// HintTTL 是修复任务的最长保留期。
+	HintTTL time.Duration
+	// ReadDegraded 允许在可用副本不足 R 时，从任一可用副本读取。
+	//
+	// 默认 false：副本不足时回 503 而不是给出"可能是旧版本"的数据。
+	// 打开后读可用性优先于一致性，错误日志会标明降级读。
+	ReadDegraded bool
+
+	// ECEnabled 开启对象级纠删码：对象 ≥ECMinSize 时按 k+m 分片存放。
+	//
+	// 默认关闭。EC 改变的是对象布局，滚动升级期间必须全集群同时启用。
+	ECEnabled bool
+	// ECK / ECM 是数据片与校验片数。
+	//
+	// 两者都为 0 时按成员数选默认 profile：3 节点 2+1，≥6 节点 4+2。
+	// 4–5 节点没有默认值，必须显式指定，避免"以为开了 EC 其实还是副本"
+	// 或反之的部署歧义。
+	ECK int
+	ECM int
+	// ECMinSize 是走 EC 的最小对象字节数；0 表示 DefaultECMinSize。
+	ECMinSize int64
 }
 
 // ParsePeers 解析 id@host:port,... 形式的成员表。
@@ -202,10 +253,91 @@ func (c Config) Validate() error {
 		problems = append(problems, "peer-timeout 必须为正数")
 	}
 
+	// 修复参数：零值表示"用默认值"（见 normalize），负数一律拒绝。
+	if c.RepairInterval < 0 {
+		problems = append(problems, "repair-interval 不能为负数（0 表示使用默认值）")
+	}
+	if c.RepairMaxConcurrency < 0 {
+		problems = append(problems, "repair-max-concurrency 不能为负数（0 表示使用默认值）")
+	}
+	if c.HintTTL < 0 {
+		problems = append(problems, "hint-ttl 不能为负数（0 表示使用默认值）")
+	}
+
+	if c.ECEnabled {
+		if _, _, err := c.ecParams(); err != nil {
+			problems = append(problems, err.Error())
+		}
+		if c.ECMinSize < 0 {
+			problems = append(problems, "ec-min-size 不能为负数（0 表示使用默认值）")
+		}
+	}
+
 	if len(problems) == 0 {
 		return nil
 	}
 	return fmt.Errorf("集群配置校验失败: %s", strings.Join(problems, "; "))
+}
+
+// normalize 把零值字段填成默认值。
+//
+// 零值必须等价于"未配置"：集群层会被大量测试与单机复用代码以
+// Config{...} 字面量构造，要求每个调用点都写全修复参数只会制造
+// "测试与生产默认值不一致"的漂移。
+func (c *Config) normalize() {
+	if c.RepairInterval <= 0 {
+		c.RepairInterval = DefaultRepairInterval
+	}
+	if c.ScrubInterval == 0 {
+		c.ScrubInterval = DefaultScrubInterval
+	}
+	if c.RepairMaxConcurrency <= 0 {
+		c.RepairMaxConcurrency = DefaultRepairMaxConcurrency
+	}
+	if c.HintTTL <= 0 {
+		c.HintTTL = DefaultHintTTL
+	}
+	if c.ECEnabled {
+		if k, m, err := c.ecParams(); err == nil {
+			c.ECK, c.ECM = k, m
+		}
+		if c.ECMinSize == 0 {
+			c.ECMinSize = DefaultECMinSize
+		}
+	}
+}
+
+// ecParams 返回生效的 (k, m)，必要时按成员数选择默认 profile。
+//
+// 只做纯计算：normalize 与 Validate 共用同一份规则，避免"校验通过但
+// 运行时用了另一组参数"这类只在生产才暴露的分歧。
+func (c Config) ecParams() (int, int, error) {
+	if !c.ECEnabled {
+		return 0, 0, nil
+	}
+	k, m := c.ECK, c.ECM
+	if k == 0 && m == 0 {
+		switch n := len(c.Peers); {
+		case n == 3:
+			k, m = 2, 1
+		case n >= 6:
+			k, m = 4, 2
+		default:
+			return 0, 0, fmt.Errorf("ec 已启用但成员数 %d 没有默认 profile，请显式设置 ec-k/ec-m（3 节点 2+1，≥6 节点 4+2）", n)
+		}
+	} else if k == 0 || m == 0 {
+		return 0, 0, fmt.Errorf("ec-k 与 ec-m 必须同时设置（当前 k=%d m=%d）", k, m)
+	}
+	if k < 1 || m < 1 {
+		return 0, 0, fmt.Errorf("ec-k 与 ec-m 必须 ≥1（当前 k=%d m=%d）", k, m)
+	}
+	if k+m > len(c.Peers) {
+		return 0, 0, fmt.Errorf("ec-k(%d)+ec-m(%d)=%d 超过成员数 %d", k, m, k+m, len(c.Peers))
+	}
+	if k+m > 256 {
+		return 0, 0, fmt.Errorf("ec-k(%d)+ec-m(%d)=%d 超过 GF(2^8) 上限 256", k, m, k+m)
+	}
+	return k, m, nil
 }
 
 // PeerByID 返回指定 ID 的成员。

@@ -1,0 +1,38 @@
+# 把内部端口 9100 限制在同 namespace 内，同时显式放行 S3 端口 9000。
+#
+# 一旦某个 NetworkPolicy 选中这些 Pod 且包含 Ingress，未被规则放行的
+# 入站流量就会被拒绝。因此这里必须同时写出 9000：只写 9100 会把客户端
+# 访问也一起切断。
+#
+# 9000 不限制来源，因为集群外客户端通常经由 NodePort / LoadBalancer /
+# Ingress 进入，来源地址随 CNI 与代理实现而异；把 9000 收窄到同 namespace
+# 会让这些入口全部失效。若需要限制客户端来源，应由单独的 NetworkPolicy
+# 或入口层完成。
+#
+# 限制：NetworkPolicy 需要支持它的 CNI。K3s 默认的 flannel **不执行**
+# NetworkPolicy，此时本文件不会产生实际隔离效果，9100 的可达性仍取决于
+# 网络与 Service 暴露方式。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: blink-internal
+  namespace: blink
+  labels:
+    app.kubernetes.io/name: blink
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: blink
+  policyTypes:
+    - Ingress
+  ingress:
+    # S3 端口：允许任意来源（含 kubelet 探针与集群外入口）。
+    - ports:
+        - protocol: TCP
+          port: 9000
+    # 内部协议：只允许同 namespace 的 Pod。
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9100

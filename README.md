@@ -113,7 +113,9 @@ Blink 的推荐生产形态是运行在带持久化卷的 Kubernetes 或 K3s 工
 
 多节点集群模式下，每个 Pod 使用独立的 `volumeClaimTemplates` 卷，通过 headless Service 互相寻址，内部流量走 9100 端口并由 NetworkPolicy 限制在同 namespace；`/readyz` 不检查 quorum，避免少数节点故障时把最后一个可读节点摘掉。详见 [08 分布式存储设计](./docs/reviews/08-distributed-storage.md) 与 [04 部署设计](./docs/reviews/04-kubernetes-deployment.md)。
 
-正式 Kubernetes 清单和 Helm Chart 会在服务接口稳定后加入仓库，并提供适用于 K3s 单节点和多节点集群的示例配置。
+单机清单位于 [`deploy/k8s/`](./deploy/k8s/)，集群清单位于 [`deploy/k8s/cluster/`](./deploy/k8s/cluster/)（含普通/headless Service、StatefulSet、NetworkPolicy 与部署说明）。两种形态互斥，不要在同一 namespace 里混用。Helm Chart 仍待提供。
+
+真实 Kubernetes / K3s 集群上的安装、升级与 NetworkPolicy 行为**尚未实测**，验收状态以 04/08 评审文档与集群 README 为准。
 
 ## 性能验证
 

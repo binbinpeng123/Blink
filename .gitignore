@@ -18,3 +18,4 @@ coverage.out
 .env
 *.local
 deploy/k8s/secret.yaml
+deploy/k8s/cluster/secret.yaml

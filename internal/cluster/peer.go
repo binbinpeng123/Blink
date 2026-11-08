@@ -144,6 +144,34 @@ func (c *PeerClient) PutBlock(ctx context.Context, hash string, data []byte) (bo
 	return out.Deduped, nil
 }
 
+// BlockExists 询问远端节点是否持有某个块。
+//
+// 用 HEAD 而不是 GET：修复前的存在性探测不需要任何内容，3 个副本
+// 各拉一遍完整块再丢弃会让一次修复的带宽放大三倍。
+//
+// 只有 200/404 是可靠答案；其余状态（含传输错误）返回 error，
+// 让修复器把它当作"目标暂不可用"重试，而不是误判为缺块去复制。
+func (c *PeerClient) BlockExists(ctx context.Context, hash string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, blockTransferTimeout)
+	defer cancel()
+
+	path := pathBlock + "?" + url.Values{"hash": {hash}}.Encode()
+	resp, err := c.doTransfer(ctx, http.MethodHead, path, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, c.peerError(http.MethodHead, path, resp)
+	}
+}
+
 // GetBlock 把远端块 b 的 [offset, offset+length) 字节流式写入 w。
 //
 // 返回的字节数必须恰好等于 length：Content-Length 已声明，短读意味着
@@ -299,6 +327,83 @@ func (c *PeerClient) PutCORS(ctx context.Context, bucket string, cfg *store.CORS
 // DeleteCORS 删除远端节点上的桶 CORS 配置（未配置也成功）。
 func (c *PeerClient) DeleteCORS(ctx context.Context, bucket string) error {
 	return c.do(ctx, http.MethodDelete, pathCORS+"?"+bucketQuery(bucket), nil, nil)
+}
+
+// GetUploadState 读取远端节点上的分片上传会话。
+//
+// found=false 是正常响应：该节点没有参与这次上传，不代表故障。
+func (c *PeerClient) GetUploadState(ctx context.Context, uploadID string) (*store.UploadState, bool, error) {
+	var out uploadStateResponse
+	if err := c.do(ctx, http.MethodGet, pathMPUUpload+"?"+uploadQuery(uploadID), nil, &out); err != nil {
+		return nil, false, err
+	}
+	if out.Found && out.State == nil {
+		return nil, false, fmt.Errorf("节点 %s: 协议错误: found=true 但 state 为空", c.peer.ID)
+	}
+	return out.State, out.Found, nil
+}
+
+// PutUploadState 提交会话。副本上的版本比较（Revision）由 store 负责。
+func (c *PeerClient) PutUploadState(ctx context.Context, st *store.UploadState) error {
+	body, err := json.Marshal(st)
+	if err != nil {
+		return fmt.Errorf("序列化分片上传会话 %s 失败: %w", st.UploadID, err)
+	}
+	return c.do(ctx, http.MethodPut, pathMPUUpload+"?"+uploadQuery(st.UploadID), body, nil)
+}
+
+// DeleteUploadState 删除会话，返回删除前是否存在（幂等）。
+func (c *PeerClient) DeleteUploadState(ctx context.Context, uploadID string) (bool, error) {
+	var out struct {
+		Found bool `json:"found"`
+	}
+	if err := c.do(ctx, http.MethodDelete, pathMPUUpload+"?"+uploadQuery(uploadID), nil, &out); err != nil {
+		return false, err
+	}
+	return out.Found, nil
+}
+
+// PutPartState 提交分片状态。
+//
+// 走 bulk 通道：分片状态里的块表随分片体积增长（5 GiB 分片 ≈ 1280 个
+// 块 ≈ 230 KB JSON），2s 的普通通道在大分片上偏紧。
+func (c *PeerClient) PutPartState(ctx context.Context, uploadID string, ps *store.PartState) error {
+	body, err := json.Marshal(ps)
+	if err != nil {
+		return fmt.Errorf("序列化分片 %d 状态失败: %w", ps.PartNumber, err)
+	}
+	return c.doBulk(ctx, http.MethodPut, pathMPUPart+"?"+uploadPartQuery(uploadID, ps.PartNumber), body, nil)
+}
+
+// ListPartStates 读取远端节点上的全部分片状态。
+func (c *PeerClient) ListPartStates(ctx context.Context, uploadID string) ([]*store.PartState, error) {
+	var out partStatesResponse
+	if err := c.doBulk(ctx, http.MethodGet, pathMPUParts+"?"+uploadQuery(uploadID), nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Parts, nil
+}
+
+// ListUploadStates 读取远端节点上属于某桶的进行中会话。
+func (c *PeerClient) ListUploadStates(ctx context.Context, bucket string) ([]*store.UploadState, error) {
+	var out uploadStatesResponse
+	if err := c.doBulk(ctx, http.MethodGet, pathMPUUploads+"?"+bucketQuery(bucket), nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Uploads, nil
+}
+
+// uploadQuery 构造只带 uploadId 的 query 串。
+func uploadQuery(uploadID string) string {
+	return url.Values{"uploadId": {uploadID}}.Encode()
+}
+
+// uploadPartQuery 构造 uploadId + partNumber 的 query 串。
+func uploadPartQuery(uploadID string, partNumber int) string {
+	return url.Values{
+		"uploadId":   {uploadID},
+		"partNumber": {strconv.Itoa(partNumber)},
+	}.Encode()
 }
 
 // bucketQuery 构造只带桶名的 query 串。

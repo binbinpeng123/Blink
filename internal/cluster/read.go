@@ -2,22 +2,28 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 
 	"github.com/binbinpeng123/Blink/internal/checksum"
+	"github.com/binbinpeng123/Blink/internal/ec"
 	"github.com/binbinpeng123/Blink/internal/store"
 )
 
 // OpenObject 打开环上最新版本的副本。
 //
-// 读路径不做"读修复"（切片 6 实现），但已经做三件必须现在就做的事：
+// 读路径承担三件事：
 //   - 多份 meta 里选 (ObjVersion, NodeID) 最大的一份，保证写到 W 之后
 //     从任意节点都能读到最新版本；
 //   - 最新版本是墓碑 ⇒ 404：删除必须立刻对任意节点可见，不能被
 //     "其它节点上还有旧副本"拖成"读得到"；
-//   - 至少 R 个副本响应且至少 R 份存活副本，否则回 503 而不是 404：
-//     副本不够时"不存在"是不可知，不是事实。
+//   - 去重法定人数：至少 R 个副本响应且至少 R 份存活副本，否则回 503
+//     而不是 404 —— 副本不够时"不存在"是不可知，不是事实。
+//
+// 顺带做读修复：落后/缺失的副本在返回数据之前就入队。让读请求顺带
+// 修复的意义在于，被读到的热数据永远不会长期缺副本。
 func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 	if err := store.ValidateObjectPath(bucket, key); err != nil {
 		return nil, err
@@ -28,8 +34,14 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 
 	responded, found := countResponses(results)
 	if responded < c.cfg.ReadQuorum {
-		return nil, fmt.Errorf("%w: 仅 %d/%d 个副本响应，需要 %d（%v）",
-			store.ErrUnavailable, responded, c.cfg.ReplicaCount, c.cfg.ReadQuorum, firstError(results))
+		// 降级读只放宽"副本数不足"，不放宽"什么都不知道"：
+		// found==0 时无论怎么降级都没有可读的数据，仍然回 503。
+		if !c.cfg.ReadDegraded || found == 0 {
+			return nil, fmt.Errorf("%w: 仅 %d/%d 个副本响应，需要 %d（%v）",
+				store.ErrUnavailable, responded, c.cfg.ReplicaCount, c.cfg.ReadQuorum, firstError(results))
+		}
+		c.logger.Warn("read_degraded",
+			"bucket", bucket, "key", key, "responded", responded, "need", c.cfg.ReadQuorum)
 	}
 	if found == 0 {
 		return nil, store.ErrNoSuchKey
@@ -40,6 +52,11 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 		// countResponses 已保证 found>0；走到这里说明响应格式有误。
 		return nil, fmt.Errorf("%w: 副本元数据缺失", store.ErrCorrupt)
 	}
+
+	// 在读数据之前先登记修复：墓碑路径也要做，否则删除后残留的活副本
+	// 会在下一次读到时让对象"复活"。
+	c.enqueueReadRepairs(bucket, key, results, latest)
+
 	// 最新版本是墓碑 ⇒ 对象已被删除。这条判断必须在存活副本数之前：
 	// 删除留下的墓碑本来就比任何活副本新，"存活副本不足 R"是删除后的
 	// 正常状态，把它报成 503 会让客户端一直重试一个永远不存在的对象。
@@ -47,8 +64,12 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 		return nil, store.ErrNoSuchKey
 	}
 	if live := liveCount(results); live < c.cfg.ReadQuorum {
-		return nil, fmt.Errorf("%w: 仅 %d 份存活副本可用，需要 %d",
-			store.ErrUnavailable, live, c.cfg.ReadQuorum)
+		if !c.cfg.ReadDegraded {
+			return nil, fmt.Errorf("%w: 仅 %d 份存活副本可用，需要 %d",
+				store.ErrUnavailable, live, c.cfg.ReadQuorum)
+		}
+		c.logger.Warn("read_degraded",
+			"bucket", bucket, "key", key, "live", live, "need", c.cfg.ReadQuorum)
 	}
 
 	// 源顺序：本地优先（命中现有 sendfile 零拷贝路径），其次是持有
@@ -81,6 +102,23 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 		}
 	}
 
+	// EC 对象的数据不在副本集上：副本只负责 meta 仲裁，分片按 meta 中
+	// 记录的组读取。组必须取自 meta 而不是重算环 —— 成员表变更后重算
+	// 可能指向另一批节点，而分片还在旧组里。
+	var ecr *ecReader
+	if latest.Layout == store.LayoutEC {
+		group, err := c.ecTargetsFor(latest)
+		if err != nil {
+			return nil, err
+		}
+		codec, err := ec.NewCodec(latest.EC.K, latest.EC.M)
+		if err != nil {
+			return nil, fmt.Errorf("%w: EC 参数 k=%d m=%d 非法: %v",
+				store.ErrCorrupt, latest.EC.K, latest.EC.M, err)
+		}
+		ecr = &ecReader{codec: codec, group: group}
+	}
+
 	return &clusterReader{
 		info: store.ObjectInfo{
 			Key:               latest.Key,
@@ -97,7 +135,24 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 		},
 		blocks:  latest.Blocks,
 		sources: sources,
+		ecr:     ecr,
+		repair: func(t target, b store.BlockDesc) {
+			c.repair.enqueue(t.id, repairBlocks, bucket, key, latest.ObjVersion)
+		},
 	}, nil
+}
+
+// enqueueReadRepairs 把本次探测发现的副本缺陷登记给修复队列。
+//
+// 只针对"不是最新版本"的副本：与最新版本一致的副本无需修复。
+// 不可达的副本同样入队 —— 它恢复后正需要一份 hint。
+func (c *Cluster) enqueueReadRepairs(bucket, key string, results []metaResult, latest *store.ObjectMeta) {
+	for _, r := range results {
+		if r.err == nil && r.found && sameVersion(r.meta, latest) {
+			continue
+		}
+		c.repair.enqueue(r.id, repairMeta, bucket, key, latest.ObjVersion)
+	}
 }
 
 // clusterReader 是一个由远端块拼成的只读对象视图。
@@ -109,6 +164,13 @@ type clusterReader struct {
 	info    store.ObjectInfo
 	blocks  []store.BlockDesc
 	sources []target
+
+	// ecr 非 nil 表示对象是 EC 布局，块由分片重建而不是从副本整块读取。
+	ecr *ecReader
+
+	// repair 在某次块读取因"副本侧原因"失败时上报给协调者。
+	// 为 nil 表示不修复（测试与只读视图）。
+	repair func(t target, b store.BlockDesc)
 }
 
 // Info 返回打开时的元数据快照。
@@ -164,6 +226,9 @@ func (r *clusterReader) WriteRangeTo(w io.Writer, offset, length int64) error {
 // 只有"一个字节都还没写"时才允许换源：一旦部分内容已交给调用方，
 // 换源会从段首重读并重复写入，产出的内容比失败更糟。
 func (r *clusterReader) readSegment(w io.Writer, b store.BlockDesc, offset, length int64) error {
+	if r.ecr != nil {
+		return r.readECSegment(w, b, offset, length)
+	}
 	var lastErr error
 	for _, src := range r.sources {
 		cw := &countingWriter{w: w}
@@ -171,13 +236,33 @@ func (r *clusterReader) readSegment(w io.Writer, b store.BlockDesc, offset, leng
 		if err == nil {
 			return nil
 		}
+		// 只有副本侧失败才值得修复。调用方的 writer 出错（连接被取消、
+		// 磁盘满）与副本是否缺块无关，上报它只会给修复队列制造噪声。
+		if r.repair != nil && isBlockReadFailure(err) {
+			r.repair(src, b)
+		}
 		if cw.n > 0 {
+			// 部分字节已经交给调用方，换源会重复写入，只能中断。
 			return fmt.Errorf("cluster: 读取块 %s 时传输中断（已写 %d/%d 字节）: %w",
 				b.Hash, cw.n, length, err)
 		}
 		lastErr = err
 	}
 	return fmt.Errorf("%w: 块 %s 在所有副本上均不可读: %v", store.ErrCorrupt, b.Hash, lastErr)
+}
+
+// isBlockReadFailure 判断错误是否来自副本一侧（缺块/损坏/不可达）。
+//
+// 本地读的失败会被 store 包成 fs 错误或 ErrCorrupt/ErrInvalidBlock，
+// 远端失败是 *PeerError。其它错误一律视为调用方侧。
+func isBlockReadFailure(err error) bool {
+	var pe *PeerError
+	if errors.As(err, &pe) {
+		return true
+	}
+	return errors.Is(err, fs.ErrNotExist) ||
+		errors.Is(err, store.ErrCorrupt) ||
+		errors.Is(err, store.ErrInvalidBlock)
 }
 
 // countingWriter 记录成功写出的字节数。

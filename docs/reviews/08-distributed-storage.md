@@ -26,7 +26,7 @@
 | 跨区域/跨集群复制、S3 Replication API | 需要广域编排、冲突与带宽管理；`?replication` 继续返回 501 |
 | EC 与副本混部（同对象双布局） | 写放大与元数据复杂；v1 按对象大小二选一 |
 | EC 自动换节点/重编码 | 需要重写 meta 与数据迁移；v1 只原位重建 shard |
-| 块级 GC / refcount | 现状本就没有块 GC，分布式不扩大范围；仅做 tombstone GC |
+| 块级 GC / refcount | 现状本就没有块 GC，分布式不扩大范围；tombstone 物理 GC 当前也**未实现** |
 | 跨节点零拷贝 | 远程数据必须经过协调者用户态；只保证本地副本的 sendfile 快路径 |
 
 ## 术语
@@ -36,7 +36,7 @@
 | **N / W / R** | 副本数 / 写 quorum / 读 quorum。默认 `3 / 2 / 2` |
 | **副本集** | 某 key 经一致性哈希选出的 N 个节点，按环上顺序排列；第 1 个称 primary |
 | **EC group** | 某 stripe 的 `k+m` 个 shard 所在节点集合 |
-| **tombstone** | 逻辑删除标记。保留 `BLINK_TOMBSTONE_TTL` 后由确定性 owner 物理清理 |
+| **tombstone** | 逻辑删除标记。当前只写不清理（物理 GC 未实现） |
 | **HLC** | 混合逻辑时钟。`obj_version = (physical_ms, logical_counter)`，并发同值时用 `node_id` 决胜 |
 | **durable quorum** | 块与 meta 均已落到 ≥W 个副本，此时向客户端返回成功 |
 
@@ -60,7 +60,7 @@ s3api ──► store.Backend（接口，由消费方定义）
 - 一致性哈希：每节点 128 个虚拟节点，`fnv64a(nodeID + "#" + i)`；`Ring.Replicas(key, n)` 顺时针取首 n 个**不同**节点。
 - 放置 key 为 `bucket + "/" + objectKey`。增删节点时只有落入变动区间的 key 需要迁移——这是选择一致性哈希而非取模的原因。
 - 副本顺序即偏序：primary 用于条件写串行化与读修复优先源。
-- v1 提供离线迁移命令 `blink-admin rebalance --dry-run|--apply`，不进入在线自动化。
+- 设想的离线迁移命令 `blink-admin rebalance --dry-run|--apply` **尚未实现**；当前扩缩容必须停机并人工迁移。
 
 ### 写路径
 
@@ -68,7 +68,7 @@ s3api ──► store.Backend（接口，由消费方定义）
 1. 任意节点作为协调者，Ring.Replicas(key, N) 得到 N 个目标
 2. 复用 `store.StreamBlocks` 流式切块（4 MiB 块，CAS 内容寻址，Stat 命中即去重）；`OpenObject` 返回 `store.Reader` 接口，本地与集群读取器对 s3api 等价
 3. 每个块扇出到 N 个目标：本地直写；远端 POST /internal/v1/block
-4. 在途窗口 BLINK_WRITE_WINDOW=8（≈32 MiB/上传），共享 buffer pool + 全局准入背压
+4. 当前按块顺序扇出；可配置的在途窗口与共享 buffer pool **未实现**（`BLINK_WRITE_WINDOW` 不是有效配置项）
 5. 块全部落盘后提交 meta，携带 obj_version=HLC(now, counter, nodeID)
 6. meta 扇出到 N 个副本，副本对更低版本直接拒绝（防乱序覆盖）
 7. 收到 W 个 ack 即返回 200；失败副本进入修复队列
@@ -85,7 +85,7 @@ s3api ──► store.Backend（接口，由消费方定义）
 ```text
 1. Ring.Replicas(key, N) → 并行向各副本取 meta，凑 R 份
 2. 取最大 (obj_version, node_id)；最高版本是 tombstone → 404 NoSuchKey
-3. 按 blocks[] 顺序并行预取（BLINK_READ_WINDOW=4）
+3. 当前按 blocks[] 顺序预取；可配置的并行预取窗口 **未实现**（`BLINK_READ_WINDOW` 不是有效配置项）
 4. 本地副本命中 → 现有 copyBlockSegment 的 sendfile 零拷贝
    远端块 → 内部接口流式转发
 5. 发现副本落后/缺块 → 后台读修复
@@ -150,7 +150,7 @@ s3api ──► store.Backend（接口，由消费方定义）
 ### tombstone 与 GC
 
 - 集群模式 `DeleteObject` 写 tombstone：`objectMeta{Deleted:true, ObjVersion:next, NodeID:self}` 提交到 W 个副本。
-- `BLINK_TOMBSTONE_TTL=168h` 后，由 `hash(bucket+"/"+key)` 的环后继作为 owner，扫描本地 tombstone，向全部副本确认"要么已有 ≥ 该版本，要么节点超过 TTL 不可达"，再物理删除 meta 目录。
+- **物理 GC 未实现**：原先设想的 `BLINK_TOMBSTONE_TTL=168h` + 确定性 owner 清理尚未落地，当前 tombstone 会一直保留。`BLINK_TOMBSTONE_TTL` 因此也不是有效配置项。
 - **CAS 块不删**：与现有行为一致（`internal/store/fsstore_read.go` 删除路径只删对象目录）。项目当前没有块 GC，tombstone GC 不能假装解决空间回收。
 
 ## 分片上传（MPU）
@@ -201,13 +201,13 @@ Complete 完全复用单机"只串接块表、不搬数据"的逻辑（`internal
 | 节点数 | profile | 空间开销 | 容错 | 说明 |
 | --- | --- | --- | --- | --- |
 | 3 | `2+1` | 1.5x | 1 节点 | 边端主流规模；与 3 副本同容错但省一半空间 |
-| 4–5 | 默认副本 | 3.0x | 1 节点 | 节点数不足以摊薄 shard，可显式指定 `2+1` |
+| 4–5 | 无默认 | — | — | 开启 EC 时必须显式指定 `BLINK_EC_K`/`BLINK_EC_M`，否则**拒绝启动**，避免"以为开了 EC 其实还是副本" |
 | ≥6 | `4+2` | 1.5x | 2 节点 | 大集群默认 |
 
 ### 触发与布局
 
 - `BLINK_EC_ENABLED=true` 且对象 ≥ `BLINK_EC_MIN_SIZE=32MiB` 时启用；否则走副本。**默认关闭**。
-- 每 `k` 个数据块 + `m` 个校验块组成一个 stripe，shard 分布到 `k+m` 个节点。
+- 每个存储块（默认 4 MiB）独立编码为 `k` 个数据片 + `m` 个校验片（即该块自成一个 stripe），分片落到 `k+m` 个节点；同一对象的所有块共享同一个分片组，组由 key 的环位置一次决定并写入 meta。
 - meta 记录 `layout:"ec"`、`ec:{k,m}` 与 shard 组节点 ID。
 - 小对象仍走副本，避免 shard 数量膨胀与元数据复杂化。
 
@@ -254,14 +254,15 @@ type RepairTask struct {
 
 ### 修复风暴抑制
 
-| 措施 | 取值/做法 |
-| --- | --- |
-| 确定性 owner | `hash(shard/key)` 的环后继负责，避免多节点重复修复 |
-| 并发上限 | 每节点 2 个 repair worker；EC 重建单独限 1 |
-| 带宽/IO 限速 | 令牌桶，不超过本地磁盘顺序带宽的 20% |
-| 优先级 | 可用 shard 数越接近 k 越优先；小对象优先于大对象 |
-| 退避 + 抖动 | 失败指数退避，±30% 抖动 |
-| 水位保护 | 磁盘高于高水位时暂停 repair 写入 |
+| 措施 | 取值/做法 | 状态 |
+| --- | --- | --- |
+| 确定性 owner | `hash(shard/key)` 的环后继负责，避免多节点重复修复 | 已实现（反熵） |
+| 并发上限 | 每节点 `repair-max-concurrency` 个 repair worker（默认 2）；EC 重建暂与普通修复共用名额 | 已实现 |
+| 退避 + 抖动 | 失败指数退避 `[1s,5s,30s,5m,1h]`，±30% 抖动 | 已实现 |
+| 带宽/IO 限速 | 令牌桶，不超过本地磁盘顺序带宽的 20% | **未实现** |
+| 优先级 | 可用 shard 数越接近 k 越优先；小对象优先于大对象 | **未实现** |
+| 水位保护 | 磁盘高于高水位时暂停 repair 写入 | **未实现**（`Store` 尚无可用空间接口） |
+| EC 重建单独限 1 | 避免重建挤占普通修复 | **未实现**，共用 worker 名额 |
 
 ## 部署
 
@@ -297,9 +298,8 @@ Pod DNS：`blink-0.blink-headless.blink.svc.cluster.local`；peers 使用短名 
 | `BLINK_REPLICA_COUNT` / `WRITE_QUORUM` / `READ_QUORUM` | 3 / 2 / 2 | 启动校验 `1≤W,R≤N` 且 `W+R>N` |
 | `BLINK_VNODES` | 128 | 每节点虚拟节点数 |
 | `BLINK_EC_ENABLED` / `EC_K` / `EC_M` / `EC_MIN_SIZE` | false / 0 / 0 / 32MiB | 开启时按节点数选 profile |
-| `BLINK_WRITE_WINDOW` / `READ_WINDOW` | 8 / 4 | 在途块数 |
 | `BLINK_REPAIR_INTERVAL` / `SCRUB_INTERVAL` / `REPAIR_MAX_CONCURRENCY` | 30s / 24h / 2 | |
-| `BLINK_TOMBSTONE_TTL` / `READ_DEGRADED` / `PEER_TIMEOUT` | 168h / false / 2s | |
+| `BLINK_HINT_TTL` / `READ_DEGRADED` / `PEER_TIMEOUT` | 72h / false / 2s | `HINT_TTL` 是修复任务保留期；`TOMBSTONE_TTL` 未实现 |
 
 单机模式下出现集群变量不改变行为，解析失败的变量只记录警告（`cluster_env_ignored`），保证老部署零回归。
 
