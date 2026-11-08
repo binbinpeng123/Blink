@@ -26,6 +26,7 @@ const (
 	CodeNoSuchUpload                 Code = "NoSuchUpload"
 	CodeEntityTooSmall               Code = "EntityTooSmall"
 	CodeInvalidPart                  Code = "InvalidPart"
+	CodeInvalidPartNumber            Code = "InvalidPartNumber"
 	CodeInvalidPartOrder             Code = "InvalidPartOrder"
 	CodeBadDigest                    Code = "BadDigest"
 	CodeInvalidDigest                Code = "InvalidDigest"
@@ -115,6 +116,7 @@ var table = map[Code]*Error{
 	CodeNoSuchUpload:                 {Code: CodeNoSuchUpload, Message: "The specified upload does not exist.", HTTPStatus: http.StatusNotFound},
 	CodeEntityTooSmall:               {Code: CodeEntityTooSmall, Message: "Your proposed upload is smaller than the minimum allowed object size.", HTTPStatus: http.StatusBadRequest},
 	CodeInvalidPart:                  {Code: CodeInvalidPart, Message: "One or more of the specified parts could not be found.", HTTPStatus: http.StatusBadRequest},
+	CodeInvalidPartNumber:            {Code: CodeInvalidPartNumber, Message: "The requested part number is not satisfiable.", HTTPStatus: http.StatusRequestedRangeNotSatisfiable},
 	CodeInvalidPartOrder:             {Code: CodeInvalidPartOrder, Message: "The list of parts was not in ascending order.", HTTPStatus: http.StatusBadRequest},
 	CodeBadDigest:                    {Code: CodeBadDigest, Message: "The Content-MD5 or checksum you specified did not match what we received.", HTTPStatus: http.StatusBadRequest},
 	CodeInvalidDigest:                {Code: CodeInvalidDigest, Message: "The Content-MD5 you specified is not valid.", HTTPStatus: http.StatusBadRequest},

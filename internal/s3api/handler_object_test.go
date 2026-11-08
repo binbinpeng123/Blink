@@ -345,8 +345,6 @@ func TestUnsupportedSubresourceStillNotImplemented(t *testing.T) {
 		{http.MethodGet, "/bkt/key?acl"},
 		{http.MethodPut, "/bkt/key?tagging"},
 		{http.MethodGet, "/bkt?versioning"},
-		// 分片下载（GetObject partNumber）仍不在本版本范围内。
-		{http.MethodGet, "/bkt/key?partNumber=1"},
 		// 单独的 HTTP 方法上没有 uploadId 语义。
 		{http.MethodPatch, "/bkt/key?uploadId=abc"},
 	}

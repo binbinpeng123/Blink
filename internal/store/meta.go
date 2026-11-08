@@ -210,6 +210,26 @@ type ObjectMeta struct {
 	// 同一对象的所有块共享同一个分片组：块是独立编码的，但落到哪
 	// k+m 个节点由对象 key 的环位置一次决定，避免逐块重算放置。
 	EC *ECLayout `json:"ec,omitempty"`
+	// Parts 记录分片上传产生的分片边界，供 GetObject/HeadObject 的
+	// `partNumber` 子资源定位。只有 CompleteMultipartUpload 写入的对象
+	// 才有；PutObject 与 CopyObject 产生的对象为 nil。
+	//
+	// 偏移刻意不落盘，按 Size 的累计和推导：同一事实存两份，任何一次
+	// 不一致都会让 partNumber 返回错误区间。
+	Parts []PartDesc `json:"parts,omitempty"`
+
+	// 说明：这是可选新增字段，不提升 format_version。旧二进制读到新
+	// meta.json 会忽略未知字段，新二进制读到旧 meta.json 得到 nil，
+	// 按"非分片对象"处理。
+}
+
+// PartDesc 是一个分片在对象内的长度描述（编号 + 长度）。
+//
+// 字段名刻意短：10000 个分片时每个约 30 字节 JSON，整体仍远低于
+// 元数据 32 MiB 的读取上限。
+type PartDesc struct {
+	Number int   `json:"number"`
+	Size   int64 `json:"size"`
 }
 
 // 数据布局常量。

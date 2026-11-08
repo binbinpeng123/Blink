@@ -275,8 +275,12 @@ func TestMultipartRoutingAndErrors(t *testing.T) {
 			want: http.StatusNotImplemented,
 		},
 		{
-			name: "单独 partNumber 下载", method: http.MethodGet, target: "/bkt/obj?partNumber=1",
-			want: http.StatusNotImplemented, wantCode: "NotImplemented",
+			// 没有 uploadId 的 partNumber 不是分片上传：GET/HEAD 属于
+			// 分片下载（交给对象读路径），其余方法没有定义，必须回 400
+			// 而不是落到普通 PUT 把 partNumber 当无关查询参数忽略。
+			name: "单独 partNumber 的 PUT", method: http.MethodPut, target: "/bkt/obj?partNumber=1",
+			body: strings.NewReader("x"),
+			want: http.StatusBadRequest, wantCode: "InvalidArgument",
 		},
 		{
 			name: "partNumber 为 0", method: http.MethodPut,
@@ -495,5 +499,143 @@ func TestUploadPartAWSChunkedTrailer(t *testing.T) {
 	}
 	if got := decodeError(t, rec).Code; got != "BadDigest" {
 		t.Errorf("错误码 = %q，期望 BadDigest", got)
+	}
+}
+
+// TestGetObjectPartNumberAfterComplete 覆盖分片上传产生的对象的分片下载：
+// 206 + 绝对 Content-Range + x-amz-mp-parts-count，以及分片内 Range 换算。
+func TestGetObjectPartNumberAfterComplete(t *testing.T) {
+	h := mpuTestServer(t)
+	const key = "parts/obj"
+	uploadID := createUploadHTTP(t, h, key, nil)
+
+	p1 := mpuPayload(5<<20, 0x33)
+	p2 := mpuPayload(1024, 0x44)
+	parts := [][]byte{p1, p2}
+	etags := make([]string, len(parts))
+	for i, p := range parts {
+		rec := mpuRequest(t, h, http.MethodPut,
+			fmt.Sprintf("/bkt/%s?partNumber=%d&uploadId=%s", key, i+1, uploadID),
+			bytes.NewReader(p), nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("UploadPart(%d) = %d：%s", i+1, rec.Code, rec.Body.String())
+		}
+		etags[i] = rec.Header().Get("ETag")
+	}
+	completeXML := fmt.Sprintf(
+		`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part>`+
+			`<Part><PartNumber>2</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`,
+		etags[0], etags[1])
+	if rec := mpuRequest(t, h, http.MethodPost, "/bkt/"+key+"?uploadId="+uploadID,
+		strings.NewReader(completeXML), nil); rec.Code != http.StatusOK {
+		t.Fatalf("Complete = %d：%s", rec.Code, rec.Body.String())
+	}
+
+	total := int64(len(p1) + len(p2))
+	const size1 = 5 << 20
+
+	// 第一片：206 + 从 0 开始的绝对 Content-Range。
+	rec := mpuRequest(t, h, http.MethodGet, "/bkt/"+key+"?partNumber=1", nil, nil)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("partNumber=1 状态码 = %d，期望 206：%s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(rec.Body.Bytes(), p1) {
+		t.Error("第一片内容不一致")
+	}
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes 0-%d/%d", size1-1, total); got != want {
+		t.Errorf("Content-Range = %q，期望 %q", got, want)
+	}
+	if got := rec.Header().Get("x-amz-mp-parts-count"); got != "2" {
+		t.Errorf("x-amz-mp-parts-count = %q，期望 2", got)
+	}
+
+	// 第二片 HEAD：长度与偏移都从元数据推导，不发响应体。
+	rec = mpuRequest(t, h, http.MethodHead, "/bkt/"+key+"?partNumber=2", nil, nil)
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("HEAD partNumber=2 状态码 = %d，期望 206", rec.Code)
+	}
+	if got := rec.Body.Len(); got != 0 {
+		t.Errorf("HEAD 响应体长度 = %d，期望 0", got)
+	}
+	if got, want := rec.Header().Get("Content-Length"), "1024"; got != want {
+		t.Errorf("Content-Length = %q，期望 %q", got, want)
+	}
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes %d-%d/%d", size1, total-1, total); got != want {
+		t.Errorf("Content-Range = %q，期望 %q", got, want)
+	}
+
+	// 不存在的分片号：416，错误码与越界 Range 区分开。
+	rec = mpuRequest(t, h, http.MethodGet, "/bkt/"+key+"?partNumber=3", nil, nil)
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("partNumber=3 状态码 = %d，期望 416", rec.Code)
+	}
+	if got := decodeError(t, rec).Code; got != "InvalidPartNumber" {
+		t.Errorf("错误码 = %q，期望 InvalidPartNumber", got)
+	}
+
+	// Range 相对分片解析：第一片的 bytes=0-9 对应对象偏移 0-9。
+	rec = mpuRequest(t, h, http.MethodGet, "/bkt/"+key+"?partNumber=1", nil, func(r *http.Request) {
+		r.Header.Set("Range", "bytes=0-9")
+	})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("分片内 Range 状态码 = %d，期望 206：%s", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(rec.Body.Bytes(), p1[:10]) {
+		t.Error("分片内 Range 内容不一致")
+	}
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes 0-9/%d", total); got != want {
+		t.Errorf("Content-Range = %q，期望 %q", got, want)
+	}
+
+	// 第二片的 bytes=0-9 必须换算成对象绝对偏移。
+	rec = mpuRequest(t, h, http.MethodGet, "/bkt/"+key+"?partNumber=2", nil, func(r *http.Request) {
+		r.Header.Set("Range", "bytes=0-9")
+	})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("第二片 Range 状态码 = %d，期望 206", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), p2[:10]) {
+		t.Error("第二片 Range 内容不一致")
+	}
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes %d-%d/%d", size1, size1+9, total); got != want {
+		t.Errorf("Content-Range = %q，期望 %q", got, want)
+	}
+
+	// 分片内越界：416 的 Content-Range 用分片大小，而不是对象总大小。
+	rec = mpuRequest(t, h, http.MethodGet, "/bkt/"+key+"?partNumber=1", nil, func(r *http.Request) {
+		r.Header.Set("Range", fmt.Sprintf("bytes=%d-", size1))
+	})
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("分片内越界状态码 = %d，期望 416", rec.Code)
+	}
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes */%d", size1); got != want {
+		t.Errorf("Content-Range = %q，期望 %q", got, want)
+	}
+	if got := decodeError(t, rec).Code; got != "InvalidRange" {
+		t.Errorf("错误码 = %q，期望 InvalidRange", got)
+	}
+
+	// If-Range 不成立时回退为整个分片（而不是整个对象）。
+	rec = mpuRequest(t, h, http.MethodGet, "/bkt/"+key+"?partNumber=2", nil, func(r *http.Request) {
+		r.Header.Set("Range", "bytes=0-9")
+		r.Header.Set("If-Range", `"deadbeef"`)
+	})
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("If-Range 不成立状态码 = %d，期望 206", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), p2) {
+		t.Error("If-Range 不成立时应回退整个分片")
+	}
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes %d-%d/%d", size1, total-1, total); got != want {
+		t.Errorf("Content-Range = %q，期望 %q", got, want)
+	}
+
+	// 普通 GET 不回传分片总数：分片元数据只在被请求时出现。
+	rec = mpuRequest(t, h, http.MethodGet, "/bkt/"+key, nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("普通 GET 状态码 = %d，期望 200", rec.Code)
+	}
+	if got := rec.Header().Get("x-amz-mp-parts-count"); got != "" {
+		t.Errorf("普通 GET 不应带 x-amz-mp-parts-count: %q", got)
 	}
 }

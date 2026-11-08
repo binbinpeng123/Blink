@@ -406,3 +406,104 @@ func TestListMultipartUploadsFanOut(t *testing.T) {
 		t.Fatalf("delimiter 结果 = uploads %+v, prefixes %+v", folded.Uploads, folded.CommonPrefixes)
 	}
 }
+
+// TestMultipartPartBoundsAcrossNodes 验证 Complete 把分片边界写进每个 O
+// 节点的副本 meta，并且任意节点都能按该边界定位区间。
+//
+// 分片边界不随会话走：会话删除后，GetObject?partNumber=N 只能依赖副本
+// meta。只要有一个节点的 meta 缺了边界，那里就会退回整对象语义。
+func TestMultipartPartBoundsAcrossNodes(t *testing.T) {
+	nodes := newTestNodesWithBlockSize(t, 3, mpuBlockSize)
+	const bucket = "mpu-parts"
+	const key = "dir/big.bin"
+	createBucketOnAll(t, nodes, bucket)
+
+	up := createMPU(t, nodes[0].cl, bucket, key, store.CreateMultipartOptions{})
+	part1 := testPayload(5<<20 + 100)
+	part2 := testPayload(1024)
+	info1 := uploadPart(t, nodes[1].cl, bucket, key, up.UploadID, 1, part1, store.UploadPartOptions{})
+	info2 := uploadPart(t, nodes[2].cl, bucket, key, up.UploadID, 2, part2, store.UploadPartOptions{})
+
+	obj, err := nodes[1].cl.CompleteMultipartUpload(bucket, key, up.UploadID,
+		[]store.CompletePart{{PartNumber: 1, ETag: info1.ETag}, {PartNumber: 2, ETag: info2.ETag}}, "", false)
+	if err != nil {
+		t.Fatalf("Complete 失败: %v", err)
+	}
+	if len(obj.Parts) != 2 ||
+		obj.Parts[0] != (store.ObjectPart{Number: 1, Offset: 0, Size: int64(len(part1))}) ||
+		obj.Parts[1] != (store.ObjectPart{Number: 2, Offset: int64(len(part1)), Size: int64(len(part2))}) {
+		t.Fatalf("Complete 返回的分片边界 = %+v", obj.Parts)
+	}
+
+	for _, n := range nodes {
+		m, found, err := n.st.LoadReplicaMeta(bucket, key)
+		if err != nil || !found {
+			t.Fatalf("节点 %s 缺少副本 meta（found=%v err=%v）", n.id, found, err)
+		}
+		if len(m.Parts) != 2 || m.Parts[0].Size != int64(len(part1)) || m.Parts[1].Size != int64(len(part2)) {
+			t.Errorf("节点 %s 的副本 meta 分片边界 = %+v", n.id, m.Parts)
+		}
+
+		r, err := n.cl.OpenObject(bucket, key)
+		if err != nil {
+			t.Fatalf("从节点 %s 打开对象失败: %v", n.id, err)
+		}
+		info := r.Info()
+		if len(info.Parts) != 2 {
+			t.Fatalf("从节点 %s 读到的分片边界 = %+v", n.id, info.Parts)
+		}
+		var buf bytes.Buffer
+		if err := r.WriteRangeTo(&buf, info.Parts[1].Offset, info.Parts[1].Size); err != nil {
+			t.Fatalf("从节点 %s 读取第二片失败: %v", n.id, err)
+		}
+		if !bytes.Equal(buf.Bytes(), part2) {
+			t.Errorf("从节点 %s 读到的第二片内容不一致", n.id)
+		}
+	}
+}
+
+// TestClusterCopyDropsPartBounds 固定集群 CopyObject 不复制分片边界。
+//
+// 集群复制走流式重写（块表按目标重新落盘），目标是一个全新的单段
+// 对象；残留的分片边界会让 partNumber 指向不存在的语义分界。
+func TestClusterCopyDropsPartBounds(t *testing.T) {
+	nodes := newTestNodesWithBlockSize(t, 3, mpuBlockSize)
+	const bucket = "mpu-copy-parts"
+	const srcKey = "src.bin"
+	const dstKey = "dst.bin"
+	createBucketOnAll(t, nodes, bucket)
+
+	up := createMPU(t, nodes[0].cl, bucket, srcKey, store.CreateMultipartOptions{})
+	part1 := testPayload(5<<20 + 5)
+	part2 := testPayload(77)
+	info1 := uploadPart(t, nodes[0].cl, bucket, srcKey, up.UploadID, 1, part1, store.UploadPartOptions{})
+	info2 := uploadPart(t, nodes[1].cl, bucket, srcKey, up.UploadID, 2, part2, store.UploadPartOptions{})
+	if _, err := nodes[2].cl.CompleteMultipartUpload(bucket, srcKey, up.UploadID,
+		[]store.CompletePart{{PartNumber: 1, ETag: info1.ETag}, {PartNumber: 2, ETag: info2.ETag}}, "", false); err != nil {
+		t.Fatalf("Complete 失败: %v", err)
+	}
+
+	if _, err := nodes[0].cl.CopyObject(bucket, dstKey, bucket, srcKey, store.CopyOptions{}); err != nil {
+		t.Fatalf("集群 CopyObject 失败: %v", err)
+	}
+	dst, err := nodes[1].cl.OpenObject(bucket, dstKey)
+	if err != nil {
+		t.Fatalf("打开目标对象失败: %v", err)
+	}
+	if len(dst.Info().Parts) != 0 {
+		t.Fatalf("目标对象不应有分片边界: %+v", dst.Info().Parts)
+	}
+	want := append(append([]byte{}, part1...), part2...)
+	if got := readAll(t, nodes[2].cl, bucket, dstKey); !bytes.Equal(got, want) {
+		t.Fatal("复制出的对象内容与源不一致")
+	}
+
+	// 源对象的边界必须保持不变。
+	src, err := nodes[0].cl.OpenObject(bucket, srcKey)
+	if err != nil {
+		t.Fatalf("打开源对象失败: %v", err)
+	}
+	if len(src.Info().Parts) != 2 {
+		t.Fatalf("源对象的分片边界被改动: %+v", src.Info().Parts)
+	}
+}

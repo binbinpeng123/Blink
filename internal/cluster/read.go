@@ -132,6 +132,7 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 			ChecksumType:      latest.ChecksumType,
 			BlockCount:        len(latest.Blocks),
 			Version:           latest.ObjVersion,
+			Parts:             store.PartBounds(latest.Parts),
 		},
 		blocks:  latest.Blocks,
 		sources: sources,

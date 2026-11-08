@@ -75,6 +75,40 @@ type ObjectInfo struct {
 	DedupedBlocks int
 	// Version 是本次写入后的 obj_version。
 	Version uint64
+
+	// Parts 是分片上传产生的分片边界（含推导出的绝对偏移），供
+	// GetObject/HeadObject 的 partNumber 子资源使用。
+	//
+	// 普通 PutObject 与 CopyObject 产生的对象为空：复制不继承源对象的
+	// 分片边界，两种复制模式都按"整体对象即第一片"处理。
+	Parts []ObjectPart
+}
+
+// ObjectPart 是一个分片在对象内的绝对边界。
+//
+// Offset 由 PartDesc 的 Size 累计推导，不落盘。PartNumber 从 1 开始，
+// 编号可以不连续（客户端允许跳过编号），因此不能用下标推算。
+type ObjectPart struct {
+	Number int
+	Offset int64
+	Size   int64
+}
+
+// PartBounds 把落盘的分片长度描述换算成带绝对偏移的读取视图。
+//
+// 单机与集群的读路径都要做这一步；集中在这里可以保证两条路径对
+// "第 N 片从哪开始"给出完全相同的结果。
+func PartBounds(parts []PartDesc) []ObjectPart {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]ObjectPart, 0, len(parts))
+	var off int64
+	for _, p := range parts {
+		out = append(out, ObjectPart{Number: p.Number, Offset: off, Size: p.Size})
+		off += p.Size
+	}
+	return out
 }
 
 // PutObject 把一个对象流式写入存储。

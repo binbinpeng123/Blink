@@ -870,6 +870,7 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 		ChecksumType:      out.ChecksumType,
 		NodeID:            s.nodeID,
 		ObjVersion:        1,
+		Parts:             out.Parts,
 	}
 	if prev != nil {
 		meta.ObjVersion = prev.ObjVersion + 1
@@ -903,6 +904,7 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 		BlockCount:        out.BlockCount,
 		DedupedBlocks:     out.Deduped,
 		Version:           meta.ObjVersion,
+		Parts:             PartBounds(out.Parts),
 	}, nil
 }
 
@@ -917,6 +919,10 @@ type AssembledObject struct {
 	ChecksumType      string
 	BlockCount        int
 	Deduped           int
+	// Parts 是本次 Complete 的分片边界，直接来自各 PartState.Size。
+	// 只能在这里产出：Complete 之后 multipart/<uploadId>/ 会被删除，
+	// 事后再也恢复不出"第 N 片从哪到哪"。
+	Parts []PartDesc
 }
 
 // AssembleMultipart 校验并串接分片块表，产出对象级块表与 ETag/校验和。
@@ -986,6 +992,10 @@ func AssembleMultipart(st *UploadState, parts []CompletePart, load func(int) (*P
 		}
 		out.Deduped += ps.Deduped
 		out.BlockCount += len(ps.Blocks)
+		// 分片边界直接取 PartState.Size。不重新用块表累计：两者不一致
+		// 说明状态文件被改过，随后的 out.Size 校验会暴露它，而不是
+		// 把错误长度静默写进 meta。
+		out.Parts = append(out.Parts, PartDesc{Number: p.PartNumber, Size: ps.Size})
 
 		raw, err := hex.DecodeString(ps.ETag)
 		if err != nil || len(raw) != md5.Size {

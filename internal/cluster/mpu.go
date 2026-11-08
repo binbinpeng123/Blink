@@ -302,6 +302,7 @@ func (c *Cluster) CompleteMultipartUpload(bucket, key, uploadID string, parts []
 		ChecksumType:      out.ChecksumType,
 		NodeID:            c.cfg.NodeID,
 		ObjVersion:        c.clock.Next(seen),
+		Parts:             out.Parts,
 	}
 
 	// meta 发给全部 O 目标而不是挑 W 个：读路径的 readSegment 会逐块回退，
@@ -345,6 +346,7 @@ func (c *Cluster) CompleteMultipartUpload(bucket, key, uploadID string, parts []
 		BlockCount:        out.BlockCount,
 		DedupedBlocks:     out.Deduped,
 		Version:           meta.ObjVersion,
+		Parts:             store.PartBounds(out.Parts),
 	}, nil
 }
 
