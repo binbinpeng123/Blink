@@ -59,6 +59,9 @@ type Options struct {
 type Capacity interface {
 	DiskUsage() store.DiskUsage
 	WriteBlocked() bool
+	// LastScrub 返回最近一轮后台完整性巡检摘要，供 /metrics 暴露。
+	// 从未跑过时返回零值（FinishedAt 为零），指标据此显示"尚未巡检"。
+	LastScrub() store.ScrubStats
 }
 
 // Server 承载路由与共享依赖。

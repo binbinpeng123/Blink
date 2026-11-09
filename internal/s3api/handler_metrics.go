@@ -26,6 +26,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	if s.capacity != nil {
 		s.metrics.refreshDisk(s.capacity.DiskUsage(), s.capacity.WriteBlocked())
+		s.metrics.refreshScrub(s.capacity.LastScrub())
 	}
 	s.metrics.refreshUptime(s.startedAt)
 

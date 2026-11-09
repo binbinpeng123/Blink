@@ -250,6 +250,11 @@ func run(args []string, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// 完整性巡检与 HTTP 服务共享生命周期 context：退出时取消正在进行的
+	// 一轮，避免全盘扫描把 Pod 终止拖过 kubelet 宽限期。
+	// 巡检始终针对本节点的本地存储（集群模式下也只看本地副本）。
+	go runIntegrityScrubber(ctx, st, logger, cfg.IntegrityInterval)
+
 	serveErr := make(chan error, len(servers))
 	for _, s := range servers {
 		go func(s serving) {
@@ -315,6 +320,74 @@ func run(args []string, stderr io.Writer) error {
 	}
 	logger.Info("blink_stopped")
 	return nil
+}
+
+// runIntegrityScrubber 按固定周期在后台巡检本节点已落盘的数据。
+//
+// 与读取时校验（--verify-read）互补：后者只在对象被访问时才发现损坏，
+// 长期不被读取的冷数据可能坏了很久都没人知道。巡检主动把每个对象读
+// 一遍并重算 CRC32C，把"静默损坏"变成可告警的指标与日志。
+//
+// 第一轮刻意**不**在启动时立即执行：边端 Pod 滚动重启频繁，立即扫描
+// 会让每次重启都触发一轮全盘读，把启动后的前台读延迟打满。第一轮在
+// 第一个周期之后才开始（默认 24h）。
+//
+// interval <= 0 表示禁用；单机与集群模式都生效。集群模式下每个节点
+// 只巡检本地已有的数据，分片缺失属于反熵修复的职责，不算损坏。
+func runIntegrityScrubber(ctx context.Context, st *store.Store, logger *slog.Logger, interval time.Duration) {
+	if st == nil || interval <= 0 {
+		logger.Info("scrub_disabled", slog.String("reason", "integrity_interval <= 0"))
+		return
+	}
+	logger.Info("scrub_scheduled",
+		slog.Duration("interval", interval),
+		// 把"首轮延迟"明确写进日志，避免运维误以为启动即巡检。
+		slog.Duration("first_run_after", interval),
+	)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		stats, err := st.ScrubAll(ctx)
+		if err != nil {
+			// 关闭时的取消不是故障，直接退出，不再刷一条误导性的错误日志。
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Error("scrub_failed", slog.Any("err", err))
+			continue
+		}
+		if stats.CorruptObjects > 0 {
+			// 明细已被 Store 限制在前 100 条；计数不受限，二者一起给出。
+			for _, c := range stats.Corruptions {
+				logger.Warn("scrub_corrupt",
+					slog.String("bucket", c.Bucket),
+					slog.String("key", c.Key),
+					slog.String("err", c.Err),
+				)
+			}
+			logger.Error("scrub_completed",
+				slog.Int("buckets", stats.Buckets),
+				slog.Int("scanned_objects", stats.ScannedObjects),
+				slog.Int("corrupt_objects", stats.CorruptObjects),
+				slog.Int("skipped_objects", stats.SkippedObjects),
+				slog.Duration("duration", stats.Duration),
+			)
+			continue
+		}
+		logger.Info("scrub_completed",
+			slog.Int("buckets", stats.Buckets),
+			slog.Int("scanned_objects", stats.ScannedObjects),
+			slog.Int("corrupt_objects", 0),
+			slog.Int("skipped_objects", stats.SkippedObjects),
+			slog.Duration("duration", stats.Duration),
+		)
+	}
 }
 
 // startClusterInternal 构造并监听节点间内部协议端口。

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -94,6 +95,11 @@ type Store struct {
 	metaCache *objectMetaCache
 
 	locks *keyLocker
+
+	// lastScrub 保存最近一轮成功完成的全量完整性巡检摘要，见 integrity.go。
+	// 用 atomic.Pointer 而不是互斥锁：写方每 24 小时一次，读方是 /metrics
+	// 抓取，二者都不值得为一次指针读去抢锁。
+	lastScrub atomic.Pointer[ScrubStats]
 }
 
 // CleanupError 返回启动时清扫失败的详情（没有失败则为 nil）。

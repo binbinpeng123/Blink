@@ -62,6 +62,12 @@ const (
 	// DefaultECMinSize 与 cluster 包保持一致。
 	DefaultECMinSize = cluster.DefaultECMinSize
 
+	// DefaultIntegrityInterval 是后台全量完整性巡检（scrub）的默认周期。
+	//
+	// 巡检要把每个对象完整读一遍，默认一天一次即可覆盖静默损坏的发现
+	// 时效；调短会持续占用磁盘读带宽，属于部署侧的权衡。
+	DefaultIntegrityInterval = 24 * time.Hour
+
 	// 集群模式取值。
 	ClusterModeSingle  = "single"
 	ClusterModeCluster = "cluster"
@@ -87,8 +93,13 @@ const (
 	EnvFsyncPolicy     = "BLINK_FSYNC_POLICY"
 	EnvClusterMode     = "BLINK_CLUSTER_MODE"
 	EnvVerifyRead      = "BLINK_VERIFY_READ"
-	EnvTLSCert         = "BLINK_TLS_CERT"
-	EnvTLSKey          = "BLINK_TLS_KEY"
+	// EnvIntegrityInterval 是后台全量完整性巡检周期；<=0 禁用。
+	//
+	// 与 EnvScrubInterval（集群反熵，按环扫描分片）是两件事：
+	// 这里巡检的是**本节点上已存在的对象数据**。
+	EnvIntegrityInterval = "BLINK_INTEGRITY_INTERVAL"
+	EnvTLSCert           = "BLINK_TLS_CERT"
+	EnvTLSKey            = "BLINK_TLS_KEY"
 
 	// 集群成员与内部协议。密钥只从环境变量读取，不提供命令行参数：
 	// 命令行会出现在进程列表与 shell 历史里，而共享密钥泄露等于全集群失守。
@@ -155,6 +166,11 @@ type Config struct {
 	// 默认关闭以保留 sendfile 零拷贝读路径；打开后每块先校验再写出，
 	// 代价是数据要经过用户态。见 03 文档"校验读 vs 零拷贝读"。
 	VerifyOnRead bool
+	// IntegrityInterval 是后台全量完整性巡检周期；<=0 表示禁用。
+	//
+	// 与 ScrubInterval（集群反熵）相互独立：后者在集群环上检查分片
+	// 归属并触发修复，这里只在本节点上对已有对象重算块校验和。
+	IntegrityInterval time.Duration
 	// HighWatermark 是拒绝写入的磁盘使用率上限。
 	HighWatermark float64
 	// LowWatermark 是恢复接受写入的磁盘使用率下限。
@@ -367,24 +383,25 @@ func (c Config) CredentialCount() int {
 // Default 返回全部使用默认值的配置（凭据为空）。
 func Default() Config {
 	return Config{
-		Addr:            DefaultAddr,
-		DataDir:         DefaultDataDir,
-		Region:          DefaultRegion,
-		LogLevel:        DefaultLogLevel,
-		MaxClockSkew:    DefaultMaxClockSkew,
-		FsyncPolicy:     DefaultFsyncPolicy,
-		BlockSize:       DefaultBlockSize,
-		InlineThreshold: DefaultInlineThreshold,
-		HighWatermark:   DefaultHighWatermark,
-		LowWatermark:    DefaultLowWatermark,
-		MaxBucketCount:  DefaultMaxBucketCount,
-		ClusterMode:     DefaultClusterMode,
-		InternalAddr:    DefaultInternalAddr,
-		ReplicaCount:    DefaultReplicaCount,
-		WriteQuorum:     DefaultWriteQuorum,
-		ReadQuorum:      DefaultReadQuorum,
-		VNodes:          DefaultVNodes,
-		PeerTimeout:     DefaultPeerTimeout,
+		Addr:              DefaultAddr,
+		DataDir:           DefaultDataDir,
+		Region:            DefaultRegion,
+		LogLevel:          DefaultLogLevel,
+		MaxClockSkew:      DefaultMaxClockSkew,
+		FsyncPolicy:       DefaultFsyncPolicy,
+		IntegrityInterval: DefaultIntegrityInterval,
+		BlockSize:         DefaultBlockSize,
+		InlineThreshold:   DefaultInlineThreshold,
+		HighWatermark:     DefaultHighWatermark,
+		LowWatermark:      DefaultLowWatermark,
+		MaxBucketCount:    DefaultMaxBucketCount,
+		ClusterMode:       DefaultClusterMode,
+		InternalAddr:      DefaultInternalAddr,
+		ReplicaCount:      DefaultReplicaCount,
+		WriteQuorum:       DefaultWriteQuorum,
+		ReadQuorum:        DefaultReadQuorum,
+		VNodes:            DefaultVNodes,
+		PeerTimeout:       DefaultPeerTimeout,
 
 		RepairInterval:       DefaultRepairInterval,
 		ScrubInterval:        DefaultScrubInterval,
@@ -431,6 +448,7 @@ func Load(args []string, out io.Writer) (Config, error) {
 	fs.DurationVar(&cfg.PeerTimeout, "peer-timeout", cfg.PeerTimeout, "节点间请求超时（环境变量 "+EnvPeerTimeout+"）")
 	fs.DurationVar(&cfg.RepairInterval, "repair-interval", cfg.RepairInterval, "修复调度器兜底唤醒间隔（环境变量 "+EnvRepairInterval+"）")
 	fs.DurationVar(&cfg.ScrubInterval, "scrub-interval", cfg.ScrubInterval, "反熵扫描周期，负值禁用（环境变量 "+EnvScrubInterval+"）")
+	fs.DurationVar(&cfg.IntegrityInterval, "integrity-interval", cfg.IntegrityInterval, "后台完整性巡检周期，<=0 禁用（环境变量 "+EnvIntegrityInterval+"）")
 	fs.IntVar(&cfg.RepairMaxConcurrency, "repair-max-concurrency", cfg.RepairMaxConcurrency, "每节点修复并发上限（环境变量 "+EnvRepairMaxConcurrency+"）")
 	fs.DurationVar(&cfg.HintTTL, "hint-ttl", cfg.HintTTL, "修复任务最长保留期（环境变量 "+EnvHintTTL+"）")
 	fs.BoolVar(&cfg.ECEnabled, "ec-enabled", cfg.ECEnabled, "开启对象级纠删码（环境变量 "+EnvECEnabled+"）")
@@ -488,6 +506,9 @@ func applyEnv(cfg *Config) {
 	cfg.applyDurationEnv(EnvPeerTimeout, &cfg.PeerTimeout, &cfg.clusterEnvErr)
 	cfg.applyDurationEnv(EnvRepairInterval, &cfg.RepairInterval, &cfg.clusterEnvErr)
 	cfg.applyDurationEnv(EnvScrubInterval, &cfg.ScrubInterval, &cfg.clusterEnvErr)
+	// 完整性巡检在单机模式下同样生效，因此错误必须记入 envErr；
+	// 写进 clusterEnvErr 会让单机部署静默忽略一个写错的周期。
+	cfg.applyDurationEnv(EnvIntegrityInterval, &cfg.IntegrityInterval, &cfg.envErr)
 	cfg.applyIntEnv(EnvRepairMaxConcurrency, &cfg.RepairMaxConcurrency, &cfg.clusterEnvErr)
 	cfg.applyDurationEnv(EnvHintTTL, &cfg.HintTTL, &cfg.clusterEnvErr)
 	cfg.applyIntEnv(EnvECK, &cfg.ECK, &cfg.clusterEnvErr)
@@ -855,6 +876,7 @@ func (c Config) Redacted() map[string]string {
 
 		"repair_interval_sec":    strconv.FormatInt(int64(c.RepairInterval.Seconds()), 10),
 		"scrub_interval_sec":     strconv.FormatInt(int64(c.ScrubInterval.Seconds()), 10),
+		"integrity_interval_sec": strconv.FormatInt(int64(c.IntegrityInterval.Seconds()), 10),
 		"repair_max_concurrency": strconv.Itoa(c.RepairMaxConcurrency),
 		"hint_ttl_hours":         strconv.FormatInt(int64(c.HintTTL.Hours()), 10),
 		"read_degraded":          strconv.FormatBool(c.ReadDegraded),
