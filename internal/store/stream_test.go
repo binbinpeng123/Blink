@@ -2,8 +2,14 @@ package store
 
 import (
 	"bytes"
+	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"runtime"
 	"testing"
+
+	"github.com/binbinpeng123/Blink/internal/checksum"
 )
 
 // TestStreamBlocksSizedKeepsBlockBoundaries 断言长度提示不改变切块结果。
@@ -53,6 +59,53 @@ func TestStreamBlocksSizedKeepsBlockBoundaries(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestStreamBlocksParallelHashes 断言并行路径（块长 ≥ parallelHashMinBlock）
+// 产出的每块 SHA-256/CRC32C 与 ETag，与对原始内容独立重算的结果一致。
+//
+// 并行版本让 goroutine 与主 goroutine 同时读同一块缓冲：等待时机错了、
+// 或在回调返回前就复用了缓冲，症状都是偶发的哈希错位/ETag 漂移。
+// 因此这里逐块重算全部字段，而不是只比较 Size 或块数。
+func TestStreamBlocksParallelHashes(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("GOMAXPROCS=1 时不会走并行路径")
+	}
+	const blockSize = int64(parallelHashMinBlock)
+	s := newSmallBlockStore(t, blockSize, 64<<10)
+
+	// 3 个满块（走并行）+ 1 个不满块（走串行），两条路径在同一对象里都覆盖。
+	body := patternBytes(int(blockSize*3+777), 13)
+	got, err := s.StreamBlocks(bytes.NewReader(body), "", "parallel-hash", func(Block) error { return nil })
+	if err != nil {
+		t.Fatalf("StreamBlocks 失败: %v", err)
+	}
+	if len(got.Blocks) != 4 {
+		t.Fatalf("块数 = %d，期望 4", len(got.Blocks))
+	}
+
+	parallel := 0
+	for i, b := range got.Blocks {
+		if b.Length >= int64(parallelHashMinBlock) {
+			parallel++
+		}
+		seg := body[b.Offset : b.Offset+b.Length]
+		sum := sha256.Sum256(seg)
+		if want := hex.EncodeToString(sum[:]); b.Hash != want {
+			t.Fatalf("第 %d 块 Hash = %s，期望 %s", i, b.Hash, want)
+		}
+		if want := checksum.BlockCRC32C(seg); b.CRC32C != want {
+			t.Fatalf("第 %d 块 CRC32C = %#x，期望 %#x", i, b.CRC32C, want)
+		}
+	}
+	if parallel != 3 {
+		t.Fatalf("走并行路径的块数 = %d，期望 3（测试没有覆盖并行路径）", parallel)
+	}
+
+	sum := md5.Sum(body)
+	if want := hex.EncodeToString(sum[:]); got.ETag != want {
+		t.Fatalf("ETag = %s，期望 %s", got.ETag, want)
 	}
 }
 
