@@ -39,6 +39,11 @@ type serverMetrics struct {
 	credentials *metrics.GaugeVec
 	uptime      *metrics.GaugeVec
 	buildInfo   *metrics.GaugeVec
+
+	scrubScanned   *metrics.GaugeVec
+	scrubCorrupt   *metrics.GaugeVec
+	scrubDuration  *metrics.GaugeVec
+	scrubCompleted *metrics.GaugeVec
 }
 
 // newServerMetrics 在给定注册表上创建全部指标；reg 为 nil 时返回 nil。
@@ -72,6 +77,16 @@ func newServerMetrics(reg *metrics.Registry, credentialCount int) *serverMetrics
 			"Process uptime in seconds."),
 		buildInfo: reg.Gauge("blink_build_info",
 			"Build information; value is always 1.", "version", "commit"),
+		// 巡检指标描述的是**最近一轮**，不是累计值：运维关心的是
+		// "现在盘上还有没有坏数据"，单调计数器无法表达这一点。
+		scrubScanned: reg.Gauge("blink_scrub_last_scanned_objects",
+			"Objects inspected by the most recent background integrity scrub."),
+		scrubCorrupt: reg.Gauge("blink_scrub_last_corrupt_objects",
+			"Objects with detected corruption in the most recent integrity scrub."),
+		scrubDuration: reg.Gauge("blink_scrub_last_duration_seconds",
+			"Wall-clock duration of the most recent integrity scrub."),
+		scrubCompleted: reg.Gauge("blink_scrub_last_completed_timestamp_seconds",
+			"Unix timestamp when the most recent integrity scrub finished; 0 means none has completed."),
 	}
 	m.credentials.Set(float64(credentialCount))
 	m.buildInfo.Set(1, buildinfo.Version, buildinfo.Commit)
@@ -129,6 +144,25 @@ func (m *serverMetrics) refreshDisk(u store.DiskUsage, blocked bool) {
 	m.diskTotal.Set(float64(u.Total))
 	m.diskFree.Set(float64(u.Free))
 	m.diskRatio.Set(u.UsedRatio)
+}
+
+// refreshScrub 写入最近一轮完整性巡检的摘要。
+//
+// 从未完成过巡检时，除完成时间外的数值都保持 0：这比隐藏整族指标
+// 更好——"scanned=0 且 completed=0"在面板上明确表达"还没跑过"，
+// 而指标族消失会让告警规则因缺样本触发（或更糟，静默不触发）。
+func (m *serverMetrics) refreshScrub(st store.ScrubStats) {
+	if m == nil {
+		return
+	}
+	m.scrubScanned.Set(float64(st.ScannedObjects))
+	m.scrubCorrupt.Set(float64(st.CorruptObjects))
+	m.scrubDuration.Set(st.Duration.Seconds())
+	if st.FinishedAt.IsZero() {
+		m.scrubCompleted.Set(0)
+		return
+	}
+	m.scrubCompleted.Set(float64(st.FinishedAt.Unix()))
 }
 
 // refreshUptime 写入进程运行时长。

@@ -16,7 +16,8 @@ func clearEnv(t *testing.T) {
 		EnvSecretKey, EnvLogLevel, EnvFsyncPolicy, EnvClusterMode,
 		EnvNodeID, EnvClusterPeers, EnvInternalAddr, EnvClusterSecret,
 		EnvReplicaCount, EnvWriteQuorum, EnvReadQuorum, EnvVNodes,
-		EnvPeerTimeout, EnvVerifyRead, EnvCredentialsFile, "BLINK_MAX_CLOCK_SKEW",
+		EnvPeerTimeout, EnvVerifyRead, EnvCredentialsFile, EnvIntegrityInterval,
+		"BLINK_MAX_CLOCK_SKEW",
 	} {
 		t.Setenv(k, "")
 	}
@@ -377,6 +378,70 @@ func TestClusterSecretNotLeaked(t *testing.T) {
 	if redacted := cfg.Redacted()["cluster_secret"]; redacted == "" {
 		t.Error("Redacted() 应包含 cluster_secret 占位项")
 	}
+}
+
+// TestIntegrityInterval 覆盖后台完整性巡检周期的加载语义。
+//
+// 与集群反熵的 --scrub-interval 不同，巡检在单机模式下同样生效，
+// 因此这里的每一条（尤其是环境变量解析失败）都必须影响单机启动。
+func TestIntegrityInterval(t *testing.T) {
+	creds := []string{"--access-key", testAK, "--secret-key", testSK}
+
+	t.Run("默认 24h", func(t *testing.T) {
+		clearEnv(t)
+		cfg, err := Load(creds, io.Discard)
+		if err != nil {
+			t.Fatalf("Load 失败: %v", err)
+		}
+		if cfg.IntegrityInterval != 24*time.Hour {
+			t.Fatalf("IntegrityInterval = %v, 期望 24h", cfg.IntegrityInterval)
+		}
+		if got := cfg.Redacted()["integrity_interval_sec"]; got != "86400" {
+			t.Errorf("Redacted()[integrity_interval_sec] = %q, 期望 86400", got)
+		}
+	})
+
+	t.Run("环境变量生效且可被参数覆盖", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvIntegrityInterval, "30m")
+		cfg, err := Load(creds, io.Discard)
+		if err != nil {
+			t.Fatalf("Load 失败: %v", err)
+		}
+		if cfg.IntegrityInterval != 30*time.Minute {
+			t.Fatalf("环境变量未生效: %v", cfg.IntegrityInterval)
+		}
+
+		cfg, err = Load(append(creds, "--integrity-interval", "2h"), io.Discard)
+		if err != nil {
+			t.Fatalf("Load 失败: %v", err)
+		}
+		if cfg.IntegrityInterval != 2*time.Hour {
+			t.Fatalf("命令行参数未覆盖环境变量: %v", cfg.IntegrityInterval)
+		}
+	})
+
+	t.Run("非正值表示禁用而不拒绝启动", func(t *testing.T) {
+		for _, v := range []string{"0", "-1h"} {
+			clearEnv(t)
+			cfg, err := Load(append(creds, "--integrity-interval", v), io.Discard)
+			if err != nil {
+				t.Fatalf("--integrity-interval %s 不应拒绝启动: %v", v, err)
+			}
+			if cfg.IntegrityInterval > 0 {
+				t.Errorf("--integrity-interval %s 未生效: %v", v, cfg.IntegrityInterval)
+			}
+		}
+	})
+
+	t.Run("非法环境变量在单机模式也拒绝启动", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvIntegrityInterval, "每天一次")
+		_, err := Load(creds, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), EnvIntegrityInterval) {
+			t.Fatalf("非法巡检周期应拒绝启动并指出变量名，实际 %v", err)
+		}
+	})
 }
 
 func TestUsageOutputOnBadFlag(t *testing.T) {
