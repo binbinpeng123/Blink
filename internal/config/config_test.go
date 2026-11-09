@@ -18,7 +18,7 @@ func clearEnv(t *testing.T) {
 		EnvReplicaCount, EnvWriteQuorum, EnvReadQuorum, EnvVNodes,
 		EnvPeerTimeout, EnvVerifyRead, EnvCredentialsFile, EnvIntegrityInterval,
 		EnvInlineObjectMaxSize, EnvBucketTTL, EnvTTLSweepInterval,
-		"BLINK_MAX_CLOCK_SKEW",
+		EnvGCInterval, EnvGCGrace, "BLINK_MAX_CLOCK_SKEW",
 	} {
 		t.Setenv(k, "")
 	}
@@ -63,6 +63,9 @@ func TestLoadDefaults(t *testing.T) {
 		// bucket-ttl，不需要再记一个必须同时打开的开关。
 		{"TTLSweepInterval", cfg.TTLSweepInterval, DefaultTTLSweepInterval},
 		{"BucketTTL", len(cfg.BucketTTL), 0},
+		// GC 默认每小时一轮、宽限期 1 小时。
+		{"GCInterval", cfg.GCInterval, DefaultGCInterval},
+		{"GCGrace", cfg.GCGrace, DefaultGCGrace},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -223,6 +226,7 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"TTL 时长非正", []string{"--bucket-ttl", "models=0s"}, "必须为正数"},
 		{"TTL 重复桶", []string{"--bucket-ttl", "models=1h,models=2h"}, "重复配置"},
 		{"TTL 集群模式", []string{"--cluster-mode", "cluster", "--bucket-ttl", "models=1h"}, "bucket-ttl 只支持单机模式"},
+		{"GC 宽限期为零", []string{"--gc-grace", "0s"}, "gc-grace"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -545,5 +549,40 @@ func TestUsageOutputOnBadFlag(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "fsync-policy") {
 		t.Errorf("用法输出应列出全部参数，实际为: %s", buf.String())
+	}
+}
+
+// TestGCConfig 验证 GC 参数的优先级与"禁用后台回收"的表达方式。
+func TestGCConfig(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvAccessKey, testAK)
+	t.Setenv(EnvSecretKey, testSK)
+	t.Setenv(EnvGCInterval, "30m")
+	t.Setenv(EnvGCGrace, "2h")
+
+	cfg, err := Load(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.GCInterval != 30*time.Minute || cfg.GCGrace != 2*time.Hour {
+		t.Fatalf("环境变量未生效: interval=%v grace=%v", cfg.GCInterval, cfg.GCGrace)
+	}
+
+	// 命令行覆盖环境变量；<=0 表示禁用后台回收，是合法配置。
+	cfg, err = Load([]string{"--gc-interval", "0s", "--gc-grace", "15m"}, io.Discard)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.GCInterval != 0 {
+		t.Errorf("GCInterval = %v，期望 0（禁用）", cfg.GCInterval)
+	}
+	if cfg.GCGrace != 15*time.Minute {
+		t.Errorf("GCGrace = %v，期望 15m", cfg.GCGrace)
+	}
+
+	// 非法时长必须报错，而不是静默保留默认值。
+	t.Setenv(EnvGCGrace, "1hour")
+	if _, err := Load(nil, io.Discard); err == nil {
+		t.Fatal("非法的 GCGrace 环境变量应导致启动失败")
 	}
 }

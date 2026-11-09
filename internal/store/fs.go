@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // FileSystem 是所有文件系统操作的唯一出口。
@@ -43,6 +44,12 @@ type FileSystem interface {
 	WriteFile(path string, data []byte, perm fs.FileMode) error
 	// Truncate 用于预分配块文件。
 	Truncate(path string, size int64) error
+	// Chtimes 更新文件访问/修改时间。
+	//
+	// GC 在提交元数据前刷新所引用块的 mtime，作为"这个块刚被引用过"的
+	// 证据：清扫阶段只删除 mtime 早于快照点的候选块，因此提交与清扫
+	// 并发时不会误删（见 gc.go）。
+	Chtimes(path string, atime, mtime time.Time) error
 }
 
 // osFS 是基于 os 包的真实实现。
@@ -113,6 +120,10 @@ func (osFS) WriteFile(path string, data []byte, perm fs.FileMode) error {
 }
 
 func (osFS) Truncate(path string, size int64) error { return os.Truncate(path, size) }
+
+func (osFS) Chtimes(path string, atime, mtime time.Time) error {
+	return os.Chtimes(path, atime, mtime)
+}
 
 // joinPath 是 path/filepath.Join 的包装，集中一处便于将来改为
 // 平台无关的路径策略（例如禁止某些字符）。

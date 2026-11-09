@@ -36,9 +36,11 @@ type serverMetrics struct {
 	diskTotal   *metrics.GaugeVec
 	diskFree    *metrics.GaugeVec
 	diskRatio   *metrics.GaugeVec
-	credentials *metrics.GaugeVec
-	uptime      *metrics.GaugeVec
-	buildInfo   *metrics.GaugeVec
+	// diskReclaimable 是 CAS 中当前未被引用、超过宽限期即可删除的字节数。
+	diskReclaimable *metrics.GaugeVec
+	credentials     *metrics.GaugeVec
+	uptime          *metrics.GaugeVec
+	buildInfo       *metrics.GaugeVec
 
 	scrubScanned   *metrics.GaugeVec
 	scrubCorrupt   *metrics.GaugeVec
@@ -78,6 +80,8 @@ func newServerMetrics(reg *metrics.Registry, credentialCount int) *serverMetrics
 			"Free bytes available to the blink process."),
 		diskRatio: reg.Gauge("blink_disk_used_ratio",
 			"Used ratio of the data volume filesystem, in [0,1]."),
+		diskReclaimable: reg.Gauge("blink_disk_reclaimable_bytes",
+			"CAS bytes no longer referenced by any metadata; includes blocks still inside the GC grace period."),
 		credentials: reg.Gauge("blink_credentials_total",
 			"Number of configured credentials."),
 		uptime: reg.Gauge("blink_uptime_seconds",
@@ -151,11 +155,14 @@ func (m *serverMetrics) authorizationDenied(action string) {
 //
 // 只在抓取时更新而不是每个请求更新：statfs 本身有成本，而容量是
 // 慢变量，抓取间隔（通常 15s）远小于填满磁盘所需时间。
-func (m *serverMetrics) refreshDisk(u store.DiskUsage, blocked bool) {
+func (m *serverMetrics) refreshDisk(u store.DiskUsage, blocked bool, reclaimable int64) {
 	if m == nil {
 		return
 	}
 	m.diskBlocked.SetBool(blocked)
+	// 可回收字节来自上一轮 GC 的扫描结果，与 statfs 是否可用无关，
+	// 因此排在 available 判断之前写入。
+	m.diskReclaimable.Set(float64(reclaimable))
 	if !u.Available {
 		// 统计不可用时把数值置 0：保留上一次的真实值会让面板在
 		// statfs 失败后继续显示过时容量，比显示 0 更容易误导。

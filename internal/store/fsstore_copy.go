@@ -104,6 +104,15 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 			ErrInvalidRequest, src.Size, MaxCopyObjectSize)
 	}
 
+	// 复制不写数据块，只把源对象的块表指向过来。pin 住这些块，
+	// 防止"源对象并发删除 + GC"在读完 meta 之后、写目标 meta 之前
+	// 把它们回收掉，从而复制出一个指向缺失块的对象。
+	pinned, err := s.pinBlocks(localBlockHashes(src))
+	if err != nil {
+		return nil, err
+	}
+	defer s.unpinBlocks(pinned)
+
 	prev, err := s.loadObjectMeta(dstBucket, dstKey)
 	switch {
 	case err == nil:
@@ -162,7 +171,7 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 		meta.ObjVersion = prev.ObjVersion + 1
 	}
 
-	if err := s.writeFileAtomic(s.objectMetaPath(dstBucket, dstKey), mustJSON(meta)); err != nil {
+	if err := s.commitMeta(s.objectMetaPath(dstBucket, dstKey), mustJSON(meta), pinned); err != nil {
 		return nil, fsErr("写入对象元数据", dstKey, err)
 	}
 	s.metaCache.put(metaCacheKey{bucket: dstBucket, key: dstKey}, &meta)

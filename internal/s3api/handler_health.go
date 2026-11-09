@@ -38,6 +38,11 @@ type readyzDisk struct {
 	HighWatermark float64 `json:"high_watermark"`
 	LowWatermark  float64 `json:"low_watermark"`
 	WriteBlocked  bool    `json:"write_blocked"`
+	// ReclaimableBytes 是上一轮 GC 统计出的未引用块字节数。
+	//
+	// 该数值包含宽限期内与 pin 中的块，因此会大于"下一轮实际删除的
+	// 字节"；它的用途是解释"删除对象后空间为何没有立即释放"。
+	ReclaimableBytes int64 `json:"reclaimable_bytes"`
 }
 
 // handleHealthz 是存活探针：只要进程还能响应就返回 200。
@@ -73,6 +78,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		disk.FreeBytes = usage.Free
 		disk.UsedRatio = usage.UsedRatio
 		disk.WriteBlocked = s.capacity.WriteBlocked()
+		disk.ReclaimableBytes = s.capacity.ReclaimableBytes()
 		if !usage.Available && usage.Err != nil {
 			// 错误只进日志：探针响应不该把底层文件系统的错误细节
 			// 暴露给任何能访问该端口的人，接口本身仍保持 200。

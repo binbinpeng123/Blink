@@ -16,14 +16,16 @@ import (
 
 // fakeCapacity 是可写死读数的 Capacity 实现。
 type fakeCapacity struct {
-	usage   store.DiskUsage
-	blocked bool
-	scrub   store.ScrubStats
-	ttl     store.TTLSweepStats
+	usage       store.DiskUsage
+	blocked     bool
+	reclaimable int64
+	scrub       store.ScrubStats
+	ttl         store.TTLSweepStats
 }
 
 func (f fakeCapacity) DiskUsage() store.DiskUsage        { return f.usage }
 func (f fakeCapacity) WriteBlocked() bool                { return f.blocked }
+func (f fakeCapacity) ReclaimableBytes() int64           { return f.reclaimable }
 func (f fakeCapacity) LastScrub() store.ScrubStats       { return f.scrub }
 func (f fakeCapacity) LastTTLSweep() store.TTLSweepStats { return f.ttl }
 
@@ -47,7 +49,8 @@ func newMetricsServer(t *testing.T, capacity Capacity) http.Handler {
 // 首个请求就是 /metrics 时，requests_total 这一族还不存在。
 func TestMetricsEndpoint(t *testing.T) {
 	h := newMetricsServer(t, fakeCapacity{
-		usage: store.DiskUsage{Total: 1000, Free: 200, UsedRatio: 0.8, Available: true},
+		usage:       store.DiskUsage{Total: 1000, Free: 200, UsedRatio: 0.8, Available: true},
+		reclaimable: 640,
 		scrub: store.ScrubStats{
 			ScannedObjects: 7,
 			CorruptObjects: 1,
@@ -87,6 +90,7 @@ func TestMetricsEndpoint(t *testing.T) {
 		"blink_disk_total_bytes 1000",
 		"blink_disk_free_bytes 200",
 		"blink_disk_write_blocked 0",
+		"blink_disk_reclaimable_bytes 640",
 		"blink_uptime_seconds",
 		"blink_build_info",
 		"blink_scrub_last_scanned_objects 7",
@@ -180,8 +184,9 @@ func TestMetricsNilRegistry(t *testing.T) {
 // TestReadyzDiskFields 验证 /readyz 忠实回显容量与水位。
 func TestReadyzDiskFields(t *testing.T) {
 	h := newMetricsServer(t, fakeCapacity{
-		usage:   store.DiskUsage{Total: 1000, Free: 100, UsedRatio: 0.9, Available: true},
-		blocked: true,
+		usage:       store.DiskUsage{Total: 1000, Free: 100, UsedRatio: 0.9, Available: true},
+		blocked:     true,
+		reclaimable: 4096,
 	})
 
 	rec := serve(h, httptest.NewRequest(http.MethodGet, "/readyz", nil))
@@ -196,13 +201,14 @@ func TestReadyzDiskFields(t *testing.T) {
 		t.Error("满盘不应影响 ready")
 	}
 	want := readyzDisk{
-		Available:     true,
-		TotalBytes:    1000,
-		FreeBytes:     100,
-		UsedRatio:     0.9,
-		HighWatermark: 0.90,
-		LowWatermark:  0.85,
-		WriteBlocked:  true,
+		Available:        true,
+		TotalBytes:       1000,
+		FreeBytes:        100,
+		UsedRatio:        0.9,
+		HighWatermark:    0.90,
+		LowWatermark:     0.85,
+		WriteBlocked:     true,
+		ReclaimableBytes: 4096,
 	}
 	if out.Disk != want {
 		t.Errorf("disk = %+v\n期望 %+v", out.Disk, want)

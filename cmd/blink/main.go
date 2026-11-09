@@ -150,6 +150,7 @@ func run(args []string, stderr io.Writer) error {
 		HighWatermark:       cfg.HighWatermark,
 		LowWatermark:        cfg.LowWatermark,
 		BucketTTL:           cfg.BucketTTL,
+		GCGrace:             cfg.GCGrace,
 	})
 	if err != nil {
 		return fmt.Errorf("打开存储失败: %w", err)
@@ -170,6 +171,8 @@ func run(args []string, stderr io.Writer) error {
 		// 具体的桶与时长在 config 的脱敏输出里，这里只给数量。
 		slog.Int("ttl_buckets", len(cfg.BucketTTL)),
 		slog.Duration("ttl_sweep_interval", cfg.TTLSweepInterval),
+		// 宽限期直接影响"删除对象后多久释放空间"，必须可追溯。
+		slog.Duration("gc_grace", st.GCGrace()),
 	)
 
 	// 存储后端按模式二选一：
@@ -268,6 +271,10 @@ func run(args []string, stderr io.Writer) error {
 	if len(cfg.BucketTTL) > 0 {
 		go runTTLSweeper(ctx, st, logger, cfg.TTLSweepInterval)
 	}
+	// 后台 CAS 回收。单机与集群模式都只回收**本机** CAS：集群里
+	// 远端节点各自回收自己的块，没有跨节点引用表（08 文档）。
+	// 启动后立即跑一轮，让上一次进程残留的孤儿块尽快得到统计与回收。
+	go runGarbageCollector(ctx, st, logger, cfg.GCInterval)
 
 	serveErr := make(chan error, len(servers))
 	for _, s := range servers {
@@ -555,4 +562,56 @@ func trimNewline(b []byte) []byte {
 // newServeErrorLog 构造 http.Server.ErrorLog 所需的 *log.Logger。
 func newServeErrorLog(logger *slog.Logger) *log.Logger {
 	return log.New(slogWriter{logger: logger}, "", 0)
+}
+
+// runGarbageCollector 周期回收本机 CAS 中不再被元数据引用的块。
+//
+// interval <= 0 表示禁用后台回收：写入路径不再产生任何后台 I/O，
+// 空间由外部调度器调用 SweepGarbage 释放。禁用是显式配置而不是
+// "间隔极小"的副作用，因此单独记一条日志。
+func runGarbageCollector(ctx context.Context, st *store.Store, logger *slog.Logger, interval time.Duration) {
+	if interval <= 0 {
+		logger.Info("gc_disabled",
+			slog.String("detail", "后台 CAS 回收已禁用；删除对象不会自动释放空间"),
+		)
+		return
+	}
+
+	sweep := func() {
+		logger.Info("gc_started", slog.Duration("grace", st.GCGrace()))
+		stats, err := st.SweepGarbage()
+		if err != nil {
+			// 失败时整轮不删任何块（fail-closed），但已经统计出的
+			// 可回收字节仍然有效，一并输出便于判断是"元数据损坏"
+			// 还是"文件系统错误"。
+			logger.Error("gc_failed",
+				slog.String("error", err.Error()),
+				slog.Int64("reclaimable_bytes", stats.ReclaimableBytes),
+				slog.Duration("duration", stats.Duration),
+			)
+			return
+		}
+		logger.Info("gc_completed",
+			slog.Int("scanned_blocks", stats.ScannedBlocks),
+			slog.Int("referenced_blocks", stats.ReferencedBlocks),
+			slog.Int64("reclaimable_bytes", stats.ReclaimableBytes),
+			slog.Int("reclaimed_blocks", stats.ReclaimedBlocks),
+			slog.Int64("reclaimed_bytes", stats.ReclaimedBytes),
+			slog.Duration("duration", stats.Duration),
+		)
+	}
+
+	// 先同步跑一轮：上一次进程 SIGKILL 留下的孤儿块不必等满一个周期。
+	sweep()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
 }

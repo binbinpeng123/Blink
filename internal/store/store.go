@@ -58,6 +58,11 @@ type Options struct {
 	LowWatermark float64
 	// DiskSpace 测量根目录所在文件系统的容量；nil 时用 syscall.Statfs。
 	DiskSpace DiskSpace
+	// GCGrace 是 CAS 块在"未被任何元数据引用"之后仍保留的时间。
+	//
+	// 必须为正：宽限期覆盖"块已落盘、引用它的 meta.json 尚未提交"的窗口，
+	// 以及集群远端节点的提交延迟。零值取默认 1 小时，负值拒绝启动。
+	GCGrace time.Duration
 }
 
 // Store 是对象存储引擎的入口。
@@ -129,6 +134,22 @@ type Store struct {
 	// lastTTLSweep 保存最近一轮成功完成的过期对象清扫摘要，见 ttl.go。
 	// 与 lastScrub 同理：写方是低频后台任务，读方是 /metrics 抓取。
 	lastTTLSweep atomic.Pointer[TTLSweepStats]
+
+	// GC 状态，见 gc.go。
+	//
+	// gcMu 的读写顺序是并发正确性的核心：写路径持读锁 pin 块并刷新 mtime，
+	// 清扫阶段持写锁删除，因此"pin 一个正在被检查的块"与"删除它"不会交错。
+	gcMu sync.RWMutex
+	// pending 记录本进程内已落盘但尚未被元数据引用的块（hash → 引用计数）。
+	// 由 pendingMu 保护；gcMu 写锁下读取它，见 isPinned。
+	pendingMu sync.Mutex
+	pending   map[string]int
+	// gcRunMu 防止后台 GC 与手工 SweepGarbage 并发执行（两轮标记会互相
+	// 看不到对方的 pin，虽然宽限期兜底，但没必要冒这个风险）。
+	gcRunMu sync.Mutex
+	gcGrace time.Duration
+	// reclaimable 是最近一轮扫描中"未被引用"的块字节数（含宽限期与 pin 中）。
+	reclaimable atomic.Int64
 }
 
 // CleanupError 返回启动时清扫失败的详情（没有失败则为 nil）。
@@ -177,6 +198,14 @@ func Open(opt Options) (*Store, error) {
 	if inline < 0 {
 		inline = 0
 	}
+	gcGrace := opt.GCGrace
+	switch {
+	case gcGrace < 0:
+		return nil, fmt.Errorf("store: GC 宽限期 %v 不能为负", gcGrace)
+	case gcGrace == 0:
+		gcGrace = defaultGCGrace
+	}
+
 	if inline > blockSize {
 		// 阈值越过块边界没有意义：一个块之内已经没有"再分片"可言。
 		// 宁可拒绝启动，也不静默截断成 blockSize —— 那会让运维以为
@@ -224,6 +253,8 @@ func Open(opt Options) (*Store, error) {
 		cors:            make(map[string]*CORSConfiguration),
 		metaCache:       newObjectMetaCache(defaultMetaCacheBytes, defaultMetaCacheEntries),
 		locks:           newKeyLocker(),
+		pending:         make(map[string]int),
+		gcGrace:         gcGrace,
 	}
 
 	// 水位只在启用时校验；high<=0 表示明确关闭容量保护。
