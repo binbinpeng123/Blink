@@ -213,6 +213,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		ReplaceMetadata: replace,
 		ContentType:     r.Header.Get("Content-Type"),
 		UserMeta:        userMetadata(r.Header),
+		HTTPMeta:        objectHTTPMeta(r.Header),
 		IfNoneMatchAny:  cond.ifNoneMatchAny,
 		IfMatchETag:     cond.ifMatchETag,
 		IfMatchAny:      cond.ifMatchAny,

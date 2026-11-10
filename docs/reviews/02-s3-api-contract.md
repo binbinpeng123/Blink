@@ -174,9 +174,9 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 
 ### GetObject / HeadObject
 
-- 响应头：`Content-Length`、`Content-Type`（默认 `application/octet-stream`）、`ETag`、`Last-Modified`、`Accept-Ranges: bytes`、`x-amz-meta-*`、`x-amz-storage-class`。
+- 响应头：`Content-Length`、`Content-Type`（默认 `application/octet-stream`）、`ETag`、`Last-Modified`、`Accept-Ranges: bytes`、`x-amz-meta-*`、`x-amz-storage-class`，以及对象上已持久化的标准 HTTP 元数据（`Cache-Control`、`Content-Disposition`、`Content-Encoding`、`Content-Language`、`Expires`，见「对象属性语义」）。
 - **Range**：支持 `bytes=start-end`、`bytes=start-`、`bytes=-suffix`；越界 → `416` 且带 `Content-Range: bytes */<size>`；多区间 → `501`。
-- **条件请求**：`If-Match` 不匹配 → `412`；`If-None-Match` 匹配 → `304`（带 ETag、无体）；`If-Modified-Since` 未修改 → `304`；`If-Unmodified-Since` 已修改 → `412`。
+- **条件请求**：`If-Match` 不匹配 → `412`；`If-None-Match` 匹配 → `304`（带 ETag、无体）；`If-Modified-Since` 未修改 → `304`；`If-Unmodified-Since` 已修改 → `412`。`304` 额外回传 `Cache-Control` 与 `Expires`（RFC 7232 要求影响缓存判定的头保持一致）。
 - `ChecksumMode: ENABLED` → 必须回传 checksum 头，并同时回传 `x-amz-checksum-type`。
 - **部分响应（206）不回传任何 checksum 头**：存储的是整个对象的校验和，附在一段字节上会让按规范校验的客户端判定为不匹配。实测 `aws s3 cp` 下载 12 MiB 对象发出两个 Range 请求（`0-8388607`、`8388608-12582911`），依赖的正是这一条。
 - 空对象必须显式 `Content-Length: 0`，不发送 `Transfer-Encoding: chunked`。
@@ -223,7 +223,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 
 - 源路径格式：`/{srcBucket}/{srcKey}` 或 `{srcBucket}/{srcKey}`，按 URL 路径规则解码；先按**未解码**的路径切分桶与 key，`%2F` 不会被误判为分隔符。
 - 带 `?versionId` → `501 NotImplemented`（无版本控制，不静默忽略）。
-- 元数据指令：`x-amz-metadata-directive` 为空或 `COPY` 时保留源 `Content-Type` 与 `x-amz-meta-*`；`REPLACE` 时以请求头为准，缺省 `Content-Type` 落 `application/octet-stream`；其他值 → `400 InvalidArgument`。
+- 元数据指令：`x-amz-metadata-directive` 为空或 `COPY` 时保留源 `Content-Type`、`x-amz-meta-*` 与标准 HTTP 元数据（`Cache-Control` 等）；`REPLACE` 时以请求头为准，**请求里没带的标准 HTTP 元数据会被清空**（而不是沿用源对象），缺省 `Content-Type` 落 `application/octet-stream`；其他值 → `400 InvalidArgument`。
 - 源条件：`x-amz-copy-source-if-match` / `if-none-match` / `if-modified-since` / `if-unmodified-since`，不满足 → `412 PreconditionFailed`；源不存在时优先 `404 NoSuchKey`。
 - 目标条件：与 PutObject 同一套规则 —— `If-None-Match: *` 与 `If-Match`（单个 ETag 或 `*`），在存储层目标 key 锁内判定；不满足 → `412 PreconditionFailed`，非法多值 → `400 InvalidArgument`。目标上的墓碑与已过期对象同样视为不存在。
 - 自复制：源与目标相同且 `COPY` → `400 InvalidRequest`；`REPLACE` 允许，用于原地更新元数据。
@@ -255,6 +255,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 
 - `UploadId` 使用 `crypto/rand` 生成。
 - `CreateMultipartUpload` 必须持久化客户端声明的 checksum 算法，它决定后续分片与完成的校验行为。
+- `CreateMultipartUpload` 同时持久化 `Content-Type`、`x-amz-meta-*` 与标准 HTTP 元数据（`Cache-Control` 等）到会话状态，`Complete` 时原样写入对象元数据。分片请求（`UploadPart`）上的同名头**不参与**对象元数据：一次会话只有一个最终对象，属性只能在 Initiate 时声明一次。
 - `UploadPart`：`partNumber` 范围 1–10000；除最后一个分片外，每片不小于 5 MiB。
 - `UploadPartCopy`：与 `UploadPart` 同路由，以 `x-amz-copy-source` 非空为唯一判据分流。支持 `x-amz-copy-source-range: bytes=first-last`（两端必填，不支持开放/后缀/多区间）；缺省复制整个源对象。源条件与 CopyObject 同一套 `x-amz-copy-source-if-*`；源不存在 → `404 NoSuchKey`；区间越界 → `416 InvalidRange` 且带 `Content-Range: bytes */<源大小>`；单次复制 > 5 GiB → `400 InvalidRequest`。响应 `<CopyPartResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyPartResult>`，ETag 按目标分片内容重算，与随后 `ListParts` 一致。
 - 单机与集群的 `UploadPartCopy` 都走 `OpenObject` + `io.Pipe` + `UploadPart`：**不是零拷贝**，数据经协调者读一次、写一次（与集群 CopyObject 同理）。
@@ -321,6 +322,13 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 | `Content-Type` | 客户端提供，否则默认 `application/octet-stream` |
 | 用户元数据 | `x-amz-meta-*`，键大小写不敏感（Go 的 `http.Header` 会规范成 `X-Amz-Meta-Owner`），**响应必须以全小写头名回传**。实测 botocore 按原始大小写匹配 `x-amz-meta-` 前缀，规范化后的大写头会被解析成 `Metadata.Owner` 而非 AWS 约定的 `Metadata.owner`，`--query Metadata.owner` 直接得到 `None`；真实 S3 返回的也是小写头名 |
 | `x-amz-storage-class` | 回传 `STANDARD` |
+| `Cache-Control` | 客户端提供则原样持久化并在 GET/HEAD 回传；不解释其语义 |
+| `Content-Disposition` | 同上。浏览器直接打开对象时的下载/展示行为依赖它（如 `attachment; filename="model.bin"`） |
+| `Content-Encoding` | 同上。`aws-chunked` 是 SigV4 传输层分块框架，**解帧后必须剥离**，其余编码（如 `gzip`）保留；多个编码按 `, ` 连接回传 |
+| `Content-Language` | 同上 |
+| `Expires` | 同上，保留客户端给出的 HTTP 日期文本（不解析、不重格式化），回传逐字节一致 |
+
+标准 HTTP 元数据随 `meta.json` 持久化（字段见 03 文档），PUT/CopyObject/分片上传三条写路径行为一致；为空时不写入 JSON，也不在响应里回传空头。
 
 ## 一致性语义
 

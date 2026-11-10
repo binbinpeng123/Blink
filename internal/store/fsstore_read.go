@@ -74,6 +74,7 @@ func objectInfoFromMeta(m *objectMeta) ObjectInfo {
 		Modified:          m.Modified,
 		ContentType:       m.ContentType,
 		UserMeta:          m.UserMeta,
+		HTTPMeta:          m.HTTPMeta,
 		Checksum:          m.Checksum,
 		ChecksumAlgorithm: checksum.Algorithm(m.ChecksumAlgorithm),
 		ChecksumType:      m.ChecksumType,

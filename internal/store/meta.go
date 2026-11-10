@@ -147,6 +147,29 @@ func (s *Store) dropBucketMeta(bucket string) {
 	delete(s.buckets, bucket)
 }
 
+// HTTPMeta 是 S3 的“标准 HTTP 元数据”：随对象持久化，并在 GET/HEAD
+// 原样回传的 HTTP 头。与 x-amz-meta-* 用户元数据不同，这些头有协议语义
+// （缓存策略、内容编码、浏览器行为），静默丢弃会让 CDN/浏览器与 AI
+// 推理客户端拿到与上传时不一致的对象。
+//
+// 单独成类型是为了让 Put/Copy/MPU 各条路径只搬运一个结构体，
+// 避免每加一个头都要在五处复制粘贴。
+type HTTPMeta struct {
+	CacheControl       string `json:"cache_control,omitempty"`
+	ContentDisposition string `json:"content_disposition,omitempty"`
+	ContentEncoding    string `json:"content_encoding,omitempty"`
+	ContentLanguage    string `json:"content_language,omitempty"`
+	// Expires 保留客户端给的 HTTP 日期文本，不解析成 time.Time：
+	// 回传必须逐字节一致，且 S3 本身不对该值做语义解释（只做缓存提示）。
+	Expires string `json:"expires,omitempty"`
+}
+
+// IsZero 报告是否所有标准 HTTP 元数据都为空。
+//
+// 部分写路径用它决定是否需要对“源对象元数据”做额外处理；空值时
+// 序列化也会因此整体省略，不改变已有 meta.json 的体积。
+func (m HTTPMeta) IsZero() bool { return m == HTTPMeta{} }
+
 // ObjectMeta 是对象目录下 meta.json 的内容，即 03 文档的字段表。
 //
 // 导出类型是集群层的需要：副本之间搬运的就是这份结构，集群模块必须能
@@ -180,6 +203,13 @@ type ObjectMeta struct {
 	ExpiresAt int64 `json:"expires_at,omitempty"`
 	// UserMeta 原样保存 x-amz-meta-* 的值。
 	UserMeta map[string]string `json:"user_meta,omitempty"`
+	// HTTPMeta 保存 S3 的“标准 HTTP 元数据”（Cache-Control 等），
+	// GET/HEAD 原样回传。字段为空时序列化会整体省略。
+	//
+	// 匿名内嵌让 JSON 保持扁平，旧二进制读到新 meta.json 会忽略这些
+	// 未知字段，新二进制读到旧 meta.json 得到零值 —— 与其它可选字段
+	// 一样不提升 format_version。
+	HTTPMeta
 	// Blocks 是**有序**块描述列表：顺序即对象内容的顺序。
 	Blocks []BlockDesc `json:"blocks"`
 	// Checksum 是客户端声明的对象级校验和（base64）；未声明时为空。

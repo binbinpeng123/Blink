@@ -72,6 +72,7 @@ func (c *Cluster) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt st
 	putOpt := store.PutOptions{
 		ContentType:    info.ContentType,
 		UserMeta:       info.UserMeta,
+		HTTPMeta:       info.HTTPMeta,
 		IfNoneMatchAny: opt.IfNoneMatchAny,
 		IfMatchETag:    opt.IfMatchETag,
 		IfMatchAny:     opt.IfMatchAny,
@@ -80,6 +81,8 @@ func (c *Cluster) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt st
 	if opt.ReplaceMetadata {
 		putOpt.ContentType = opt.ContentType
 		putOpt.UserMeta = opt.UserMeta
+		// REPLACE 与单机路径语义一致：缺省的标准 HTTP 元数据要清空。
+		putOpt.HTTPMeta = opt.HTTPMeta
 	}
 	// 不传 ChecksumAlgorithm：集群路径重新切块、重新计算 ETag，源的
 	// FULL_OBJECT 校验和虽然仍然成立，但 COMPOSITE（分片上传产生）的

@@ -65,6 +65,11 @@
 | `content_type` | MIME 类型 |
 | `modified` | 最后修改时间（UTC） |
 | `user_meta` | `x-amz-meta-*` 键值对 |
+| `cache_control` | 标准 HTTP 元数据：`Cache-Control` 原文 |
+| `content_disposition` | 标准 HTTP 元数据：`Content-Disposition` 原文 |
+| `content_encoding` | 标准 HTTP 元数据：解帧后的 `Content-Encoding`（不含 `aws-chunked`） |
+| `content_language` | 标准 HTTP 元数据：`Content-Language` 原文 |
+| `expires` | 标准 HTTP 元数据：`Expires` 原文（HTTP 日期文本，不解析） |
 | `blocks` | 有序块描述列表（每条含块哈希、偏移、长度） |
 | `checksum` | 对象级校验和（算法按客户端声明） |
 | `node_id` | 写入节点（v0.2.0 起作为冲突决胜字段） |
@@ -74,6 +79,8 @@
 | `ec` | EC 布局：`{k, m, group}`，仅在 `layout:"ec"` 时存在 |
 
 `checksum` 与 `checksum_algorithm` 需同时记录，以便 `ChecksumMode: ENABLED` 时正确回传。
+
+标准 HTTP 元数据在 `meta.json` 中与其它可选字段一样扁平存储，空值整体省略，因此**不提升 `format_version`**：旧二进制读到含这些字段的 `meta.json` 会忽略未知键，新二进制读到旧文件得到零值。分片上传的会话状态 `multipart/<uploadId>/upload.json` 使用同一组字段名，`Complete` 时把它们原样搬到对象元数据。
 
 ## 块策略
 
