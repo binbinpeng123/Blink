@@ -143,6 +143,9 @@ func objectMetaCost(m *ObjectMeta) int64 {
 		cost += int64(len(k) + len(v) + 32)
 	}
 	cost += int64(len(m.Blocks)) * 96
+	// 内联内容驻留在 meta 里：不计入成本会让缓存远超 maxBytes
+	// （4 KiB 上限下每条多出 4 KiB 数据，默认 4 MiB 缓存会被迅速挤空）。
+	cost += int64(len(m.InlineData))
 	if m.EC != nil {
 		cost += int64(64 + len(m.EC.Group)*24)
 	}

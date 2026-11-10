@@ -17,7 +17,7 @@ func clearEnv(t *testing.T) {
 		EnvNodeID, EnvClusterPeers, EnvInternalAddr, EnvClusterSecret,
 		EnvReplicaCount, EnvWriteQuorum, EnvReadQuorum, EnvVNodes,
 		EnvPeerTimeout, EnvVerifyRead, EnvCredentialsFile, EnvIntegrityInterval,
-		"BLINK_MAX_CLOCK_SKEW",
+		EnvInlineObjectMaxSize, "BLINK_MAX_CLOCK_SKEW",
 	} {
 		t.Setenv(k, "")
 	}
@@ -50,6 +50,9 @@ func TestLoadDefaults(t *testing.T) {
 		{"MaxClockSkew", cfg.MaxClockSkew, 15 * time.Minute},
 		{"BlockSize", cfg.BlockSize, int64(4 << 20)},
 		{"InlineThreshold", cfg.InlineThreshold, int64(64 << 10)},
+		// 服务端默认开启 4 KiB 内联：覆盖绝大多数 AI 边端的配置、
+		// prompt 片段与小 JSON 响应。
+		{"InlineObjectMaxSize", cfg.InlineObjectMaxSize, int64(4 << 10)},
 		{"HighWatermark", cfg.HighWatermark, 0.90},
 		{"LowWatermark", cfg.LowWatermark, 0.85},
 		{"MaxBucketCount", cfg.MaxBucketCount, 1000},
@@ -117,6 +120,30 @@ func TestEnvThenFlagPrecedence(t *testing.T) {
 	}
 }
 
+func TestInlineObjectMaxSizeEnvAndFlag(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvAccessKey, testAK)
+	t.Setenv(EnvSecretKey, testSK)
+	t.Setenv(EnvInlineObjectMaxSize, "2048")
+
+	cfg, err := Load(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.InlineObjectMaxSize != 2048 {
+		t.Errorf("环境变量未生效: %d", cfg.InlineObjectMaxSize)
+	}
+
+	// 命令行参数覆盖环境变量；0 表示关闭。
+	cfg, err = Load([]string{"--inline-object-max-size", "0"}, io.Discard)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.InlineObjectMaxSize != 0 {
+		t.Errorf("命令行未覆盖环境变量: %d", cfg.InlineObjectMaxSize)
+	}
+}
+
 func TestValidateRejectsBadValues(t *testing.T) {
 	cases := []struct {
 		name string
@@ -129,6 +156,8 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"集群模式非法", []string{"--cluster-mode", "gossip"}, "cluster-mode"},
 		{"块大小非正", []string{"--block-size", "0"}, "block-size"},
 		{"内联阈值大于块大小", []string{"--inline-threshold", "8388608", "--block-size", "1048576"}, "inline-threshold"},
+		{"内联对象上限为负", []string{"--inline-object-max-size", "-1"}, "inline-object-max-size"},
+		{"内联对象上限超过阈值", []string{"--inline-object-max-size", "131072"}, "inline-object-max-size"},
 		{"时钟容差非正", []string{"--max-clock-skew", "-1s"}, "max-clock-skew"},
 		{"监听地址为空", []string{"--addr", ""}, "监听地址"},
 	}

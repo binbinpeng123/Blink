@@ -282,6 +282,13 @@ func validateReplicaMeta(key string, m *ObjectMeta) error {
 		}
 		return nil
 	}
+	// 内联对象的内容随副本元数据一起搬运：接收端必须确认结构与长度自洽，
+	// 否则会落下一份"块表指向 CAS、实际数据在 meta"的矛盾元数据。
+	if m.Layout == LayoutInline {
+		if err := validateInlineMeta(m); err != nil {
+			return err
+		}
+	}
 	if m.ETag == "" {
 		return fmt.Errorf("%w: 缺少 ETag", ErrCorrupt)
 	}
@@ -363,7 +370,9 @@ func validateParts(m *ObjectMeta) error {
 // 让截断错误的分片进入 CAS，直到读取时才以哈希不符暴露。
 func validateECMeta(m *ObjectMeta) error {
 	switch m.Layout {
-	case "", LayoutReplica:
+	case "", LayoutReplica, LayoutInline:
+		// 内联布局的内容同样在单块里，不带 EC 分片；结构自洽性已由
+		// validateInlineMeta 校验，这里只补上"不得携带 ec 信息"这一条。
 		if m.EC != nil {
 			return fmt.Errorf("%w: 副本布局不应携带 ec 信息", ErrCorrupt)
 		}

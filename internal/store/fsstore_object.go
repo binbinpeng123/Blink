@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -165,9 +166,38 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 		return nil, err
 	}
 
-	res, err := s.streamBlocks(body, opt.ChecksumAlgorithm, key, opt.ExpectedSize)
-	if err != nil {
-		return nil, err
+	// 内联快路径（创新 D0）：声明长度不超过上限时，先把内容读进内存。
+	//
+	// 只有长度**恰好**等于声明值才走内联；少了或多了都把已读到的前缀
+	// 拼回请求体，交给普通流式路径产生与以前完全相同的错误
+	// （ErrIncompleteBody），不能因为"试过内联"而改变失败语义。
+	//
+	// 上限本身不大于 InlineThreshold 与 BlockSize，因此内联对象必然只有
+	// 一个块。多读一个字节（+1）专门用来识别"声明 4 KiB、实际更多"。
+	var (
+		res        *streamResult
+		inlineData []byte
+	)
+	if s.inlineObjectMax > 0 && opt.ExpectedSize > 0 && opt.ExpectedSize <= s.inlineObjectMax {
+		prefix, rerr := io.ReadAll(io.LimitReader(body, opt.ExpectedSize+1))
+		if rerr != nil {
+			return nil, fsErr("读取请求体", key, rerr)
+		}
+		if int64(len(prefix)) == opt.ExpectedSize {
+			res, err = s.hashInline(prefix, opt.ChecksumAlgorithm, key)
+			if err != nil {
+				return nil, err
+			}
+			inlineData = prefix
+		} else {
+			body = io.MultiReader(bytes.NewReader(prefix), body)
+		}
+	}
+	if res == nil {
+		res, err = s.streamBlocks(body, opt.ChecksumAlgorithm, key, opt.ExpectedSize)
+		if err != nil {
+			return nil, err
+		}
 	}
 	blocks, total, etag := res.blocks, res.size, res.etag
 	deduped := res.deduped
@@ -218,6 +248,12 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 		ChecksumType:      checksumType,
 		NodeID:            s.nodeID,
 		ObjVersion:        1,
+	}
+	if inlineData != nil {
+		// 块描述保留（Hash=内容 SHA-256），让旧二进制能按块表找到
+		// 同等内容或明确报损坏；新二进制按 Layout 直接读 InlineData。
+		meta.Layout = LayoutInline
+		meta.InlineData = inlineData
 	}
 	if prev != nil {
 		meta.ObjVersion = prev.ObjVersion + 1

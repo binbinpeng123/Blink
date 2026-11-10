@@ -200,11 +200,26 @@ type ObjectMeta struct {
 	// 墓碑只有版本，没有内容：Size=0、Blocks 为空、ETag/ContentType 为空。
 	// 物理回收由后续切片的确定性 owner 在确认全副本不旧于墓碑后完成。
 	Deleted bool `json:"deleted,omitempty"`
-	// Layout 标记对象的数据布局："" 或 "replica" 为多副本，"ec" 为纠删码。
+	// Layout 标记对象的数据布局："" 或 "replica" 为多副本，"ec" 为纠删码，
+	// "inline" 表示内容直接内联在 InlineData 中。
 	//
 	// 空字符串是多副本的历史写法，必须继续接受：升级前写入的对象没有
 	// 这个字段，读到它们不能报错。
 	Layout string `json:"layout,omitempty"`
+	// InlineData 是内联对象的完整内容，仅 Layout==LayoutInline 时非空。
+	//
+	// 为什么值得把数据放进元数据文件：块文件与 meta.json 各自需要一次
+	// write+fsync+rename+dirsync，小对象的一半持久化成本花在"数据文件"
+	// 上；合并后对象由一次 rename 提交，块文件那一次完全消失。
+	// 代价是 meta.json 变大（base64 膨胀 4/3），LIST 读取量随之增加 ——
+	// 默认上限刻意压到 4 KiB，见 docs/03 的基准与取舍说明。
+	//
+	// 内联对象仍然保留**恰好一个** BlockDesc（Hash 是内容的 SHA-256）。
+	// 旧二进制不认识 "inline" 布局，会按块表去 CAS 找这个哈希：命中说明
+	// 同等内容曾经以普通块写入过，读到的是完全相同的字节；未命中则明确
+	// 返回 ErrCorrupt，而不是把空内容当成合法对象。因此不需要提升
+	// format_version —— 失败是显式的，绝不会静默给出错误数据。
+	InlineData []byte `json:"inline_data,omitempty"`
 	// EC 仅在 Layout==LayoutEC 时非空，记录分片组与 (k,m) 参数。
 	//
 	// 同一对象的所有块共享同一个分片组：块是独立编码的，但落到哪
@@ -238,6 +253,8 @@ const (
 	LayoutReplica = "replica"
 	// LayoutEC 是纠删码布局。
 	LayoutEC = "ec"
+	// LayoutInline 表示对象内容内联在 meta.json 中（见 InlineData）。
+	LayoutInline = "inline"
 )
 
 // ECLayout 描述一个 EC 对象的分片组。

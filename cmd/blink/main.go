@@ -141,13 +141,14 @@ func run(args []string, stderr io.Writer) error {
 	// "存储不可用但 HTTP 起来了"会让所有请求拿到 500，
 	// 而运维很难从一堆 500 里看出根因是数据目录挂了。
 	st, err := store.Open(store.Options{
-		Root:            cfg.DataDir,
-		FsyncPolicy:     cfg.FsyncPolicy,
-		BlockSize:       cfg.BlockSize,
-		InlineThreshold: cfg.InlineThreshold,
-		VerifyOnRead:    cfg.VerifyOnRead,
-		HighWatermark:   cfg.HighWatermark,
-		LowWatermark:    cfg.LowWatermark,
+		Root:                cfg.DataDir,
+		FsyncPolicy:         cfg.FsyncPolicy,
+		BlockSize:           cfg.BlockSize,
+		InlineThreshold:     cfg.InlineThreshold,
+		InlineObjectMaxSize: cfg.InlineObjectMaxSize,
+		VerifyOnRead:        cfg.VerifyOnRead,
+		HighWatermark:       cfg.HighWatermark,
+		LowWatermark:        cfg.LowWatermark,
 	})
 	if err != nil {
 		return fmt.Errorf("打开存储失败: %w", err)
@@ -159,6 +160,9 @@ func run(args []string, stderr io.Writer) error {
 		slog.String("fsync_policy", cfg.FsyncPolicy),
 		slog.Int64("block_size", cfg.BlockSize),
 		slog.Int64("inline_threshold", cfg.InlineThreshold),
+		// 内联上限改变的是**小对象的落盘布局**，与块大小同理，
+		// 必须能从启动日志复原"这个对象为什么没有块文件"。
+		slog.Int64("inline_object_max_size", cfg.InlineObjectMaxSize),
 		// 校验读会影响读吞吐，属于"事后必须能从日志复原"的部署参数。
 		slog.Bool("verify_read", cfg.VerifyOnRead),
 	)

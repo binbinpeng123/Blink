@@ -212,7 +212,8 @@
 | **A. 内容寻址块 + 每块 CRC32C，跨桶/跨 key 天然去重** | ✅ 纳入 | 低（布局自带） | `BenchmarkDedupSecondCopy/1GiB` 断言写入字节数不增长 |
 | **B. 分片上传完成时仅串接块表，不重写数据** | ✅ 纳入 | 中 | `BenchmarkCompleteMultipart20GB` 断言耗时与写入量不随对象增长 |
 | **C. `sendfile` 零拷贝读路径 + 顺序预读** | ✅ 纳入 | 低 | `BenchmarkGetRangeSequential` 前后对照 |
-| **D. 小对象打包为只读 segment（needle 思路）** | ⏸ 未实施（性能切片 09 评估后仍延后） | 高 | `BenchmarkPutSmallObject10k`、`BenchmarkList100kObjects` 前后对照 |
+| **D0. 小对象内容内联进 `meta.json`** | ✅ 纳入（默认 ≤4 KiB，`0` 关闭） | 中 | `BenchmarkGetSmallInline`、`BenchmarkListSmallInline`、`BenchmarkPutSmallInline` 前后对照 |
+| **D. 小对象打包为只读 segment（needle 思路）** | ⏸ 未实施（D0 先落地的过渡方案） | 高 | `BenchmarkPutSmallObject10k`、`BenchmarkList100kObjects` 前后对照 |
 | **E. 批量写与非标准 API** | ❌ 不做 | — | 保持"任意 S3 客户端可用"，不引入非标准接口 |
 | **F. 预热 / pin 接口** | ❌ 不做 | — | 零拷贝与内核页缓存已使热点模型自然驻留 |
 | **F'. TTL bucket（中间结果自动过期）** | ⏸ 配置驱动的后台任务，切片 9 之后 | 低 | 属策略而非机制，不占用首个切片注意力 |
@@ -220,6 +221,54 @@
 **为什么创新 B 对边缘场景重要**：20 GiB 模型的分片上传若在完成时重写全部数据，在 eMMC/SD 卡上会产生数十 GiB 的额外写入（写放大），显著缩短介质寿命。仅串接块表可将完成操作的开销与对象大小解耦。
 
 **开发纪律**：创新 D 是唯一"必须先有基线基准数据、再决定是否合入"的项。任何没有前后 benchmark 对照的优化一律回滚。
+
+### 创新 D0：小对象内容内联（2026-11-10 落地）
+
+**动机**：边端 AI 负载里大量对象是 4 KiB 以下的配置、prompt 片段、推理结果与
+清单。它们走 CAS 时，一次 GET 仍要打开/`Stat` 一个块文件，一次 PUT 要写块文件
+再做一次持久化屏障；数据本身只有几 KiB，元数据与文件系统开销占了大头。
+
+**做法**：
+
+- `PutObject` 在 `0 < ExpectedSize <= InlineObjectMaxSize` 时先预读
+  `ExpectedSize+1` 字节。长度恰好匹配 → 内容只做 MD5/对象校验和/块哈希计算，
+  不写 CAS；长度不符 → `io.MultiReader(prefix, body)` 回退普通流式路径，保持
+  原有 `ErrIncompleteBody` 语义。
+- 内联对象在 `meta.json` 里新增 `inline_data` 字段（JSON 自动 base64），并保留
+  **恰好一个** `BlockDesc`：`Offset=0`、`Length=Size`、`Hash` 为内容的 SHA-256、
+  `CRC32C` 为内容的 Castagnoli 校验和。块表因此仍是"内容完整性凭据"的唯一来源，
+  读取、巡检、副本校验共用同一套判断。
+- 单次原子提交：内联对象只需 `writeFileAtomic(meta.json)` 一次；删除对象即随
+  目录释放内容，不产生需要 GC 的 CAS 块。
+- ETag 与对象级校验和复用 `StreamBlocksSized` 计算，保证同一份内容无论内联与否
+  都得到完全相同的 ETag。
+- 作用域仅限单机 `Store.PutObject`。集群写路径由 `cluster/write.go` 自行调用
+  `StreamBlocksSized`，不经过该分支；EC 与分片上传也不产生内联对象。
+  `clusterReader` 仍按块哈希向副本拉取，遇到内联 meta 会因 CAS 中不存在该块而
+  返回 `ErrCorrupt`（响亮失败，不会静默返回空对象）——这是把单机数据目录直接
+  接入集群的既有限制，不是本切片的支持范围。
+
+**旧版本兼容**：旧二进制忽略 `layout` 字段，按块表去 CAS 找那个 SHA-256。
+
+- 若同等内容曾以普通块写入并被去重命中，读到完全相同且正确的字节；
+- 否则 `copyBlockSegment` 返回 `ErrCorrupt`，不会静默返回空对象。
+
+因此不提升 `FormatVersion`（仍为 1）。这一行为由
+`TestInlineOldVersionCompatibility` 覆盖。
+
+**默认值与开关**：服务端默认 `4 KiB`（`--inline-object-max-size` /
+`BLINK_INLINE_OBJECT_MAX_SIZE`，`0` 关闭），且不得超过 `inline-threshold`。
+store 的 `Options` 零值关闭，避免影响直接调用方与既有测试。
+
+**代价（如实记录）**：内联内容以 base64 存入 `meta.json`，文件按 4/3 膨胀；
+LIST 必须读取每个对象的全部元数据，因此内联对象越多、内容越大，LIST 的单次
+耗时越高。本机 1000 个 1 KiB 对象 LIST 从 16.1–16.3 ms 升至 18.2–19.1 ms
+（+14%～17%），4 KiB 对象为 16.3–16.8 ms → 18.7–19.7 ms（+15%～18%）。收益
+与代价的取舍、以及为什么仍默认开启，见 09 文档。
+
+**回滚条件**：内联读写/复制/巡检/副本元数据任一致性测试失败，或内联对象的
+ETag 与同一内容的普通对象不一致，或 LIST 回退超过 25%（以
+`BenchmarkListSmallCAS` 与 `BenchmarkListSmallInline` 同机对照为准）。
 
 ## 分布式扩展点（v0.2.0 已落地）
 

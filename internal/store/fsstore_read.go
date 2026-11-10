@@ -97,6 +97,22 @@ func (r *ObjectReader) WriteRangeTo(w io.Writer, offset, length int64) error {
 	}
 
 	end := offset + length
+
+	// 内联对象：内容就在 meta 快照里，直接切片写出，没有 CAS 打开/Stat
+	// 与 sendfile 路径可走。范围校验已在上面完成，这里只防御元数据与
+	// 内容不自洽的情况 —— 那必须是 ErrCorrupt，不能把短内容当合法对象。
+	if r.meta.Layout == LayoutInline {
+		if r.s.verifyOnRead {
+			if err := verifyInlineContent(r.meta); err != nil {
+				return err
+			}
+		} else if err := validateInlineMeta(r.meta); err != nil {
+			return err
+		}
+		_, err := w.Write(r.meta.InlineData[offset:end])
+		return err
+	}
+
 	// 块表按 Offset 升序（写路径按顺序追加），用二分找到第一个可能
 	// 覆盖 offset 的块。对象可能有上万个块，线性扫描在 Range 请求上
 	// 不值得。
