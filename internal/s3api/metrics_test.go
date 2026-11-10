@@ -19,11 +19,13 @@ type fakeCapacity struct {
 	usage   store.DiskUsage
 	blocked bool
 	scrub   store.ScrubStats
+	ttl     store.TTLSweepStats
 }
 
-func (f fakeCapacity) DiskUsage() store.DiskUsage  { return f.usage }
-func (f fakeCapacity) WriteBlocked() bool          { return f.blocked }
-func (f fakeCapacity) LastScrub() store.ScrubStats { return f.scrub }
+func (f fakeCapacity) DiskUsage() store.DiskUsage        { return f.usage }
+func (f fakeCapacity) WriteBlocked() bool                { return f.blocked }
+func (f fakeCapacity) LastScrub() store.ScrubStats       { return f.scrub }
+func (f fakeCapacity) LastTTLSweep() store.TTLSweepStats { return f.ttl }
 
 func newMetricsServer(t *testing.T, capacity Capacity) http.Handler {
 	t.Helper()
@@ -51,6 +53,15 @@ func TestMetricsEndpoint(t *testing.T) {
 			CorruptObjects: 1,
 			Duration:       2 * time.Second,
 			FinishedAt:     time.Unix(1_700_000_000, 0).UTC(),
+		},
+		ttl: store.TTLSweepStats{
+			Buckets:        1,
+			ExpiredObjects: 5,
+			DeletedObjects: 3,
+			SkippedObjects: 1,
+			FailedObjects:  1,
+			Duration:       500 * time.Millisecond,
+			FinishedAt:     time.Unix(1_700_000_010, 0).UTC(),
 		},
 	})
 
@@ -82,6 +93,12 @@ func TestMetricsEndpoint(t *testing.T) {
 		"blink_scrub_last_corrupt_objects 1",
 		"blink_scrub_last_duration_seconds 2",
 		"blink_scrub_last_completed_timestamp_seconds 1.7e+09",
+		"blink_ttl_last_expired_objects 5",
+		"blink_ttl_last_deleted_objects 3",
+		"blink_ttl_last_skipped_objects 1",
+		"blink_ttl_last_failed_objects 1",
+		"blink_ttl_last_duration_seconds 0.5",
+		"blink_ttl_last_completed_timestamp_seconds 1.70000001e+09",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("指标输出缺少 %q\n%s", want, body)
@@ -119,6 +136,12 @@ func TestMetricsScrubNeverRan(t *testing.T) {
 		"blink_scrub_last_corrupt_objects 0",
 		"blink_scrub_last_duration_seconds 0",
 		"blink_scrub_last_completed_timestamp_seconds 0",
+		"blink_ttl_last_expired_objects 0",
+		"blink_ttl_last_deleted_objects 0",
+		"blink_ttl_last_skipped_objects 0",
+		"blink_ttl_last_failed_objects 0",
+		"blink_ttl_last_duration_seconds 0",
+		"blink_ttl_last_completed_timestamp_seconds 0",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("指标输出缺少 %q\n%s", want, body)

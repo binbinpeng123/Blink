@@ -105,6 +105,11 @@ func (s *Store) ListObjects(bucket string, opt ListOptions) (*ListResult, error)
 			// 被副本引擎写入：墓碑对用户不可见，与"已删除"完全等价。
 			continue
 		}
+		if s.expiredAt(e.ExpiresAt) {
+			// 惰性过期：后台清扫可能尚未删除目录，但对象在逻辑上
+			// 已经不存在，LIST 不得返回它。
+			continue
+		}
 		objs = append(objs, ListObject{
 			Key:      e.Key,
 			Size:     e.Size,
@@ -218,13 +223,16 @@ func pastCursor(key string, opt ListOptions) bool {
 // 这不改变"目录布局是稳定契约"这一事实：字段名与 objectMeta 一致，
 // 缺字段/字段类型错误照样在解码时失败并报 ErrCorrupt。
 type ReplicaEntry struct {
-	Key        string    `json:"key"`
-	Size       int64     `json:"size"`
-	ETag       string    `json:"etag"`
-	Modified   time.Time `json:"modified"`
-	NodeID     string    `json:"node_id"`
-	ObjVersion uint64    `json:"obj_version"`
-	Deleted    bool      `json:"deleted,omitempty"`
+	Key      string    `json:"key"`
+	Size     int64     `json:"size"`
+	ETag     string    `json:"etag"`
+	Modified time.Time `json:"modified"`
+	// ExpiresAt 与 ObjectMeta 同名同义：Unix 秒，0 表示永不过期。
+	// LIST 过滤与 TTL 清扫都要用它，因此必须出现在部分字段解码里。
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
+	NodeID     string `json:"node_id"`
+	ObjVersion uint64 `json:"obj_version"`
+	Deleted    bool   `json:"deleted,omitempty"`
 }
 
 // ScanReplicaEntries 读出桶内全部副本条目，**包含 tombstone**。

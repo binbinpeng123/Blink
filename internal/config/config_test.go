@@ -17,7 +17,8 @@ func clearEnv(t *testing.T) {
 		EnvNodeID, EnvClusterPeers, EnvInternalAddr, EnvClusterSecret,
 		EnvReplicaCount, EnvWriteQuorum, EnvReadQuorum, EnvVNodes,
 		EnvPeerTimeout, EnvVerifyRead, EnvCredentialsFile, EnvIntegrityInterval,
-		EnvInlineObjectMaxSize, "BLINK_MAX_CLOCK_SKEW",
+		EnvInlineObjectMaxSize, EnvBucketTTL, EnvTTLSweepInterval,
+		"BLINK_MAX_CLOCK_SKEW",
 	} {
 		t.Setenv(k, "")
 	}
@@ -58,6 +59,10 @@ func TestLoadDefaults(t *testing.T) {
 		{"MaxBucketCount", cfg.MaxBucketCount, 1000},
 		// 校验读默认关闭：保留 sendfile 零拷贝路径。
 		{"VerifyOnRead", cfg.VerifyOnRead, false},
+		// TTL 默认不启用任何桶，但清扫周期有默认值：运维一旦配置
+		// bucket-ttl，不需要再记一个必须同时打开的开关。
+		{"TTLSweepInterval", cfg.TTLSweepInterval, DefaultTTLSweepInterval},
+		{"BucketTTL", len(cfg.BucketTTL), 0},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -144,6 +149,58 @@ func TestInlineObjectMaxSizeEnvAndFlag(t *testing.T) {
 	}
 }
 
+// TestBucketTTLConfig 覆盖桶级 TTL 的环境变量、命令行覆盖与脱敏输出。
+func TestBucketTTLConfig(t *testing.T) {
+	clearEnv(t)
+	t.Setenv(EnvAccessKey, testAK)
+	t.Setenv(EnvSecretKey, testSK)
+	t.Setenv(EnvBucketTTL, "cache=30m")
+	t.Setenv(EnvTTLSweepInterval, "10s")
+
+	cfg, err := Load(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if got := cfg.BucketTTL["cache"]; got != 30*time.Minute {
+		t.Errorf("BucketTTL[cache] = %v，期望 30m", got)
+	}
+	if cfg.TTLSweepInterval != 10*time.Second {
+		t.Errorf("TTLSweepInterval = %v，期望 10s", cfg.TTLSweepInterval)
+	}
+
+	// 命令行整体覆盖环境变量，而不是与它合并：同一个桶出现在两处时，
+	// 合并语义会让"最终生效的 TTL"取决于来源优先级之外的东西。
+	cfg, err = Load([]string{
+		"--bucket-ttl", "models=24h,tmp=5m",
+		"--ttl-sweep-interval", "0s",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if len(cfg.BucketTTL) != 2 {
+		t.Fatalf("命令行应整体覆盖环境变量，实际 %v", cfg.BucketTTL)
+	}
+	if got := cfg.BucketTTL["models"]; got != 24*time.Hour {
+		t.Errorf("BucketTTL[models] = %v，期望 24h", got)
+	}
+	if _, ok := cfg.BucketTTL["cache"]; ok {
+		t.Error("环境变量中的 cache 不应残留")
+	}
+	// 0 是合法值：只禁用后台清扫，惰性过期仍然生效。
+	if cfg.TTLSweepInterval != 0 {
+		t.Errorf("TTLSweepInterval = %v，期望 0", cfg.TTLSweepInterval)
+	}
+
+	// 脱敏输出必须是稳定顺序，便于日志比对。
+	red := cfg.Redacted()
+	if got, want := red["bucket_ttl"], "models=24h0m0s,tmp=5m0s"; got != want {
+		t.Errorf("bucket_ttl = %q，期望 %q", got, want)
+	}
+	if got := red["ttl_sweep_interval_sec"]; got != "0" {
+		t.Errorf("ttl_sweep_interval_sec = %q，期望 0", got)
+	}
+}
+
 func TestValidateRejectsBadValues(t *testing.T) {
 	cases := []struct {
 		name string
@@ -160,6 +217,12 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"内联对象上限超过阈值", []string{"--inline-object-max-size", "131072"}, "inline-object-max-size"},
 		{"时钟容差非正", []string{"--max-clock-skew", "-1s"}, "max-clock-skew"},
 		{"监听地址为空", []string{"--addr", ""}, "监听地址"},
+		{"TTL 缺少等号", []string{"--bucket-ttl", "models,1h"}, "缺少 '='"},
+		{"TTL 桶名为空", []string{"--bucket-ttl", "=1h"}, "桶名"},
+		{"TTL 时长无法解析", []string{"--bucket-ttl", "models=1hour"}, "无法解析"},
+		{"TTL 时长非正", []string{"--bucket-ttl", "models=0s"}, "必须为正数"},
+		{"TTL 重复桶", []string{"--bucket-ttl", "models=1h,models=2h"}, "重复配置"},
+		{"TTL 集群模式", []string{"--cluster-mode", "cluster", "--bucket-ttl", "models=1h"}, "bucket-ttl 只支持单机模式"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -149,6 +149,7 @@ func run(args []string, stderr io.Writer) error {
 		VerifyOnRead:        cfg.VerifyOnRead,
 		HighWatermark:       cfg.HighWatermark,
 		LowWatermark:        cfg.LowWatermark,
+		BucketTTL:           cfg.BucketTTL,
 	})
 	if err != nil {
 		return fmt.Errorf("打开存储失败: %w", err)
@@ -165,6 +166,10 @@ func run(args []string, stderr io.Writer) error {
 		slog.Int64("inline_object_max_size", cfg.InlineObjectMaxSize),
 		// 校验读会影响读吞吐，属于"事后必须能从日志复原"的部署参数。
 		slog.Bool("verify_read", cfg.VerifyOnRead),
+		// TTL 桶决定"数据为什么会自己消失"，必须能从启动日志复原；
+		// 具体的桶与时长在 config 的脱敏输出里，这里只给数量。
+		slog.Int("ttl_buckets", len(cfg.BucketTTL)),
+		slog.Duration("ttl_sweep_interval", cfg.TTLSweepInterval),
 	)
 
 	// 存储后端按模式二选一：
@@ -258,6 +263,11 @@ func run(args []string, stderr io.Writer) error {
 	// 一轮，避免全盘扫描把 Pod 终止拖过 kubelet 宽限期。
 	// 巡检始终针对本节点的本地存储（集群模式下也只看本地副本）。
 	go runIntegrityScrubber(ctx, st, logger, cfg.IntegrityInterval)
+	// TTL 清扫与巡检共享生命周期。未配置 TTL 时不启动 goroutine，
+	// 单机默认部署（无 TTL）的行为与引入该功能前完全一致。
+	if len(cfg.BucketTTL) > 0 {
+		go runTTLSweeper(ctx, st, logger, cfg.TTLSweepInterval)
+	}
 
 	serveErr := make(chan error, len(servers))
 	for _, s := range servers {
@@ -389,6 +399,70 @@ func runIntegrityScrubber(ctx context.Context, st *store.Store, logger *slog.Log
 			slog.Int("scanned_objects", stats.ScannedObjects),
 			slog.Int("corrupt_objects", 0),
 			slog.Int("skipped_objects", stats.SkippedObjects),
+			slog.Duration("duration", stats.Duration),
+		)
+	}
+}
+
+// runTTLSweeper 按固定周期回收已过期对象的元数据目录（创新 F'）。
+//
+// 惰性过期已经保证客户端读不到过期对象；这个后台任务只负责把磁盘
+// 空间真正释放出来。因此它**不是正确性依赖**：interval <= 0 时直接
+// 不启动，对象依然会按时对客户端消失，只是目录要等手工清理。
+//
+// 与完整性巡检一样，第一轮在第一个周期之后才开始：启动瞬间的目录扫描
+// 会与前台请求争抢磁盘队列，而边端 Pod 滚动重启很频繁。
+func runTTLSweeper(ctx context.Context, st *store.Store, logger *slog.Logger, interval time.Duration) {
+	if st == nil || interval <= 0 {
+		logger.Info("ttl_sweep_disabled", slog.String("reason", "ttl_sweep_interval <= 0"))
+		return
+	}
+	logger.Info("ttl_sweep_scheduled",
+		slog.Duration("interval", interval),
+		slog.Duration("first_run_after", interval),
+		slog.Int("ttl_buckets", st.BucketTTLCount()),
+	)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		stats, err := st.SweepExpired(ctx)
+		if err != nil {
+			// 关闭时的取消不是故障。
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Error("ttl_sweep_failed", slog.Any("err", err))
+			continue
+		}
+		// 失败明细先逐条输出：计数告诉运维"有多少"，明细告诉"是哪些"。
+		for _, f := range stats.Failures {
+			logger.Warn("ttl_sweep_failure",
+				slog.String("bucket", f.Bucket),
+				slog.String("key", f.Key),
+				slog.String("err", f.Err),
+			)
+		}
+		// 没有删除也没有失败时降为 Debug：默认一分钟一轮，Info 会把日志打满。
+		if stats.DeletedObjects == 0 && stats.FailedObjects == 0 {
+			logger.Debug("ttl_sweep_completed",
+				slog.Int("buckets", stats.Buckets),
+				slog.Int("expired_objects", stats.ExpiredObjects),
+				slog.Duration("duration", stats.Duration),
+			)
+			continue
+		}
+		logger.Info("ttl_sweep_completed",
+			slog.Int("buckets", stats.Buckets),
+			slog.Int("expired_objects", stats.ExpiredObjects),
+			slog.Int("deleted_objects", stats.DeletedObjects),
+			slog.Int("skipped_objects", stats.SkippedObjects),
+			slog.Int("failed_objects", stats.FailedObjects),
 			slog.Duration("duration", stats.Duration),
 		)
 	}

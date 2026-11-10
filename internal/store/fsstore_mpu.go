@@ -851,7 +851,8 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 	prev, err := s.loadObjectMeta(bucket, key)
 	switch {
 	case err == nil:
-		if ifNoneMatchAny {
+		// 已过期对象在逻辑上不存在，条件写不能因为它触发 412。
+		if ifNoneMatchAny && !s.expiredAt(prev.ExpiresAt) {
 			return nil, ErrPreconditionFailed
 		}
 	case errors.Is(err, ErrNoSuchKey):
@@ -860,13 +861,17 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 		return nil, err
 	}
 
+	// TTL 在对象真正变得可见的这一刻（Complete）开始计算，而不是从
+	// Initiate 或最后一片上传算起：客户端等待完成的时长不应吃掉保留期。
+	modified := s.now().UTC().Truncate(time.Second)
 	meta := objectMeta{
 		Version:           formatVersion,
 		Key:               key,
 		Size:              out.Size,
 		ETag:              out.ETag,
 		ContentType:       st.ContentType,
-		Modified:          s.now().UTC().Truncate(time.Second),
+		Modified:          modified,
+		ExpiresAt:         s.expiresAtFor(bucket, modified),
 		UserMeta:          st.UserMeta,
 		Blocks:            out.Blocks,
 		Checksum:          out.Checksum,

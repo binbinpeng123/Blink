@@ -44,6 +44,13 @@ type serverMetrics struct {
 	scrubCorrupt   *metrics.GaugeVec
 	scrubDuration  *metrics.GaugeVec
 	scrubCompleted *metrics.GaugeVec
+
+	ttlExpired   *metrics.GaugeVec
+	ttlDeleted   *metrics.GaugeVec
+	ttlSkipped   *metrics.GaugeVec
+	ttlFailed    *metrics.GaugeVec
+	ttlDuration  *metrics.GaugeVec
+	ttlCompleted *metrics.GaugeVec
 }
 
 // newServerMetrics 在给定注册表上创建全部指标；reg 为 nil 时返回 nil。
@@ -87,6 +94,22 @@ func newServerMetrics(reg *metrics.Registry, credentialCount int) *serverMetrics
 			"Wall-clock duration of the most recent integrity scrub."),
 		scrubCompleted: reg.Gauge("blink_scrub_last_completed_timestamp_seconds",
 			"Unix timestamp when the most recent integrity scrub finished; 0 means none has completed."),
+		// TTL 清扫指标同样描述"最近一轮"。expired 包含扫描后又被并发
+		// 覆盖、因而实际未删除的对象，deleted + skipped 才等于本次
+		// 实际处理的候选数；两者分开暴露是为了区分"清扫正常"
+		// 与"清扫一直在和写者竞争"。
+		ttlExpired: reg.Gauge("blink_ttl_last_expired_objects",
+			"Expired objects observed by the most recent TTL sweep."),
+		ttlDeleted: reg.Gauge("blink_ttl_last_deleted_objects",
+			"Expired objects deleted by the most recent TTL sweep."),
+		ttlSkipped: reg.Gauge("blink_ttl_last_skipped_objects",
+			"Candidates skipped by the most recent TTL sweep because they were overwritten or already gone."),
+		ttlFailed: reg.Gauge("blink_ttl_last_failed_objects",
+			"Objects the most recent TTL sweep failed to inspect or delete."),
+		ttlDuration: reg.Gauge("blink_ttl_last_duration_seconds",
+			"Wall-clock duration of the most recent TTL sweep."),
+		ttlCompleted: reg.Gauge("blink_ttl_last_completed_timestamp_seconds",
+			"Unix timestamp when the most recent TTL sweep finished; 0 means none has completed."),
 	}
 	m.credentials.Set(float64(credentialCount))
 	m.buildInfo.Set(1, buildinfo.Version, buildinfo.Commit)
@@ -163,6 +186,25 @@ func (m *serverMetrics) refreshScrub(st store.ScrubStats) {
 		return
 	}
 	m.scrubCompleted.Set(float64(st.FinishedAt.Unix()))
+}
+
+// refreshTTLSweep 写入最近一轮过期对象清扫的摘要。
+//
+// 与 refreshScrub 同一约定：从未跑过时数值为 0，但指标族始终存在。
+func (m *serverMetrics) refreshTTLSweep(st store.TTLSweepStats) {
+	if m == nil {
+		return
+	}
+	m.ttlExpired.Set(float64(st.ExpiredObjects))
+	m.ttlDeleted.Set(float64(st.DeletedObjects))
+	m.ttlSkipped.Set(float64(st.SkippedObjects))
+	m.ttlFailed.Set(float64(st.FailedObjects))
+	m.ttlDuration.Set(st.Duration.Seconds())
+	if st.FinishedAt.IsZero() {
+		m.ttlCompleted.Set(0)
+		return
+	}
+	m.ttlCompleted.Set(float64(st.FinishedAt.Unix()))
 }
 
 // refreshUptime 写入进程运行时长。

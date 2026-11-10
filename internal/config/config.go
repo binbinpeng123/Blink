@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/binbinpeng123/Blink/internal/authz"
 	"github.com/binbinpeng123/Blink/internal/cluster"
 	"github.com/binbinpeng123/Blink/internal/logx"
+	"github.com/binbinpeng123/Blink/internal/store"
 )
 
 // 默认值集中在此处，便于文档与测试引用。
@@ -74,6 +76,13 @@ const (
 	// 时效；调短会持续占用磁盘读带宽，属于部署侧的权衡。
 	DefaultIntegrityInterval = 24 * time.Hour
 
+	// DefaultTTLSweepInterval 是过期对象后台清扫的默认周期（创新 F'）。
+	//
+	// 惰性过期已经保证客户端看不到过期对象，清扫只负责回收磁盘；
+	// 一分钟一次足以把边端中间结果的磁盘占用控制在一个可接受的窗口，
+	// 同时每轮只做一次目录扫描，不读块数据。
+	DefaultTTLSweepInterval = time.Minute
+
 	// 集群模式取值。
 	ClusterModeSingle  = "single"
 	ClusterModeCluster = "cluster"
@@ -106,8 +115,12 @@ const (
 	EnvIntegrityInterval = "BLINK_INTEGRITY_INTERVAL"
 	// EnvInlineObjectMaxSize 控制"内容内联"的小对象上限；0 关闭。
 	EnvInlineObjectMaxSize = "BLINK_INLINE_OBJECT_MAX_SIZE"
-	EnvTLSCert             = "BLINK_TLS_CERT"
-	EnvTLSKey              = "BLINK_TLS_KEY"
+	// EnvBucketTTL 是按桶配置的对象存活时长，格式 bucket=1h,bucket2=24h。
+	EnvBucketTTL = "BLINK_BUCKET_TTL"
+	// EnvTTLSweepInterval 是过期对象后台清扫周期；<=0 只禁用清扫。
+	EnvTTLSweepInterval = "BLINK_TTL_SWEEP_INTERVAL"
+	EnvTLSCert          = "BLINK_TLS_CERT"
+	EnvTLSKey           = "BLINK_TLS_KEY"
 
 	// 集群成员与内部协议。密钥只从环境变量读取，不提供命令行参数：
 	// 命令行会出现在进程列表与 shell 历史里，而共享密钥泄露等于全集群失守。
@@ -185,6 +198,15 @@ type Config struct {
 	// 与 ScrubInterval（集群反熵）相互独立：后者在集群环上检查分片
 	// 归属并触发修复，这里只在本节点上对已有对象重算块校验和。
 	IntegrityInterval time.Duration
+	// BucketTTL 是按桶配置的对象存活时长（创新 F'）。
+	//
+	// 写入时换算成绝对过期时刻存进对象元数据；读取/LIST/COPY 把过期
+	// 对象视为不存在，后台清扫回收其元数据目录。只对单机模式生效：
+	// 集群写路径不经过 Store.PutObject，Validate 在集群模式下显式拒绝。
+	BucketTTL map[string]time.Duration
+	// TTLSweepInterval 是过期对象后台清扫周期；<=0 只禁用清扫，
+	// 惰性过期仍然生效（客户端不会读到过期对象，只是磁盘暂不回收）。
+	TTLSweepInterval time.Duration
 	// HighWatermark 是拒绝写入的磁盘使用率上限。
 	HighWatermark float64
 	// LowWatermark 是恢复接受写入的磁盘使用率下限。
@@ -404,6 +426,7 @@ func Default() Config {
 		MaxClockSkew:        DefaultMaxClockSkew,
 		FsyncPolicy:         DefaultFsyncPolicy,
 		IntegrityInterval:   DefaultIntegrityInterval,
+		TTLSweepInterval:    DefaultTTLSweepInterval,
 		BlockSize:           DefaultBlockSize,
 		InlineThreshold:     DefaultInlineThreshold,
 		InlineObjectMaxSize: DefaultInlineObjectMaxSize,
@@ -474,6 +497,15 @@ func Load(args []string, out io.Writer) (Config, error) {
 	fs.Int64Var(&cfg.BlockSize, "block-size", cfg.BlockSize, "大对象块大小（字节）")
 	fs.Int64Var(&cfg.InlineThreshold, "inline-threshold", cfg.InlineThreshold, "小对象内联阈值（字节）")
 	fs.Var(sizeValue{&cfg.InlineObjectMaxSize}, "inline-object-max-size", "内容内联的对象大小上限，0 关闭（环境变量 "+EnvInlineObjectMaxSize+"）")
+	fs.Func("bucket-ttl", "按桶配置对象存活时长，格式 bucket=1h,bucket2=24h（环境变量 "+EnvBucketTTL+"；仅单机模式）", func(v string) error {
+		m, err := parseBucketTTL(v)
+		if err != nil {
+			return err
+		}
+		cfg.BucketTTL = m
+		return nil
+	})
+	fs.DurationVar(&cfg.TTLSweepInterval, "ttl-sweep-interval", cfg.TTLSweepInterval, "过期对象后台清扫周期，<=0 只禁用清扫（环境变量 "+EnvTTLSweepInterval+"）")
 	fs.Float64Var(&cfg.HighWatermark, "disk-high-watermark", cfg.HighWatermark, "拒绝写入的磁盘水位")
 	fs.Float64Var(&cfg.LowWatermark, "disk-low-watermark", cfg.LowWatermark, "恢复写入的磁盘水位")
 	fs.IntVar(&cfg.MaxBucketCount, "max-buckets", cfg.MaxBucketCount, "桶数量软上限")
@@ -532,6 +564,17 @@ func applyEnv(cfg *Config) {
 	cfg.applySizeEnv(EnvECMinSize, &cfg.ECMinSize, &cfg.clusterEnvErr)
 	// 内容内联在单机模式下同样生效，错误必须记入 envErr。
 	cfg.applySizeEnv(EnvInlineObjectMaxSize, &cfg.InlineObjectMaxSize, &cfg.envErr)
+	// TTL 只用于单机模式；在集群模式下配置本身会被 Validate 拒绝，
+	// 但格式错误仍应记入 envErr，先于"不支持的配置"暴露出来。
+	if v := strings.TrimSpace(os.Getenv(EnvBucketTTL)); v != "" {
+		m, err := parseBucketTTL(v)
+		if err != nil {
+			cfg.addEnvErr(fmt.Errorf("%s: %w", EnvBucketTTL, err))
+		} else {
+			cfg.BucketTTL = m
+		}
+	}
+	cfg.applyDurationEnv(EnvTTLSweepInterval, &cfg.TTLSweepInterval, &cfg.envErr)
 
 	if v := os.Getenv("BLINK_MAX_CLOCK_SKEW"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -676,6 +719,46 @@ func parseSize(raw string) (int64, error) {
 	return n * unit, nil
 }
 
+// parseBucketTTL 解析 "bucket=1h,bucket2=24h" 形式的桶级 TTL 配置。
+//
+// 空串返回 nil（等于不启用），而不是空 map：调用方据此判断"是否配置"。
+// 重复桶与非法桶名都直接报错 —— TTL 配错会让数据提前消失或永不消失，
+// 静默取第一个值不是可接受的行为。
+func parseBucketTTL(raw string) (map[string]time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	out := make(map[string]time.Duration)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			return nil, fmt.Errorf("bucket-ttl %q 含空条目", raw)
+		}
+		bucket, ttlText, ok := strings.Cut(item, "=")
+		if !ok {
+			return nil, fmt.Errorf("bucket-ttl 条目 %q 缺少 '='（示例：models=24h）", item)
+		}
+		bucket = strings.TrimSpace(bucket)
+		ttlText = strings.TrimSpace(ttlText)
+		if err := store.ValidateBucketName(bucket); err != nil {
+			return nil, fmt.Errorf("bucket-ttl 中的桶名 %q 非法: %w", bucket, err)
+		}
+		ttl, err := time.ParseDuration(ttlText)
+		if err != nil {
+			return nil, fmt.Errorf("bucket-ttl 中桶 %s 的时长 %q 无法解析（示例：1h、24h、30m）", bucket, ttlText)
+		}
+		if ttl <= 0 {
+			return nil, fmt.Errorf("bucket-ttl 中桶 %s 的时长必须为正数，当前 %v", bucket, ttl)
+		}
+		if _, dup := out[bucket]; dup {
+			return nil, fmt.Errorf("bucket-ttl 重复配置了桶 %s", bucket)
+		}
+		out[bucket] = ttl
+	}
+	return out, nil
+}
+
 // addEnvErr 累积环境变量解析错误。
 //
 // 用 errors.Join 而不是覆盖：多个变量同时写错时，运维应当一次看到全部问题。
@@ -786,6 +869,29 @@ func (c Config) Validate() error {
 	if c.InlineObjectMaxSize > inlineLimit {
 		problems = append(problems, "inline-object-max-size 不应大于 inline-threshold")
 	}
+	// 桶级 TTL：桶名与时长在这里再校验一次（Config 可能被手工构造，
+	// 不经过 parseBucketTTL）。集群模式显式拒绝而不是静默忽略：
+	// 集群写路径不经过 Store.PutObject，配置了也不会生效，静默接受
+	// 会让运维以为中间结果正在自动过期。
+	if len(c.BucketTTL) > 0 {
+		if c.ClusterMode == ClusterModeCluster {
+			problems = append(problems, "bucket-ttl 只支持单机模式：集群写路径不经过本地 PutObject，无法保证副本按同一策略过期")
+		}
+		buckets := make([]string, 0, len(c.BucketTTL))
+		for bucket := range c.BucketTTL {
+			buckets = append(buckets, bucket)
+		}
+		sort.Strings(buckets)
+		for _, bucket := range buckets {
+			if err := store.ValidateBucketName(bucket); err != nil {
+				problems = append(problems, fmt.Sprintf("bucket-ttl 中的桶名 %q 非法: %v", bucket, err))
+				continue
+			}
+			if ttl := c.BucketTTL[bucket]; ttl <= 0 {
+				problems = append(problems, fmt.Sprintf("bucket-ttl 中桶 %s 的时长必须为正数，当前 %v", bucket, ttl))
+			}
+		}
+	}
 	if c.MaxClockSkew <= 0 {
 		problems = append(problems, "max-clock-skew 必须为正数")
 	}
@@ -889,6 +995,8 @@ func (c Config) Redacted() map[string]string {
 		"inline_threshold":       strconv.FormatInt(c.InlineThreshold, 10),
 		"inline_object_max_size": strconv.FormatInt(c.InlineObjectMaxSize, 10),
 		"verify_read":            strconv.FormatBool(c.VerifyOnRead),
+		"bucket_ttl":             formatBucketTTL(c.BucketTTL),
+		"ttl_sweep_interval_sec": strconv.FormatInt(int64(c.TTLSweepInterval.Seconds()), 10),
 		"high_watermark":         strconv.FormatFloat(c.HighWatermark, 'f', 2, 64),
 		"low_watermark":          strconv.FormatFloat(c.LowWatermark, 'f', 2, 64),
 		"max_bucket_count":       strconv.Itoa(c.MaxBucketCount),
@@ -920,6 +1028,24 @@ func (c Config) Redacted() map[string]string {
 		"tls_cert":    c.TLSCert,
 		"tls_key":     c.TLSKey,
 	}
+}
+
+// formatBucketTTL 把 TTL 配置渲染成稳定的 "bucket=duration,..." 串。
+// 按桶名排序：map 迭代顺序随机，日志与配置输出必须可复现。
+func formatBucketTTL(m map[string]time.Duration) string {
+	if len(m) == 0 {
+		return ""
+	}
+	buckets := make([]string, 0, len(m))
+	for bucket := range m {
+		buckets = append(buckets, bucket)
+	}
+	sort.Strings(buckets)
+	parts := make([]string, 0, len(buckets))
+	for _, bucket := range buckets {
+		parts = append(parts, bucket+"="+m[bucket].String())
+	}
+	return strings.Join(parts, ",")
 }
 
 // String 实现 fmt.Stringer，输出脱敏后的配置，防止意外打印泄露凭据。
