@@ -65,6 +65,8 @@ type Capacity interface {
 	// LastTTLSweep 返回最近一轮过期对象清扫摘要，供 /metrics 暴露。
 	// 未配置 TTL 或从未跑过时返回零值。
 	LastTTLSweep() store.TTLSweepStats
+	// ReclaimableBytes 是上一轮 GC 统计出的未引用块字节数。
+	ReclaimableBytes() int64
 }
 
 // Server 承载路由与共享依赖。

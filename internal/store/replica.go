@@ -91,7 +91,7 @@ func (s *Store) PutReplicaMeta(bucket, key string, m *ObjectMeta) error {
 			ErrStaleMeta, m.ObjVersion, m.NodeID, cur.ObjVersion, cur.NodeID)
 	}
 
-	if err := s.writeFileAtomic(s.objectMetaPath(bucket, key), mustJSON(m)); err != nil {
+	if err := s.commitMeta(s.objectMetaPath(bucket, key), mustJSON(m), localBlockHashes(m)); err != nil {
 		return fsErr("写入副本元数据", key, err)
 	}
 	s.metaCache.put(metaCacheKey{bucket: bucket, key: key}, m)
@@ -140,7 +140,23 @@ func (s *Store) PutBlock(hash string, data []byte) (bool, error) {
 	if len(data) == 0 {
 		return false, fmt.Errorf("%w: 块内容为空", ErrInvalidBlock)
 	}
-	return s.putBlock(hash, data)
+	wrote, err := s.putBlock(hash, data)
+	if err != nil {
+		return false, err
+	}
+	// PutBlock 的调用方（集群协调者）随后可能在另一个请求里才写副本
+	// 元数据。这里无法一直持有 pin，改为把 mtime 刷新到当前时间并立即
+	// 解除 pin：宽限期因此从"块被写入/确认"开始计时，覆盖元数据到达
+	// 之前的窗口。
+	now := s.now()
+	s.gcMu.RLock()
+	touchErr := s.fs.Chtimes(s.casPath(hash), now, now)
+	s.gcMu.RUnlock()
+	s.unpinBlock(hash)
+	if touchErr != nil {
+		return false, fsErr("刷新块 mtime", hash, touchErr)
+	}
+	return wrote, nil
 }
 
 // BlockExists 报告 CAS 中是否已有该块。

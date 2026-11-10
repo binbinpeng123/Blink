@@ -459,7 +459,7 @@ func (s *Store) PutPartState(uploadID string, ps *PartState) error {
 	if err := s.fs.MkdirAll(s.multipartPartsDir(uploadID), dirPerm); err != nil {
 		return fsErr("创建分片目录", uploadID, err)
 	}
-	if err := s.writeFileAtomic(s.multipartPartPath(uploadID, ps.PartNumber), mustJSON(ps)); err != nil {
+	if err := s.commitMeta(s.multipartPartPath(uploadID, ps.PartNumber), mustJSON(ps), partHashes(ps)); err != nil {
 		return fsErr("写入分片状态", uploadID, err)
 	}
 	return nil
@@ -720,6 +720,10 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, body io
 
 	tag := fmt.Sprintf("upload %s part %d", uploadID, partNumber)
 	res, err := s.streamBlocks(body, alg, tag, opt.ExpectedSize)
+	if res != nil {
+		// 块已 pin，分片状态提交（或失败返回）后统一解除。
+		defer s.unpinBlocks(res.hashes)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -776,11 +780,14 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, body io
 		cur.ChecksumAlgorithm = alg
 		cur.ChecksumType = checksumType
 		cur.Revision++
-		if err := s.writeFileAtomic(s.multipartStatePath(uploadID), mustJSON(cur)); err != nil {
+		// 会话状态不引用数据块，hashes 传 nil。
+		if err := s.commitMeta(s.multipartStatePath(uploadID), mustJSON(cur), nil); err != nil {
 			return nil, fsErr("更新分片上传状态", uploadID, err)
 		}
 	}
-	if err := s.writeFileAtomic(s.multipartPartPath(uploadID, partNumber), mustJSON(ps)); err != nil {
+	// 分片状态引用的块必须在提交前刷新 mtime，否则一份"刚写好状态、
+	// 块却是旧 mtime"的分片会被并发清扫误判为孤儿。
+	if err := s.commitMeta(s.multipartPartPath(uploadID, partNumber), mustJSON(ps), res.hashes); err != nil {
 		return nil, fsErr("写入分片状态", tag, err)
 	}
 	return &PartInfo{
@@ -888,7 +895,7 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 	// 先提交对象（元数据 + 块表在同一次 rename 里），再删除分片状态。
 	// 顺序不能反：先删状态而对象没写成功，数据就彻底丢了；
 	// 反过来的中间态只是"对象已可见、临时状态还没清"，重试是幂等的。
-	if err := s.writeFileAtomic(s.objectMetaPath(bucket, key), mustJSON(meta)); err != nil {
+	if err := s.commitMeta(s.objectMetaPath(bucket, key), mustJSON(meta), localBlockHashes(&meta)); err != nil {
 		return nil, fsErr("写入对象元数据", key, err)
 	}
 	s.metaCache.put(metaCacheKey{bucket: bucket, key: key}, &meta)

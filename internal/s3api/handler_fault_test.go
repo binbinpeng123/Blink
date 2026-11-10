@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/binbinpeng123/Blink/internal/store"
 )
@@ -56,6 +57,9 @@ func (f *enospcFS) WriteFile(path string, data []byte, perm fs.FileMode) error {
 }
 func (f *enospcFS) Truncate(path string, size int64) error {
 	return f.inner.Truncate(path, size)
+}
+func (f *enospcFS) Chtimes(path string, atime, mtime time.Time) error {
+	return f.inner.Chtimes(path, atime, mtime)
 }
 
 // enospcFile 在文件句柄上拦截写。

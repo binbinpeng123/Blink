@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"strings"
 	"time"
 
@@ -197,9 +196,13 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 	}
 	if res == nil {
 		res, err = s.streamBlocks(body, opt.ChecksumAlgorithm, key, opt.ExpectedSize)
-		if err != nil {
-			return nil, err
-		}
+	}
+	if res != nil {
+		// 块在 streamBlocks 里已经 pin；元数据提交（或失败返回）后统一解除。
+		defer s.unpinBlocks(res.hashes)
+	}
+	if err != nil {
+		return nil, err
 	}
 	blocks, total, etag := res.blocks, res.size, res.etag
 	deduped := res.deduped
@@ -267,7 +270,7 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 
 	// 唯一让对象变得可见的一步：改名是原子的，读者要么看不到对象，
 	// 要么看到完整的新版本，绝不会看到"块表指向一半的块"。
-	if err := s.writeFileAtomic(s.objectMetaPath(bucket, key), mustJSON(meta)); err != nil {
+	if err := s.commitMeta(s.objectMetaPath(bucket, key), mustJSON(meta), res.hashes); err != nil {
 		return nil, fsErr("写入对象元数据", key, err)
 	}
 	s.metaCache.put(metaCacheKey{bucket: bucket, key: key}, &meta)
@@ -303,6 +306,12 @@ type streamResult struct {
 	checksum string
 	// deduped 是命中本地 CAS、本次未写盘的块数。
 	deduped int
+	// hashes 是本次写入过程中成功 pin 的块（含去重命中），按出现顺序。
+	//
+	// 调用方必须把它们交给 commitMeta 刷新 mtime，并在元数据提交后
+	// unpinBlocks；失败路径同样要 unpin —— 块已落盘但无人引用，
+	// 交给 GC 在宽限期后回收。
+	hashes []string
 }
 
 // streamBlocks 从 body 读完全部内容，切块写入本地 CAS。
@@ -319,13 +328,18 @@ func (s *Store) streamBlocks(body io.Reader, alg checksum.Algorithm, tag string,
 		if err != nil {
 			return err
 		}
+		// pin 在 putBlock 内登记，无论是否命中已有块都要记下来，
+		// 由调用方在元数据提交后统一解除。
+		res.hashes = append(res.hashes, b.Desc.Hash)
 		if !wrote {
 			res.deduped++
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		// 失败时也返回 res：已经 pin 的块必须由调用方 unpin，
+		// 否则它们会被永久视为"使用中"，GC 再也回收不掉。
+		return res, err
 	}
 	res.blocks = summary.Blocks
 	res.size = summary.Size
@@ -343,13 +357,25 @@ func (s *Store) streamBlocks(body io.Reader, alg checksum.Algorithm, tag string,
 // 并发下两个写者可能同时发现"不存在"，各自写临时文件后 rename 到同一路径：
 // 两者内容逐字节相同，后到的覆盖先到的，结果依然正确。因此这里不加锁 ——
 // 给 CAS 加锁会把所有共享块前缀的写入串行化，正好抵消掉并发写的好处。
+//
+// 返回时块处于 **pinned** 状态（无论是否命中已有块）：调用方必须在
+// 元数据提交后 unpin，或在本函数返回错误时由本函数自行解除。
 func (s *Store) putBlock(hash string, data []byte) (bool, error) {
-	final := s.casPath(hash)
-	if _, err := s.fs.Stat(final); err == nil {
-		return false, nil
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return false, fsErr("检查块", hash, err)
+	exists, err := s.acquireBlock(hash)
+	if err != nil {
+		return false, err
 	}
+	if exists {
+		return false, nil // pin 保留给调用方，用于 commitMeta 的 touch
+	}
+
+	// 从这里开始，任何失败路径都必须解除 acquireBlock 留下的 pin。
+	success := false
+	defer func() {
+		if !success {
+			s.unpinBlock(hash)
+		}
+	}()
 
 	// 去重命中不占新空间，因此水位检查放在 Stat 之后：已存在的块
 	// 即使在阻断期也允许命中，否则重复上传同一份模型会莫名失败。
@@ -357,7 +383,7 @@ func (s *Store) putBlock(hash string, data []byte) (bool, error) {
 		return false, err
 	}
 
-	w, err := s.newAtomicWriter(final, false)
+	w, err := s.newAtomicWriter(s.casPath(hash), false)
 	if err != nil {
 		return false, fsErr("创建块", hash, err)
 	}
@@ -371,5 +397,6 @@ func (s *Store) putBlock(hash string, data []byte) (bool, error) {
 	if err := w.Commit(); err != nil {
 		return false, fsErr("提交块", hash, err)
 	}
+	success = true
 	return true, nil
 }

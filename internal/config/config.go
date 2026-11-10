@@ -83,6 +83,15 @@ const (
 	// 同时每轮只做一次目录扫描，不读块数据。
 	DefaultTTLSweepInterval = time.Minute
 
+	// DefaultGCInterval 是后台 CAS 回收的周期。单机与集群一致：
+	// 每个节点只回收本机不再被元数据引用的块。
+	DefaultGCInterval = time.Hour
+	// DefaultGCGrace 是块在"失去最后一个元数据引用"之后的保留期。
+	//
+	// 必须覆盖"块已落盘、meta.json 尚未提交"的窗口，以及集群远端
+	// 节点提交块的延迟；取 1 小时与 03 文档一致。
+	DefaultGCGrace = time.Hour
+
 	// 集群模式取值。
 	ClusterModeSingle  = "single"
 	ClusterModeCluster = "cluster"
@@ -146,6 +155,10 @@ const (
 	EnvECK       = "BLINK_EC_K"
 	EnvECM       = "BLINK_EC_M"
 	EnvECMinSize = "BLINK_EC_MIN_SIZE"
+
+	// CAS 垃圾回收。
+	EnvGCInterval = "BLINK_GC_INTERVAL"
+	EnvGCGrace    = "BLINK_GC_GRACE"
 )
 
 // Config 是服务的完整启动配置。
@@ -255,6 +268,13 @@ type Config struct {
 	ECM int
 	// ECMinSize 是走 EC 的最小对象字节数。
 	ECMinSize int64
+	// GCInterval 是后台 CAS 回收周期；<=0 表示禁用后台回收。
+	//
+	// 禁用后写入路径的块仍然只增不减，只有显式调用 SweepGarbage
+	// 才会回收；这适合由外部调度器按需触发的部署。
+	GCInterval time.Duration
+	// GCGrace 是块在失去引用后的宽限期，必须为正。
+	GCGrace time.Duration
 	// TLSCert 是 PEM 证书链文件路径；为空表示不启用 TLS。
 	TLSCert string
 	// TLSKey 是 PEM 私钥文件路径；必须与 TLSCert 同时提供。
@@ -448,6 +468,9 @@ func Default() Config {
 		ReadDegraded:         DefaultReadDegraded,
 		ECEnabled:            DefaultECEnabled,
 		ECMinSize:            DefaultECMinSize,
+
+		GCInterval: DefaultGCInterval,
+		GCGrace:    DefaultGCGrace,
 	}
 }
 
@@ -493,6 +516,8 @@ func Load(args []string, out io.Writer) (Config, error) {
 	fs.IntVar(&cfg.ECK, "ec-k", cfg.ECK, "EC 数据片数，0 表示按成员数选 profile（环境变量 "+EnvECK+"）")
 	fs.IntVar(&cfg.ECM, "ec-m", cfg.ECM, "EC 校验片数，0 表示按成员数选 profile（环境变量 "+EnvECM+"）")
 	fs.Var(sizeValue{&cfg.ECMinSize}, "ec-min-size", "走 EC 的最小对象大小，如 32MiB（环境变量 "+EnvECMinSize+"）")
+	fs.DurationVar(&cfg.GCInterval, "gc-interval", cfg.GCInterval, "后台 CAS 回收周期，<=0 禁用（环境变量 "+EnvGCInterval+"）")
+	fs.DurationVar(&cfg.GCGrace, "gc-grace", cfg.GCGrace, "块失去引用后的保留期，必须为正（环境变量 "+EnvGCGrace+"）")
 	fs.DurationVar(&cfg.MaxClockSkew, "max-clock-skew", cfg.MaxClockSkew, "签名校验允许的时钟偏移")
 	fs.Int64Var(&cfg.BlockSize, "block-size", cfg.BlockSize, "大对象块大小（字节）")
 	fs.Int64Var(&cfg.InlineThreshold, "inline-threshold", cfg.InlineThreshold, "小对象内联阈值（字节）")
@@ -575,6 +600,10 @@ func applyEnv(cfg *Config) {
 		}
 	}
 	cfg.applyDurationEnv(EnvTTLSweepInterval, &cfg.TTLSweepInterval, &cfg.envErr)
+	// GC 在单机与集群模式都生效，因此解析失败记入 envErr 而不是
+	// clusterEnvErr：单机模式下写错的 GC 参数不应被静默忽略。
+	cfg.applyDurationEnv(EnvGCInterval, &cfg.GCInterval, &cfg.envErr)
+	cfg.applyDurationEnv(EnvGCGrace, &cfg.GCGrace, &cfg.envErr)
 
 	if v := os.Getenv("BLINK_MAX_CLOCK_SKEW"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -899,6 +928,16 @@ func (c Config) Validate() error {
 		problems = append(problems, "max-buckets 必须为正数")
 	}
 
+	// GC 宽限期在单机与集群模式都必须为正：它覆盖"块已落盘、
+	// meta.json 尚未提交"的窗口。0 或负值会让并发的写入被本轮回收
+	// 误删，属于数据损坏级别的配置错误，直接拒绝启动。
+	//
+	// GCInterval 允许 <=0（禁用后台回收），由外部调度器按需触发，
+	// 因此这里不校验。
+	if c.GCGrace <= 0 {
+		problems = append(problems, "gc-grace 必须为正（如 1h）：宽限期覆盖块落盘到元数据提交之间的窗口")
+	}
+
 	// 证书与私钥必须成对出现。只给其中一个时，若静默退回明文 HTTP，
 	// 运维会以为服务已经在 TLS 上 —— 这正是"以为有保护、实际没有"。
 	if (c.TLSCert == "") != (c.TLSKey == "") {
@@ -1023,6 +1062,9 @@ func (c Config) Redacted() map[string]string {
 		"ec_k":                   strconv.Itoa(c.ECK),
 		"ec_m":                   strconv.Itoa(c.ECM),
 		"ec_min_size_bytes":      strconv.FormatInt(c.ECMinSize, 10),
+		// GC 参数不是秘密，排障时需要确认宽限期是否被调过。
+		"gc_interval_sec": strconv.FormatInt(int64(c.GCInterval.Seconds()), 10),
+		"gc_grace_sec":    strconv.FormatInt(int64(c.GCGrace.Seconds()), 10),
 		// TLS 只输出开关与文件路径：路径不是秘密，但私钥内容永远不出现。
 		"tls_enabled": strconv.FormatBool(c.TLSCert != ""),
 		"tls_cert":    c.TLSCert,

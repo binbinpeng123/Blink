@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // 故障注入的切入点。命名与 FileSystem 的方法对应，
@@ -141,6 +142,12 @@ func (f *faultFS) Truncate(path string, size int64) error {
 		return err
 	}
 	return f.inner.Truncate(path, size)
+}
+
+// Chtimes 直接转发，不参与故障注入：它只服务于 GC 的 mtime 刷新，
+// 失败不会破坏数据正确性（最多让块晚一轮被回收）。
+func (f *faultFS) Chtimes(path string, atime, mtime time.Time) error {
+	return f.inner.Chtimes(path, atime, mtime)
 }
 
 // faultFile 在文件句柄上拦截写与 fsync。
