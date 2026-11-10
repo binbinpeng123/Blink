@@ -858,12 +858,16 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 	prev, err := s.loadObjectMeta(bucket, key)
 	switch {
 	case err == nil:
-		// 已过期对象在逻辑上不存在，条件写不能因为它触发 412。
-		if ifNoneMatchAny && !s.expiredAt(prev.ExpiresAt) {
-			return nil, ErrPreconditionFailed
+		// 与 PUT/COPY 共用同一套判定：墓碑与已过期对象在逻辑上都不存在，
+		// 不能因为它们触发 412。
+		if cerr := s.checkWriteConditions(prev, ifNoneMatchAny, "", false); cerr != nil {
+			return nil, cerr
 		}
 	case errors.Is(err, ErrNoSuchKey):
 		prev = nil
+		if cerr := s.checkWriteConditions(nil, ifNoneMatchAny, "", false); cerr != nil {
+			return nil, cerr
+		}
 	default:
 		return nil, err
 	}

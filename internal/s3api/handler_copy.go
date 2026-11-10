@@ -183,10 +183,11 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	// 目标对象上的条件写：与普通 PUT 同一套规则（只支持 If-None-Match: *），
-	// 复用同一个解析函数，避免两条写路径对同一个头给出不同答复。
-	if e := checkPutPreconditions(r); e != nil {
-		e.Write(w, r, reqID)
+	// 目标对象上的条件写：与普通 PUT 同一套规则（If-None-Match: * 与
+	// If-Match），复用同一个解析函数，避免两条写路径对同一个头给出不同答复。
+	cond, condErr := parseWriteConditions(r)
+	if condErr != nil {
+		condErr.Write(w, r, reqID)
 		return
 	}
 
@@ -212,7 +213,9 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		ReplaceMetadata: replace,
 		ContentType:     r.Header.Get("Content-Type"),
 		UserMeta:        userMetadata(r.Header),
-		IfNoneMatchAny:  strings.TrimSpace(r.Header.Get("If-None-Match")) == "*",
+		IfNoneMatchAny:  cond.ifNoneMatchAny,
+		IfMatchETag:     cond.ifMatchETag,
+		IfMatchAny:      cond.ifMatchAny,
 	})
 	if err != nil {
 		s.writeStoreErr(w, r, reqID, err)

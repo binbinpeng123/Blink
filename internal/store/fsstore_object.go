@@ -36,6 +36,12 @@ type PutOptions struct {
 	ContentMD5 string
 	// IfNoneMatchAny 对应 If-None-Match: *：对象已存在则失败。
 	IfNoneMatchAny bool
+	// IfMatchETag 对应 If-Match: "etag"：仅当当前对象 ETag 完全匹配才写。
+	// 对象不存在（或已过期）同样视为前置条件未满足。
+	IfMatchETag string
+	// IfMatchAny 对应 If-Match: *：仅当对象存在才写。
+	// 与 IfMatchETag 互斥；两者都为零值时不做 If-Match 判断。
+	IfMatchAny bool
 	// ExpectedSize 是 Content-Length。
 	//
 	// S3 要求单次 PUT 必须声明长度，负值一律拒绝：边读边写时"长度未知"
@@ -151,18 +157,22 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 	unlock := s.locks.Lock(bucket + "\x00" + key)
 	defer unlock()
 
-	// 读旧元数据有两个用途：If-None-Match 判断，以及 obj_version 递增。
+	// 读旧元数据有两个用途：条件写判断，以及 obj_version 递增。
 	// 持有 key 锁期间读取，因此 prev 与随后的写入之间不可能插入别的写者。
 	prev, err := s.loadObjectMeta(bucket, key)
 	switch {
 	case err == nil:
-		// 已过期的对象在逻辑上不存在，条件写必须把它当成"没有对象"：
-		// 否则客户端会因为一个自己已经看不见的对象而拿到 412。
-		if opt.IfNoneMatchAny && !s.expiredAt(prev.ExpiresAt) {
-			return nil, ErrPreconditionFailed
+		// 条件判定统一走 checkWriteConditions：这里刻意不直接把
+		// If-None-Match 与 If-Match 写死在分支里，避免 PUT/COPY/MPU
+		// 三条写路径对同一组头部给出不同答复。
+		if cerr := s.checkWriteConditions(prev, opt.IfNoneMatchAny, opt.IfMatchETag, opt.IfMatchAny); cerr != nil {
+			return nil, cerr
 		}
 	case errors.Is(err, ErrNoSuchKey):
 		prev = nil
+		if cerr := s.checkWriteConditions(nil, opt.IfNoneMatchAny, opt.IfMatchETag, opt.IfMatchAny); cerr != nil {
+			return nil, cerr
+		}
 	default:
 		return nil, err
 	}

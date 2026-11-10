@@ -151,7 +151,12 @@
 - 必需 `Content-Length`，缺失 → `411 Length Required`；key 为空 → `400 InvalidArgument`。
 - 响应含 `ETag`、`Last-Modified`；若客户端通过 `x-amz-sdk-checksum-algorithm` 或 `x-amz-checksum-*` 声明算法，**必须回传对应 checksum**，且**必须同时回传 `x-amz-checksum-type`**。只回校验值不回类型，客户端无法区分 `FULL_OBJECT`（整段直算）与 `COMPOSITE`（对分片校验值再算、带 `-N` 后缀），也就无法复算。
 - 客户端未声明算法时**不**回传 checksum 头（不能替客户端决定要校验什么）。
-- `If-None-Match: *` 且对象已存在 → `412 PreconditionFailed`。
+- 条件写（在存储层 key 锁内判定，检查与提交之间不插入其他写者）：
+  - `If-None-Match: *` 且对象已存在 → `412 PreconditionFailed`；具体 ETag 形式的 `If-None-Match` 未实现 → `501 NotImplemented`（不静默忽略）。
+  - `If-Match: "etag"`：对象不存在或 ETag 不匹配 → `412 PreconditionFailed`；服务端按去掉 `W/` 与引号后的值比较。
+  - `If-Match: *`：对象不存在 → `412 PreconditionFailed`，仅要求"存在"。
+  - 逗号分隔的多值列表、空 ETag → `400 InvalidArgument`；静默取第一个会把"任一匹配"变成"只认第一个"。
+  - **墓碑与已过期对象在逻辑上不存在**：`If-Match` 对它们一律 `412`，`If-None-Match: *` 对它们一律放行。否则客户端会因为一个自己已经看不见的对象拿到无法恢复的 412。
 - 客户端中途断开 → 丢弃临时文件，不产生任何元数据。
 
 ### 流式上传（`Content-Encoding: aws-chunked`）
@@ -220,7 +225,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 带 `?versionId` → `501 NotImplemented`（无版本控制，不静默忽略）。
 - 元数据指令：`x-amz-metadata-directive` 为空或 `COPY` 时保留源 `Content-Type` 与 `x-amz-meta-*`；`REPLACE` 时以请求头为准，缺省 `Content-Type` 落 `application/octet-stream`；其他值 → `400 InvalidArgument`。
 - 源条件：`x-amz-copy-source-if-match` / `if-none-match` / `if-modified-since` / `if-unmodified-since`，不满足 → `412 PreconditionFailed`；源不存在时优先 `404 NoSuchKey`。
-- 目标条件：仅 `If-None-Match: *`；目标已存在 → `412 PreconditionFailed`。
+- 目标条件：与 PutObject 同一套规则 —— `If-None-Match: *` 与 `If-Match`（单个 ETag 或 `*`），在存储层目标 key 锁内判定；不满足 → `412 PreconditionFailed`，非法多值 → `400 InvalidArgument`。目标上的墓碑与已过期对象同样视为不存在。
 - 自复制：源与目标相同且 `COPY` → `400 InvalidRequest`；`REPLACE` 允许，用于原地更新元数据。
 - 大小上限：源对象 > 5 GiB → `400 InvalidRequest`。
 - `x-amz-storage-class` 只接受 `STANDARD`（缺省同义），其余 → `501 NotImplemented`。
@@ -254,6 +259,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - `UploadPartCopy`：与 `UploadPart` 同路由，以 `x-amz-copy-source` 非空为唯一判据分流。支持 `x-amz-copy-source-range: bytes=first-last`（两端必填，不支持开放/后缀/多区间）；缺省复制整个源对象。源条件与 CopyObject 同一套 `x-amz-copy-source-if-*`；源不存在 → `404 NoSuchKey`；区间越界 → `416 InvalidRange` 且带 `Content-Range: bytes */<源大小>`；单次复制 > 5 GiB → `400 InvalidRequest`。响应 `<CopyPartResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyPartResult>`，ETag 按目标分片内容重算，与随后 `ListParts` 一致。
 - 单机与集群的 `UploadPartCopy` 都走 `OpenObject` + `io.Pipe` + `UploadPart`：**不是零拷贝**，数据经协调者读一次、写一次（与集群 CopyObject 同理）。
 - `CompleteMultipartUpload` 必须校验分片序号升序（否则 `400 InvalidPartOrder`）、分片存在且 ETag 匹配（否则 `400 InvalidPart`）、尺寸约束（否则 `400 EntityTooSmall`）。
+- `CompleteMultipartUpload` 支持 `If-None-Match: *`（对象已存在 → `412`）；`If-Match` → `501 NotImplemented` —— 条件必须进入存储层 key 锁才有意义，本版本只给 PutObject 与 CopyObject 目标落地，接受后忽略会把"仅当目标版本未变才提交"降级成无条件覆盖。
 - 完成后的 `ETag` 为 `"<md5(各分片 MD5 拼接)>-<N>"`。
 - 完成后先原子提交元数据与块表，再删除分片上传的临时状态。
 - `AbortMultipartUpload` → `204`，清理临时状态；不存在的 uploadId → `404 NoSuchUpload`。

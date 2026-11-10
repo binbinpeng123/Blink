@@ -156,9 +156,18 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket
 func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) {
 	uploadID := r.URL.Query().Get("uploadId")
 
-	condErr := checkPutPreconditions(r)
+	cond, condErr := parseWriteConditions(r)
 	if condErr != nil {
 		condErr.Write(w, r, reqID)
+		return
+	}
+	if cond.ifMatchETag != "" || cond.ifMatchAny {
+		// Complete 的 If-Match 需要把条件传入存储层的 key 锁内；本切片
+		// 只给 PUT/COPY 落地，这里必须显式拒绝而不是接受后忽略 ——
+		// 忽略等于把"仅当目标版本未变才提交"降级成无条件覆盖。
+		s3err.New(s3err.CodeNotImplemented).
+			WithMessage("CompleteMultipartUpload 暂不支持 If-Match 条件写。").
+			Write(w, r, reqID)
 		return
 	}
 
@@ -191,7 +200,7 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 	}
 
 	info, err := s.store.CompleteMultipartUpload(bucket, key, uploadID, parts, declared,
-		strings.TrimSpace(r.Header.Get("If-None-Match")) == "*")
+		cond.ifNoneMatchAny)
 	if err != nil {
 		s.writeStoreErr(w, r, reqID, err)
 		return
