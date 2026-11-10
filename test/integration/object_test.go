@@ -156,16 +156,33 @@ func TestObjectErrors(t *testing.T) {
 		requireS3Error(t, res, http.StatusPreconditionFailed, "PreconditionFailed")
 	})
 
-	t.Run("显式 ETag 的条件写返回 501", func(t *testing.T) {
+	t.Run("If-None-Match 的显式 ETag 返回 501", func(t *testing.T) {
 		res := c.putObject(bucket, "cond", []byte("x"), map[string]string{
 			"If-None-Match": `"abc"`,
 		})
 		requireS3Error(t, res, http.StatusNotImplemented, "NotImplemented")
+	})
 
-		res = c.putObject(bucket, "cond", []byte("x"), map[string]string{
-			"If-Match": `"abc"`,
+	t.Run("If-Match 条件写按 ETag 生效", func(t *testing.T) {
+		first := c.putObject(bucket, "cas", []byte("v1"), nil)
+		requireStatus(t, first, http.StatusOK)
+		etag := first.Header.Get("ETag")
+
+		requireStatus(t, c.putObject(bucket, "cas", []byte("v2"), map[string]string{
+			"If-Match": etag,
+		}), http.StatusOK)
+
+		// 覆盖之后旧 ETag 不再成立。
+		res := c.putObject(bucket, "cas", []byte("v3"), map[string]string{
+			"If-Match": etag,
 		})
-		requireS3Error(t, res, http.StatusNotImplemented, "NotImplemented")
+		requireS3Error(t, res, http.StatusPreconditionFailed, "PreconditionFailed")
+
+		// 对象不存在时 `*` 同样不成立。
+		res = c.putObject(bucket, "cas-missing", []byte("x"), map[string]string{
+			"If-Match": "*",
+		})
+		requireS3Error(t, res, http.StatusPreconditionFailed, "PreconditionFailed")
 	})
 
 	t.Run("不存在的桶与对象", func(t *testing.T) {

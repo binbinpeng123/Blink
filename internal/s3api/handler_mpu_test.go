@@ -639,3 +639,24 @@ func TestGetObjectPartNumberAfterComplete(t *testing.T) {
 		t.Errorf("普通 GET 不应带 x-amz-mp-parts-count: %q", got)
 	}
 }
+
+// TestCompleteMultipartUploadRejectsIfMatch 验证 Complete 上显式拒绝 If-Match。
+//
+// 接受后忽略会把"仅当目标版本未变才提交"降级成无条件覆盖 —— 这是数据
+// 丢失，不是少个特性。If-None-Match:* 仍然支持（store 已在 key 锁内判定）。
+func TestCompleteMultipartUploadRejectsIfMatch(t *testing.T) {
+	h := objectTestServer(t)
+	for _, v := range []string{`"some-etag"`, "*"} {
+		t.Run(v, func(t *testing.T) {
+			rec := mpuRequest(t, h, http.MethodPost, "/bkt/k?uploadId=whatever",
+				strings.NewReader(`<CompleteMultipartUpload></CompleteMultipartUpload>`),
+				func(r *http.Request) { r.Header.Set("If-Match", v) })
+			if rec.Code != http.StatusNotImplemented {
+				t.Fatalf("状态码 = %d，期望 501 (%s)", rec.Code, rec.Body.String())
+			}
+			if got := decodeError(t, rec).Code; got != "NotImplemented" {
+				t.Errorf("Code = %q，期望 NotImplemented", got)
+			}
+		})
+	}
+}

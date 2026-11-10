@@ -169,16 +169,67 @@ func TestPutObjectPreconditionFailed(t *testing.T) {
 	}
 }
 
-// 不支持的条件写必须明确拒绝，不能静默降级成无条件覆盖。
+// TestPutObjectIfMatch 验证 PUT 上的 If-Match 往返：
+// 用上一次响应回传的 ETag（带引号）可以覆盖，旧 ETag 则 412。
+func TestPutObjectIfMatch(t *testing.T) {
+	h := objectTestServer(t)
+	first := putObject(t, h, "/bkt/cas", "v1", nil)
+	if first.Code != http.StatusOK {
+		t.Fatalf("首次写入失败: %d (%s)", first.Code, first.Body.String())
+	}
+	etag := first.Header().Get("ETag")
+
+	rec := putObject(t, h, "/bkt/cas", "v2", func(r *http.Request) {
+		r.Header.Set("If-Match", etag)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ETag 匹配时状态码 = %d，期望 200 (%s)", rec.Code, rec.Body.String())
+	}
+
+	rec = putObject(t, h, "/bkt/cas", "v3", func(r *http.Request) {
+		r.Header.Set("If-Match", etag)
+	})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("旧 ETag 状态码 = %d，期望 412 (%s)", rec.Code, rec.Body.String())
+	}
+
+	// `*` 只要求对象存在。
+	if rec := putObject(t, h, "/bkt/cas", "v4", func(r *http.Request) {
+		r.Header.Set("If-Match", "*")
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("If-Match:* 状态码 = %d，期望 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if rec := putObject(t, h, "/bkt/no-such-cas", "x", func(r *http.Request) {
+		r.Header.Set("If-Match", "*")
+	}); rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("对象不存在时状态码 = %d，期望 412 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// 不支持或不合法的条件写必须明确拒绝，不能静默降级成无条件覆盖。
 func TestPutObjectUnsupportedPreconditions(t *testing.T) {
 	h := objectTestServer(t)
-	for _, hdr := range []string{"If-Match", "If-None-Match"} {
-		t.Run(hdr, func(t *testing.T) {
+	cases := []struct {
+		name, header, value string
+		status              int
+		code                string
+	}{
+		// If-None-Match 只实现 `*`：具体 ETag 的"不匹配才写"本版本没有。
+		{"If-None-Match 具体 ETag", "If-None-Match", `"some-etag"`, http.StatusNotImplemented, "NotImplemented"},
+		// 多值列表会让"任一匹配"退化成"只认第一个"，必须拒绝。
+		{"If-Match 列表", "If-Match", `"a", "b"`, http.StatusBadRequest, "InvalidArgument"},
+		{"If-Match 空 ETag", "If-Match", `""`, http.StatusBadRequest, "InvalidArgument"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			rec := putObject(t, h, "/bkt/cond", "x", func(r *http.Request) {
-				r.Header.Set(hdr, `"some-etag"`)
+				r.Header.Set(tc.header, tc.value)
 			})
-			if rec.Code != http.StatusNotImplemented {
-				t.Fatalf("状态码 = %d，期望 501", rec.Code)
+			if rec.Code != tc.status {
+				t.Fatalf("状态码 = %d，期望 %d (%s)", rec.Code, tc.status, rec.Body.String())
+			}
+			if got := decodeError(t, rec).Code; got != tc.code {
+				t.Errorf("错误码 = %q，期望 %s", got, tc.code)
 			}
 		})
 	}

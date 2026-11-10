@@ -51,10 +51,10 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
-	// 条件写：只支持 If-None-Match: *（02 文档）。
+	// 条件写：If-None-Match: * 与 If-Match（具体 ETag 或 *）。
 	// 其他形式不静默忽略 —— 客户端明确要求了"仅当 ETag 不等于 X 才写"，
 	// 忽略它就变成了无条件覆盖，是数据丢失而不是"少个特性"。
-	condErr := checkPutPreconditions(r)
+	cond, condErr := parseWriteConditions(r)
 	if condErr != nil {
 		condErr.Write(w, r, reqID)
 		return
@@ -94,7 +94,9 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		Checksum:          declared,
 		LateChecksum:      lateChecksum,
 		ContentMD5:        contentMD5,
-		IfNoneMatchAny:    strings.TrimSpace(r.Header.Get("If-None-Match")) == "*",
+		IfNoneMatchAny:    cond.ifNoneMatchAny,
+		IfMatchETag:       cond.ifMatchETag,
+		IfMatchAny:        cond.ifMatchAny,
 		ExpectedSize:      r.ContentLength,
 	})
 	if err != nil {
@@ -128,20 +130,57 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 	)
 }
 
-// checkPutPreconditions 解析写请求上的前置条件。
+// writeConditions 是写请求上已解析的前置条件。
 //
-// 只实现 If-None-Match: *。其余形式（带具体 ETag 的 If-None-Match、If-Match）
-// 返回 501 而不是忽略：忽略等价于把用户的"仅当…才写"降级成无条件覆盖。
-func checkPutPreconditions(r *http.Request) *s3err.Error {
-	if v := strings.TrimSpace(r.Header.Get("If-None-Match")); v != "" && v != "*" {
-		return s3err.New(s3err.CodeNotImplemented).
-			WithMessage("仅支持 `If-None-Match: *`。")
+// 三个字段同时为零值表示客户端没有提条件；存储层据此跳过旧元数据比较，
+// 但仍然会在 key 锁内读取一次 prev 以递增 obj_version。
+type writeConditions struct {
+	ifNoneMatchAny bool
+	ifMatchETag    string
+	ifMatchAny     bool
+}
+
+// parseWriteConditions 解析写请求上的前置条件。
+//
+// If-None-Match 只实现 `*`；带具体 ETag 的形式返回 501。If-Match 支持
+// 单个 ETag（可带 W/ 与引号）和 `*`；逗号分隔的列表返回 400 ——
+// AWS 的条件写同样只接受单个 ETag，静默取第一个会让"任一匹配"变成
+// "只认第一个"，客户端无法察觉。
+//
+// 这里不做"当前对象是否匹配"的判断：那必须在存储层的 key 锁内完成，
+// 否则检查与提交之间会插入别的写者。
+func parseWriteConditions(r *http.Request) (writeConditions, *s3err.Error) {
+	var cond writeConditions
+
+	if v := strings.TrimSpace(r.Header.Get("If-None-Match")); v != "" {
+		if v != "*" {
+			return cond, s3err.New(s3err.CodeNotImplemented).
+				WithMessage("仅支持 `If-None-Match: *`。")
+		}
+		cond.ifNoneMatchAny = true
 	}
-	if v := strings.TrimSpace(r.Header.Get("If-Match")); v != "" {
-		return s3err.New(s3err.CodeNotImplemented).
-			WithMessage("写请求暂不支持 If-Match。")
+
+	raw := strings.TrimSpace(r.Header.Get("If-Match"))
+	if raw == "" {
+		return cond, nil
 	}
-	return nil
+	if raw == "*" {
+		cond.ifMatchAny = true
+		return cond, nil
+	}
+	if strings.Contains(raw, ",") {
+		return cond, s3err.New(s3err.CodeInvalidArgument).
+			WithMessage("写请求的 If-Match 只支持单个 ETag 或 `*`。")
+	}
+
+	etag := strings.TrimPrefix(raw, "W/")
+	etag = strings.Trim(strings.TrimSpace(etag), `"`)
+	if etag == "" {
+		return cond, s3err.New(s3err.CodeInvalidArgument).
+			WithMessage("If-Match 的 ETag 不能为空。")
+	}
+	cond.ifMatchETag = etag
+	return cond, nil
 }
 
 // parseContentMD5 把头部里的 base64 Content-MD5 转成小写十六进制。

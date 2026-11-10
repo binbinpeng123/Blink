@@ -326,3 +326,46 @@ func TestCopyObjectMissingBucket(t *testing.T) {
 		t.Errorf("Code = %q，期望 NoSuchBucket", got)
 	}
 }
+
+// TestCopyObjectDestinationIfMatch 验证 COPY 目标上的 If-Match 与 PUT 同语义：
+// 目标 ETag 匹配才覆盖，否则 412；`*` 只要求目标存在。
+func TestCopyObjectDestinationIfMatch(t *testing.T) {
+	h := objectTestServer(t)
+	putObject(t, h, "/bkt/src", "payload", nil)
+	dst := putObject(t, h, "/bkt/dst", "old", nil)
+	if dst.Code != http.StatusOK {
+		t.Fatalf("目标初始化失败: %d (%s)", dst.Code, dst.Body.String())
+	}
+	etag := dst.Header().Get("ETag")
+
+	rec := doCopy(t, h, "/bkt/dst", "/bkt/src", func(r *http.Request) {
+		r.Header.Set("If-Match", etag)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ETag 匹配时状态码 = %d，期望 200 (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 覆盖之后旧 ETag 不再成立。
+	rec = doCopy(t, h, "/bkt/dst", "/bkt/src", func(r *http.Request) {
+		r.Header.Set("If-Match", etag)
+	})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("旧 ETag 状态码 = %d，期望 412 (%s)", rec.Code, rec.Body.String())
+	}
+	if got := decodeError(t, rec).Code; got != string(s3err.CodePreconditionFailed) {
+		t.Errorf("Code = %q，期望 PreconditionFailed", got)
+	}
+
+	if rec := doCopy(t, h, "/bkt/dst", "/bkt/src", func(r *http.Request) {
+		r.Header.Set("If-Match", "*")
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("If-Match:* 状态码 = %d，期望 200 (%s)", rec.Code, rec.Body.String())
+	}
+
+	rec = doCopy(t, h, "/bkt/fresh", "/bkt/src", func(r *http.Request) {
+		r.Header.Set("If-Match", "*")
+	})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("目标不存在时状态码 = %d，期望 412 (%s)", rec.Code, rec.Body.String())
+	}
+}

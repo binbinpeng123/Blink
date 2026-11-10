@@ -39,7 +39,8 @@
 | **CopyObject 单次上限 5 GiB；更大对象须走 `UploadPartCopy`** | 与 S3 单次复制契约一致；分片复制在切片 11 实现，单分片上限同为 5 GiB | 源对象 > 5 GiB → `400 InvalidRequest`；客户端可用 `UploadPartCopy` 按 ≤5 GiB 区间复制。**aws-cli 2.36.2 的 `s3 cp s3://… s3://…` 默认 `--copy-props default` 会先调用 `GetObjectTagging`（本版本 `501`），因此大对象服务端复制必须加 `--copy-props none`** |
 | **单机模式不能复制 EC 布局的源对象** | 单机路径复制只搬运元数据，无法保证目标节点上存在对应分片 | 返回 `501 NotImplemented`。集群模式走流式重写，不受此限制 |
 | **集群 CopyObject 不是零拷贝** | 目标副本需按目标 key 的环位置重新分布，数据必须经协调者流式读一次、写一次 | 耗时与对象大小线性相关。**O(1) 元数据复制只对单机模式成立**，文档与响应均不得宣称集群复制零拷贝 |
-| **CopyObject 的条件检查与写入非原子** | 源条件在读取源后求值，目标 `If-None-Match: *` 在写入前检查，期间无全局锁 | 并发复制到同一目标时，条件可能被同时满足（与集群条件写的"尽力而为"同源）；单客户端顺序操作不受影响 |
+| **CopyObject 的源条件检查与写入非原子** | 源条件（`x-amz-copy-source-if-*`）在读取源后求值，与随后的复制之间无全局锁；目标 `If-None-Match: *` / `If-Match` 则在目标 key 锁内判定 | 源在检查与复制之间被覆盖时复制到新版本（与 S3 语义一致：条件针对"观察到的源版本"）。集群模式下目标条件写是尽力而为，并发复制到同一目标时可能被同时满足；单机与单客户端顺序操作不受影响 |
+| **集群条件写是尽力而为** | 写前 `probeMetas` 读 R 份元数据判定 `If-None-Match: *` / `If-Match`，probe 与 meta 提交之间无跨节点锁 | 两个协调者对同一 key 的并发条件写可能都成功，不提供线性化保证；`CompleteMultipartUpload` 的 `If-Match` 显式 `501`，不做降级 |
 | **DeleteObjects 单次最多 1000 个对象** | 与 S3 契约一致，防止单请求占用过多 worker 与内存 | 超过 1000 或 XML 非法 → `400 MalformedXML`；更大批量需客户端分批 |
 | **Range 不支持多区间** | 简化实现，S3 客户端极少使用 | 多区间请求返回 `501` |
 | **分片下载（`partNumber=N`）只对分片上传对象生效** | 边界来自 Complete 时写入 `meta.json` 的 `parts`；`PutObject`/`CopyObject` 不产生该字段 | 非分片对象 `partNumber=1` 返回 `200` 整对象，`partNumber>1` → `416 InvalidPartNumber`；复制后的对象不保留源分片边界 |

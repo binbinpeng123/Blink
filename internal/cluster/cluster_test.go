@@ -195,6 +195,17 @@ func putObject(t *testing.T, cl *Cluster, bucket, key string, data []byte) *stor
 	return info
 }
 
+// putWithOpts 以额外的前置条件写入并断言成功，供条件写的"应成功"分支使用。
+func putWithOpts(t *testing.T, cl *Cluster, bucket, key string, data []byte, opt store.PutOptions) *store.ObjectInfo {
+	t.Helper()
+	opt.ExpectedSize = int64(len(data))
+	info, err := cl.PutObject(bucket, key, bytes.NewReader(data), opt)
+	if err != nil {
+		t.Fatalf("条件写入 %s 失败: %v", key, err)
+	}
+	return info
+}
+
 func readAll(t *testing.T, cl *Cluster, bucket, key string) []byte {
 	t.Helper()
 	r, err := cl.OpenObject(bucket, key)
@@ -464,5 +475,68 @@ func TestReplicatedUnavailableWhenQuorumLost(t *testing.T) {
 	}
 	if err := nodes[0].cl.DeleteObject(bucket, key); !errors.Is(err, store.ErrUnavailable) {
 		t.Errorf("删除错误 = %v，期望 ErrUnavailable", err)
+	}
+}
+
+// TestReplicatedIfMatchPut 验证 If-Match 在跨节点写前 barrier 上生效：
+// 判定依据是 probeMetas 观察到的最新**活**副本，不是本地 meta。
+func TestReplicatedIfMatchPut(t *testing.T) {
+	nodes := newTestNodes(t, 3)
+	const bucket, key = "test-bucket", "cas.txt"
+	createBucketOnAll(t, nodes, bucket)
+
+	first := putObject(t, nodes[0].cl, bucket, key, []byte("v1"))
+
+	// 用非写入协调者、拿第一次响应的 ETag 覆盖：必须成功。
+	putWithOpts(t, nodes[1].cl, bucket, key, []byte("v2"), store.PutOptions{
+		IfMatchETag: first.ETag,
+	})
+	// 旧 ETag 已被覆盖，再写必须 412。
+	if _, err := nodes[2].cl.PutObject(bucket, key, strings.NewReader("v3"), store.PutOptions{
+		ExpectedSize: 2,
+		IfMatchETag:  first.ETag,
+	}); !errors.Is(err, store.ErrPreconditionFailed) {
+		t.Fatalf("旧 ETag 条件写错误 = %v，期望 ErrPreconditionFailed", err)
+	}
+	// `*` 只要求对象存在。
+	putWithOpts(t, nodes[0].cl, bucket, key, []byte("v4"), store.PutOptions{IfMatchAny: true})
+
+	if _, err := nodes[1].cl.PutObject(bucket, "absent", strings.NewReader("x"), store.PutOptions{
+		ExpectedSize: 1,
+		IfMatchAny:   true,
+	}); !errors.Is(err, store.ErrPreconditionFailed) {
+		t.Fatalf("对象不存在时 If-Match:* 错误 = %v，期望 ErrPreconditionFailed", err)
+	}
+
+	for _, n := range nodes {
+		if got := string(readAll(t, n.cl, bucket, key)); got != "v4" {
+			t.Errorf("节点 %s 读到 %q，期望 v4", n.id, got)
+		}
+	}
+}
+
+// TestReplicatedIfMatchIgnoresTombstone 验证集群条件写把墓碑当成"没有对象"：
+// 墓碑的 ETag 是删除前的旧值，用它匹配会与单机语义分叉。
+func TestReplicatedIfMatchIgnoresTombstone(t *testing.T) {
+	nodes := newTestNodes(t, 3)
+	const bucket, key = "test-bucket", "deleted.txt"
+	createBucketOnAll(t, nodes, bucket)
+
+	first := putObject(t, nodes[0].cl, bucket, key, []byte("v1"))
+	if err := nodes[1].cl.DeleteObject(bucket, key); err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+
+	if _, err := nodes[2].cl.PutObject(bucket, key, strings.NewReader("v2"), store.PutOptions{
+		ExpectedSize: 2,
+		IfMatchETag:  first.ETag,
+	}); !errors.Is(err, store.ErrPreconditionFailed) {
+		t.Fatalf("删除后旧 ETag 条件写错误 = %v，期望 ErrPreconditionFailed", err)
+	}
+	if _, err := nodes[2].cl.PutObject(bucket, key, strings.NewReader("v2"), store.PutOptions{
+		ExpectedSize: 2,
+		IfMatchAny:   true,
+	}); !errors.Is(err, store.ErrPreconditionFailed) {
+		t.Fatalf("删除后 If-Match:* 错误 = %v，期望 ErrPreconditionFailed", err)
 	}
 }

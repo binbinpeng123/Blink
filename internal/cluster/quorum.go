@@ -117,6 +117,24 @@ func latestMeta(results []metaResult) *store.ObjectMeta {
 	return latest
 }
 
+// latestLiveMeta 返回响应中版本最新的**活对象**元数据；只有墓碑时返回 nil。
+//
+// 条件写 If-Match 要比较的是"当前可见对象的 ETag"。latestMeta 会返回墓碑，
+// 而墓碑的 ETag 是删除前的旧值：拿它来匹配会让"删除后仍用旧 ETag 写入"
+// 通过条件检查，与单机语义不一致。
+func latestLiveMeta(results []metaResult) *store.ObjectMeta {
+	var latest *store.ObjectMeta
+	for _, r := range results {
+		if r.err != nil || !r.found || r.meta == nil || r.meta.Deleted {
+			continue
+		}
+		if latest == nil || newerMeta(r.meta, latest) {
+			latest = r.meta
+		}
+	}
+	return latest
+}
+
 // firstError 返回第一个非 nil 的错误，仅用于日志与排障。
 func firstError(results []metaResult) error {
 	for _, r := range results {

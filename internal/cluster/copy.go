@@ -73,6 +73,8 @@ func (c *Cluster) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt st
 		ContentType:    info.ContentType,
 		UserMeta:       info.UserMeta,
 		IfNoneMatchAny: opt.IfNoneMatchAny,
+		IfMatchETag:    opt.IfMatchETag,
+		IfMatchAny:     opt.IfMatchAny,
 		ExpectedSize:   info.Size,
 	}
 	if opt.ReplaceMetadata {
