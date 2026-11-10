@@ -22,6 +22,17 @@ type Options struct {
 	// InlineThreshold 是小对象免分片阈值，零值取 64 KiB；
 	// 显式赋 0 之外的负值视为禁用小对象快路径。
 	InlineThreshold int64
+	// InlineObjectMaxSize 是"内容内联"的对象大小上限，零值或负值关闭。
+	//
+	// 开启后，声明长度不超过该值且实际长度一致的对象，内容直接写进
+	// meta.json，不再写 CAS 块文件：一次 rename 同时提交数据与元数据，
+	// 省掉块文件的 write+fsync+rename+dirsync，也省掉一次 CAS 查找。
+	// 上限必须不大于 InlineThreshold（最终也不大于 BlockSize），否则
+	// 一个对象会跨越多个块，内联就失去"单块"这一前提。
+	//
+	// 零值关闭是刻意的：既有测试与直接使用 store 包的调用方行为不变；
+	// 服务端由 config 显式设置默认值。
+	InlineObjectMaxSize int64
 	// Now 可注入时间源，便于测试断言 mtime；为零值时用 time.Now。
 	Now func() time.Time
 	// FS 可注入文件系统实现，用于故障注入测试；为零值时用真实文件系统。
@@ -53,6 +64,8 @@ type Store struct {
 
 	blockSize       int64
 	inlineThreshold int64
+	// inlineObjectMax 见 Options.InlineObjectMaxSize；0 表示关闭。
+	inlineObjectMax int64
 	// verifyOnRead 见 Options.VerifyOnRead。只读，不需要同步。
 	verifyOnRead bool
 	// disk 是容量水位状态；为 nil 表示未启用容量保护。
@@ -154,6 +167,16 @@ func Open(opt Options) (*Store, error) {
 		// 自己配的值生效了（与 fsync 策略的校验同一个理由）。
 		return nil, fmt.Errorf("store: 内联阈值 %d 大于块大小 %d", inline, blockSize)
 	}
+	inlineObjectMax := opt.InlineObjectMaxSize
+	if inlineObjectMax < 0 {
+		inlineObjectMax = 0
+	}
+	if inlineObjectMax > inline {
+		// 内容内联要求"一个对象恰好一个块"：上限越过阈值或块边界后，
+		// 对象会被切成多个块，把多块内容塞进 meta 只会制造两套块语义。
+		return nil, fmt.Errorf("store: 内联对象上限 %d 大于小对象阈值 %d",
+			inlineObjectMax, inline)
+	}
 
 	s := &Store{
 		root:            opt.Root,
@@ -162,6 +185,7 @@ func Open(opt Options) (*Store, error) {
 		now:             now,
 		blockSize:       blockSize,
 		inlineThreshold: inline,
+		inlineObjectMax: inlineObjectMax,
 		verifyOnRead:    opt.VerifyOnRead,
 		buckets:         make(map[string]*bucketMeta),
 		cors:            make(map[string]*CORSConfiguration),

@@ -81,6 +81,12 @@ func (s *Store) scrubObject(ctx context.Context, bucket, key string) error {
 	case err != nil:
 		return fsErr("读取对象元数据", key, err)
 	}
+	// 内联对象没有 CAS 块可查：数据就在 meta.json 里，校验内容哈希与
+	// CRC32C 即可。必须在下面的块循环之前分流，否则会去 CAS 找那个
+	// 只存在于元数据中的块，把每一个健康的内联对象误报成损坏。
+	if m.Layout == LayoutInline {
+		return s.scrubInline(m)
+	}
 	for i := range m.Blocks {
 		if err := ctx.Err(); err != nil {
 			return err

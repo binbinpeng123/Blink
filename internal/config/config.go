@@ -35,9 +35,15 @@ const (
 	DefaultMaxClockSkew    = 15 * time.Minute
 	DefaultBlockSize       = 4 << 20 // 4 MiB
 	DefaultInlineThreshold = 64 << 10
-	DefaultHighWatermark   = 0.90
-	DefaultLowWatermark    = 0.85
-	DefaultMaxBucketCount  = 1000
+	// DefaultInlineObjectMaxSize 是内容内联的默认上限（创新 D0）。
+	//
+	// 4 KiB 覆盖边端最常见的配置、清单、小 JSON；再大就会明显放大
+	// LIST 的读放大（meta.json 内联后按 base64 膨胀 4/3），
+	// 基准与取舍见 docs/03 与 docs/09。
+	DefaultInlineObjectMaxSize = 4 << 10
+	DefaultHighWatermark       = 0.90
+	DefaultLowWatermark        = 0.85
+	DefaultMaxBucketCount      = 1000
 
 	// 集群默认值。单机模式下这些字段不参与任何行为。
 	DefaultInternalAddr = "0.0.0.0:9100"
@@ -98,8 +104,10 @@ const (
 	// 与 EnvScrubInterval（集群反熵，按环扫描分片）是两件事：
 	// 这里巡检的是**本节点上已存在的对象数据**。
 	EnvIntegrityInterval = "BLINK_INTEGRITY_INTERVAL"
-	EnvTLSCert           = "BLINK_TLS_CERT"
-	EnvTLSKey            = "BLINK_TLS_KEY"
+	// EnvInlineObjectMaxSize 控制"内容内联"的小对象上限；0 关闭。
+	EnvInlineObjectMaxSize = "BLINK_INLINE_OBJECT_MAX_SIZE"
+	EnvTLSCert             = "BLINK_TLS_CERT"
+	EnvTLSKey              = "BLINK_TLS_KEY"
 
 	// 集群成员与内部协议。密钥只从环境变量读取，不提供命令行参数：
 	// 命令行会出现在进程列表与 shell 历史里，而共享密钥泄露等于全集群失守。
@@ -161,6 +169,12 @@ type Config struct {
 	BlockSize int64
 	// InlineThreshold 是小对象免分片阈值。
 	InlineThreshold int64
+	// InlineObjectMaxSize 是内容内联的对象大小上限；0 关闭。
+	//
+	// 开启后，不超过该值的小对象把内容写进 meta.json，由一次 rename
+	// 同时提交数据与元数据，省掉一次块文件持久化。上限不得大于
+	// InlineThreshold（一个对象必须是一个块）。
+	InlineObjectMaxSize int64
 	// VerifyOnRead 开启读取时逐块 CRC32C 校验。
 	//
 	// 默认关闭以保留 sendfile 零拷贝读路径；打开后每块先校验再写出，
@@ -383,25 +397,26 @@ func (c Config) CredentialCount() int {
 // Default 返回全部使用默认值的配置（凭据为空）。
 func Default() Config {
 	return Config{
-		Addr:              DefaultAddr,
-		DataDir:           DefaultDataDir,
-		Region:            DefaultRegion,
-		LogLevel:          DefaultLogLevel,
-		MaxClockSkew:      DefaultMaxClockSkew,
-		FsyncPolicy:       DefaultFsyncPolicy,
-		IntegrityInterval: DefaultIntegrityInterval,
-		BlockSize:         DefaultBlockSize,
-		InlineThreshold:   DefaultInlineThreshold,
-		HighWatermark:     DefaultHighWatermark,
-		LowWatermark:      DefaultLowWatermark,
-		MaxBucketCount:    DefaultMaxBucketCount,
-		ClusterMode:       DefaultClusterMode,
-		InternalAddr:      DefaultInternalAddr,
-		ReplicaCount:      DefaultReplicaCount,
-		WriteQuorum:       DefaultWriteQuorum,
-		ReadQuorum:        DefaultReadQuorum,
-		VNodes:            DefaultVNodes,
-		PeerTimeout:       DefaultPeerTimeout,
+		Addr:                DefaultAddr,
+		DataDir:             DefaultDataDir,
+		Region:              DefaultRegion,
+		LogLevel:            DefaultLogLevel,
+		MaxClockSkew:        DefaultMaxClockSkew,
+		FsyncPolicy:         DefaultFsyncPolicy,
+		IntegrityInterval:   DefaultIntegrityInterval,
+		BlockSize:           DefaultBlockSize,
+		InlineThreshold:     DefaultInlineThreshold,
+		InlineObjectMaxSize: DefaultInlineObjectMaxSize,
+		HighWatermark:       DefaultHighWatermark,
+		LowWatermark:        DefaultLowWatermark,
+		MaxBucketCount:      DefaultMaxBucketCount,
+		ClusterMode:         DefaultClusterMode,
+		InternalAddr:        DefaultInternalAddr,
+		ReplicaCount:        DefaultReplicaCount,
+		WriteQuorum:         DefaultWriteQuorum,
+		ReadQuorum:          DefaultReadQuorum,
+		VNodes:              DefaultVNodes,
+		PeerTimeout:         DefaultPeerTimeout,
 
 		RepairInterval:       DefaultRepairInterval,
 		ScrubInterval:        DefaultScrubInterval,
@@ -458,6 +473,7 @@ func Load(args []string, out io.Writer) (Config, error) {
 	fs.DurationVar(&cfg.MaxClockSkew, "max-clock-skew", cfg.MaxClockSkew, "签名校验允许的时钟偏移")
 	fs.Int64Var(&cfg.BlockSize, "block-size", cfg.BlockSize, "大对象块大小（字节）")
 	fs.Int64Var(&cfg.InlineThreshold, "inline-threshold", cfg.InlineThreshold, "小对象内联阈值（字节）")
+	fs.Var(sizeValue{&cfg.InlineObjectMaxSize}, "inline-object-max-size", "内容内联的对象大小上限，0 关闭（环境变量 "+EnvInlineObjectMaxSize+"）")
 	fs.Float64Var(&cfg.HighWatermark, "disk-high-watermark", cfg.HighWatermark, "拒绝写入的磁盘水位")
 	fs.Float64Var(&cfg.LowWatermark, "disk-low-watermark", cfg.LowWatermark, "恢复写入的磁盘水位")
 	fs.IntVar(&cfg.MaxBucketCount, "max-buckets", cfg.MaxBucketCount, "桶数量软上限")
@@ -514,6 +530,8 @@ func applyEnv(cfg *Config) {
 	cfg.applyIntEnv(EnvECK, &cfg.ECK, &cfg.clusterEnvErr)
 	cfg.applyIntEnv(EnvECM, &cfg.ECM, &cfg.clusterEnvErr)
 	cfg.applySizeEnv(EnvECMinSize, &cfg.ECMinSize, &cfg.clusterEnvErr)
+	// 内容内联在单机模式下同样生效，错误必须记入 envErr。
+	cfg.applySizeEnv(EnvInlineObjectMaxSize, &cfg.InlineObjectMaxSize, &cfg.envErr)
 
 	if v := os.Getenv("BLINK_MAX_CLOCK_SKEW"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -756,6 +774,18 @@ func (c Config) Validate() error {
 	if c.InlineThreshold > c.BlockSize {
 		problems = append(problems, "inline-threshold 不应大于 block-size")
 	}
+	if c.InlineObjectMaxSize < 0 {
+		problems = append(problems, "inline-object-max-size 不能为负数（0 表示关闭）")
+	}
+	// InlineThreshold==0 在 store 层会取默认 64 KiB，因此比较对象是
+	// "实际生效的阈值"，而不是字面上的 0。
+	inlineLimit := c.InlineThreshold
+	if inlineLimit == 0 {
+		inlineLimit = DefaultInlineThreshold
+	}
+	if c.InlineObjectMaxSize > inlineLimit {
+		problems = append(problems, "inline-object-max-size 不应大于 inline-threshold")
+	}
 	if c.MaxClockSkew <= 0 {
 		problems = append(problems, "max-clock-skew 必须为正数")
 	}
@@ -857,6 +887,7 @@ func (c Config) Redacted() map[string]string {
 		"cluster_mode":           c.ClusterMode,
 		"block_size":             strconv.FormatInt(c.BlockSize, 10),
 		"inline_threshold":       strconv.FormatInt(c.InlineThreshold, 10),
+		"inline_object_max_size": strconv.FormatInt(c.InlineObjectMaxSize, 10),
 		"verify_read":            strconv.FormatBool(c.VerifyOnRead),
 		"high_watermark":         strconv.FormatFloat(c.HighWatermark, 'f', 2, 64),
 		"low_watermark":          strconv.FormatFloat(c.LowWatermark, 'f', 2, 64),

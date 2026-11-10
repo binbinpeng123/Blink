@@ -87,6 +87,13 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 	if src.Layout == LayoutEC {
 		return nil, fmt.Errorf("%w: 纠删码布局的对象不能通过单机路径复制", ErrNotImplemented)
 	}
+	// 内联对象的内容不在 CAS 里：复制必须连同 InlineData 一起搬走，
+	// 且源数据先做结构校验，避免把一条损坏的元数据复制成两条。
+	if src.Layout == LayoutInline {
+		if err := validateInlineMeta(src); err != nil {
+			return nil, err
+		}
+	}
 	if src.Size > MaxCopyObjectSize {
 		return nil, fmt.Errorf("%w: 源对象 %d 字节超过 %d 字节上限，请使用分片上传",
 			ErrInvalidRequest, src.Size, MaxCopyObjectSize)
@@ -129,7 +136,12 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 		// 块表按值复制一份：meta 是只读快照，但两个 meta 共享同一个
 		// 底层数组会让将来的任何原地改动（如修复逻辑）同时改到源对象。
 		// 复制 1300 个块描述是微秒级操作，换掉这类隐性耦合值得。
-		Blocks:            append([]BlockDesc(nil), src.Blocks...),
+		Blocks: append([]BlockDesc(nil), src.Blocks...),
+		Layout: src.Layout,
+		// 内容也要深拷贝：与 Blocks 同理，源 meta 是只读快照，
+		// 但两个 meta 共享 InlineData 底层数组会让将来任何原地修改
+		// （例如校验读修复）同时改到源对象。
+		InlineData:        append([]byte(nil), src.InlineData...),
 		Checksum:          src.Checksum,
 		ChecksumAlgorithm: src.ChecksumAlgorithm,
 		ChecksumType:      src.ChecksumType,

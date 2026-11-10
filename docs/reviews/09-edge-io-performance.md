@@ -129,6 +129,36 @@ LIST 的数字不受影响，也不存在"缓存让 LIST 少扫盘"的假象。
 
 16 MiB 只提升 4%，符合预期：大对象的时间在块数据搬运上，元数据只占一次。
 
+### 小对象内容内联（创新 D0，已落地）
+
+**问题**：1 KiB 对象走 CAS 时，GET 仍要打开/`Stat` 一个块文件，PUT 要写块文件
+并提交两次持久化屏障。数据只有 1 KiB，文件系统与元数据成本盖过了数据本身。
+
+**做法**：`ExpectedSize` 在 `(0, 4 KiB]` 内且实际长度恰好匹配时，内容直接存进
+`meta.json` 的 `inline_data`，只做一次原子元数据提交；读取时直接切片写出。
+长度不符回退普通流式路径。完整设计与兼容性见 03 文档"创新 D0"。
+
+**结果**（Apple M4 / APFS，`-benchtime=200x -count=3`，1 KiB 内容）：
+
+| 基准 | CAS（关闭内联） | 内联 | 变化 |
+| --- | --- | --- | --- |
+| PUT 1 KiB | 8.29–8.82 ms | 8.14–8.80 ms | 中位 8.49 → 8.16 ms（−3.9%，落在噪声内） |
+| GET 1 KiB | 52.9–65.4 µs | 335–685 ns | **≈100×** |
+| LIST 1000 对象（1 KiB） | 16.1–16.3 ms | 18.2–19.1 ms | +14%～17% |
+| LIST 1000 对象（4 KiB） | 16.3–16.8 ms | 18.7–19.7 ms | +15%～18% |
+
+**解读**：
+
+- PUT 的延迟仍由 `writeFileAtomic` 的 fsync 主导（APFS 上约 8 ms），少写一个
+  CAS 块在延迟上测不出来；真实收益是**少一个持久化对象**（无 CAS 块文件、
+  无孤儿块、低写放大），对 eMMC/SD 卡寿命有利，但本机无法验证。
+- GET 的收益来自路径长度：命中元数据缓存后，内联对象只剩一次切片与
+  `Write`，没有 `Stat`/`Open`/`sendfile`。
+- LIST 的退化来自 `meta.json` 变大与 base64 膨胀。1 KiB 与 4 KiB 内容在同一
+  量级（+14%～18%），说明当前规模下固定解析开销仍占主导。**这是默认值定为
+  4 KiB 而不是更大的依据之一**；10 万对象规模未实测（受本机写入总量约束），
+  不得外推。
+
 ### 块级哈希与整对象 MD5 并行（已落地，切片 16）
 
 **问题**：16 MiB PUT 的 CPU profile 显示 `crypto/md5.block` 占 **62.83%**，
@@ -213,6 +243,10 @@ MD5"，两者都需要新的基准对照。
 满足接口抽取 <3% 的要求）。根因与后续方向见 `docs/design/known-limitations.md`
 （每对象 JSON + 小对象打包未实施）。
 
+内联（创新 D0）默认开启后，`meta.json` 对 4 KiB 以下对象按 base64 膨胀 4/3，
+LIST 的读放大随内联对象占比上升。1000 对象微基准为 +14%～18%（见上节）；
+10 万对象规模未实测，**不得用 1000 对象的比例直接外推**。
+
 ## 回滚条件
 
 出现以下任一情况，回滚对应改动而不是放宽断言：
@@ -224,6 +258,10 @@ MD5"，两者都需要新的基准对照。
 - 单机接口抽取性能回退 ≥3%（以 `BenchmarkGetRangeSequential`、
   `BenchmarkList100kObjects` 前后对照为准）。
 - 元数据缓存导致常驻内存增长超过 4 MiB + 1024 条的上限（应被 LRU 边界挡住）。
+- 内联对象与同内容普通对象的 ETag/校验和不一致，或内联读写、复制、巡检、
+  副本元数据校验任一测试失败。
+- 内联导致 1000 对象 LIST 相对关闭时回退超过 25%（以
+  `BenchmarkListSmallCAS`/`BenchmarkListSmallInline` 同机对照为准）。
 
 ## 未验证项（不得写成已通过）
 
@@ -232,6 +270,10 @@ MD5"，两者都需要新的基准对照。
   未测量。
 - 1 GiB 单对象写入（受本机写入总量约束未跑）。
 - 长稳（>24 h）运行下的缓存命中率与 GC 行为。
+- 内联对象在 10 万对象规模下对 LIST 的影响；以及 eMMC/SD 卡上"少一次块写入"
+  对写放大与介质寿命的实际收益。
+- 集群模式不产生内联对象这一结论的端到端验证（当前由代码路径保证，未在
+  多节点环境实测）。
 
 ## 验证命令
 
@@ -245,6 +287,9 @@ go test ./test/bench/ -run '^$' -bench 'BenchmarkGetObjectSizes' -benchtime=200m
 go test ./test/bench/ -run '^$' -bench 'BenchmarkGetRangeSequential' -benchtime=200ms -count=2
 go test ./test/bench/ -run '^$' -bench 'BenchmarkConcurrentPut1MiB' -benchtime=200ms -count=2
 go test ./test/bench/ -run '^$' -bench 'BenchmarkList100kObjects' -benchtime=1x -count=1
+
+go test ./internal/store/ -run 'TestInline' -count=1
+go test ./internal/store/ -run '^$' -bench 'Benchmark(Put|Get|List)Small' -benchtime=200x -count=3
 ```
 
 LIST 基准会预置 10 万对象（约 176 MB 写入），单独运行并计入本机写入总量。
