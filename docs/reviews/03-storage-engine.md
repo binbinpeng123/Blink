@@ -233,7 +233,7 @@
 | **B. 分片上传完成时仅串接块表，不重写数据** | ✅ 纳入 | 中 | `BenchmarkCompleteMultipart20GB` 断言耗时与写入量不随对象增长 |
 | **C. `sendfile` 零拷贝读路径 + 顺序预读** | ✅ 纳入 | 低 | `BenchmarkGetRangeSequential` 前后对照 |
 | **D0. 小对象内容内联进 `meta.json`** | ✅ 纳入（默认 ≤4 KiB，`0` 关闭） | 中 | `BenchmarkGetSmallInline`、`BenchmarkListSmallInline`、`BenchmarkPutSmallInline` 前后对照 |
-| **D. 小对象打包为只读 segment（needle 思路）** | ⏸ 未实施（D0 先落地的过渡方案） | 高 | `BenchmarkPutSmallObject10k`、`BenchmarkList100kObjects` 前后对照 |
+| **D. 小对象打包为只读 segment（needle 思路）** | ⏸ 本版本不实施（基线已测，见下方评估） | 高 | `BenchmarkPutSmallObject10k`、`BenchmarkList100kObjects` 前后对照 |
 | **E. 批量写与非标准 API** | ❌ 不做 | — | 保持"任意 S3 客户端可用"，不引入非标准接口 |
 | **F. 预热 / pin 接口** | ❌ 不做 | — | 零拷贝与内核页缓存已使热点模型自然驻留 |
 | **F'. TTL bucket（中间结果自动过期）** | ✅ 纳入（切片 18，2026-11-10，仅单机） | 低 | `TestBucketTTL*`、`TestSweepExpired*`、`TestCopyObjectUsesDestinationTTL`、`TestMultipartCompleteAppliesBucketTTL` |
@@ -289,6 +289,54 @@ LIST 必须读取每个对象的全部元数据，因此内联对象越多、内
 **回滚条件**：内联读写/复制/巡检/副本元数据任一致性测试失败，或内联对象的
 ETag 与同一内容的普通对象不一致，或 LIST 回退超过 25%（以
 `BenchmarkListSmallCAS` 与 `BenchmarkListSmallInline` 同机对照为准）。
+
+### 创新 D：小对象打包基线评估（2026-11-10，未实施）
+
+**本节回答"要不要做 D"，不实现 D。** 03 文档的开发纪律要求先有基线数据；
+数据如下，结论是本版本继续搁置。
+
+**方法**：`BenchmarkPutSmallObject10k`（`test/bench/small_object_bench_test.go`）
+向空桶顺序写入 10,000 个内容互不相同的 1 KiB 对象，使用线上默认
+`InlineObjectMaxSize=4 KiB`（即创新 D0 生效后的路径），计时包含完整
+`PutObject`（两次 fsync + 两次目录同步），不预置文件、不关闭持久化。
+LIST 一侧沿用已实现的 `BenchmarkList100kObjects`。
+
+**实测**（2026-11-10，Apple M4 / APFS / Go 1.27.2，`-benchtime=1x`）：
+
+| 指标 | 实测 |
+| --- | --- |
+| 10,000 × 1 KiB 写入总耗时 | 86.4 s |
+| 聚合速率 | 115.7 objects/s |
+| 单对象 P50 | 8.8 ms |
+| 单对象 P95 / P99 | 10.9 ms / 13.0 ms |
+| 单对象平均 | 8.6 ms |
+
+同一分支上 `BenchmarkList100kObjects` 的既有基线为 3.90–4.27 s
+（每对象 JSON + 全量扫描），仍远未达到 05 文档的 `< 500 ms` 目标。
+
+**为什么本版本不做**：
+
+1. **瓶颈不在对象数据布局，而在持久化屏障与元数据目录提交。** 1 KiB 对象
+   的内容内联后已不写 CAS 块，P50 8.8 ms 主要来自 `meta.json` 原子写与
+   目录同步。packing 若仍坚持"每个 PUT 都持久化"，就必须为 segment 追加
+   做同等级别的屏障；只有改成"批量刷盘 + 允许丢失最近一批"才可能显著降本，
+   那已经是持久性语义的变更，不能当作纯性能优化合入。
+2. **LIST 的成本来自逐对象 `meta.json`，打包对象数据本身不消除它。**
+   要同时改善 LIST，必须把索引也从每对象文件迁到聚合结构，等于重做元数据
+   层（布局、恢复、校验、GC、集群副本一致性全部受影响），成本评估为"高"。
+3. **D0 已经把最高频的读路径收益拿到。** 4 KiB 以下对象的 GET 不再打开
+   CAS 块，1 KiB GET 延迟此前已下降约两个数量级；继续叠加 D 的边际收益
+   不足以抵消其复杂度与崩溃恢复风险。
+
+**重新评估的触发条件**（满足任一即重新立项）：
+
+- 目标硬件（eMMC/SD 卡）上的小对象写入 P50 仍被固定开销主导，且
+  `BenchmarkPutSmallObject10k` 显示单对象成本没有随硬件代数改善；
+- 10 万对象 LIST 的 `< 500 ms` 目标成为发布阻塞项，且确认瓶颈在元数据
+  文件数而非解码 CPU；
+- 出现必须支持"每秒数万小对象写入"的明确产品需求。
+
+届时仍需先给出 D 的前后 benchmark 对照，未达标即回滚。
 
 ### 创新 F'：TTL bucket（2026-11-10 落地，仅单机）
 

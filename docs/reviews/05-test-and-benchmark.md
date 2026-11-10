@@ -155,6 +155,12 @@ BenchmarkSigV4Verify                       签名开销
 `BenchmarkGetRangeRandom/1GiB`、`BenchmarkDedupSecondCopy/1GiB`、
 `BenchmarkCompleteMultipart20GB` 目前仍是**计划项**，未实现为可执行基准。
 
+`BenchmarkPutSmallObject10k` 已于 2026-11-10 实现（`test/bench/small_object_bench_test.go`），
+补齐创新 D 的前置基线：10,000 个 1 KiB 对象、默认内容内联、`-benchtime=1x`，
+本机（Apple M4/APFS）总耗时 86.4 s、P50 8.8 ms、P95 10.9 ms、P99 13.0 ms、
+115.7 objects/s。结论与本版本不做 D 的理由见 03 文档。该基准单次迭代写入
+10 MiB，满足本机压测写入约束；默认不随 `go test ./...` 运行（无 `-bench` 时跳过）。
+
 每个基准使用 `b.ReportAllocs()` 与 `b.SetBytes(n)` 输出吞吐，并额外用 `b.ReportMetric` 记录每操作写入字节数 —— 使创新 A 与 B 的验收（写入量不增长）能被基准直接断言，而不依赖人工观察。
 
 ## 验收门槛
