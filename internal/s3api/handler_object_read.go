@@ -73,6 +73,14 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 		h := w.Header()
 		h.Set("ETag", quoteETag(info.ETag))
 		h.Set("Last-Modified", httpTime(info.Modified))
+		// RFC 7232 要求 304 回传会影响缓存判定的头：客户端据此刷新
+		// 缓存条目的新鲜度，而不是只更新"上次校验时间"。
+		if info.HTTPMeta.CacheControl != "" {
+			h.Set("Cache-Control", info.HTTPMeta.CacheControl)
+		}
+		if info.HTTPMeta.Expires != "" {
+			h.Set("Expires", info.HTTPMeta.Expires)
+		}
 		w.WriteHeader(http.StatusNotModified)
 		logger.Debug("object_not_modified",
 			slog.String("bucket", bucket),
@@ -193,6 +201,26 @@ func setObjectHeaders(h http.Header, info store.ObjectInfo) {
 	h.Set("Accept-Ranges", "bytes")
 	h.Set("Content-Type", info.ContentType)
 	h.Set("x-amz-storage-class", storageClassStandard)
+	// 标准 HTTP 元数据原样回传。空值不回传：S3 语义里"没有这个头"
+	// 与"头为空串"不同，`Content-Encoding: ` 这类空头会让部分客户端
+	// 按未知编码处理而拒绝响应。
+	if m := info.HTTPMeta; !m.IsZero() {
+		if m.CacheControl != "" {
+			h.Set("Cache-Control", m.CacheControl)
+		}
+		if m.ContentDisposition != "" {
+			h.Set("Content-Disposition", m.ContentDisposition)
+		}
+		if m.ContentEncoding != "" {
+			h.Set("Content-Encoding", m.ContentEncoding)
+		}
+		if m.ContentLanguage != "" {
+			h.Set("Content-Language", m.ContentLanguage)
+		}
+		if m.Expires != "" {
+			h.Set("Expires", m.Expires)
+		}
+	}
 	// 用户元数据必须用**全小写**的原始头名写进 map，不能走 h.Set：
 	// h.Set 会把键规范成 X-Amz-Meta-Owner，而 aws-cli（botocore）是按
 	// 原始大小写匹配 `x-amz-meta-` 前缀的，大写头会被解析成

@@ -127,6 +127,7 @@ func (c *Cluster) OpenObject(bucket, key string) (store.Reader, error) {
 			Modified:          latest.Modified,
 			ContentType:       latest.ContentType,
 			UserMeta:          latest.UserMeta,
+			HTTPMeta:          latest.HTTPMeta,
 			Checksum:          latest.Checksum,
 			ChecksumAlgorithm: checksum.Algorithm(latest.ChecksumAlgorithm),
 			ChecksumType:      latest.ChecksumType,

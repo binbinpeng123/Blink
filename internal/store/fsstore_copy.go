@@ -27,6 +27,8 @@ type CopyOptions struct {
 	ContentType string
 	// UserMeta 是 REPLACE 时的新用户元数据（键已去掉 x-amz-meta- 前缀）。
 	UserMeta map[string]string
+	// HTTPMeta 是 REPLACE 时的标准 HTTP 元数据；COPY 时从源对象复制。
+	HTTPMeta HTTPMeta
 	// IfNoneMatchAny 对应目标上的 If-None-Match: *。
 	IfNoneMatchAny bool
 	// IfMatchETag 对应目标上的 If-Match: "etag"：仅当目标当前 ETag 匹配才写。
@@ -136,12 +138,16 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 
 	contentType := src.ContentType
 	userMeta := src.UserMeta
+	httpMeta := src.HTTPMeta
 	if opt.ReplaceMetadata {
 		contentType = opt.ContentType
 		if contentType == "" {
 			contentType = defaultContentType
 		}
 		userMeta = opt.UserMeta
+		// REPLACE 是完整替换：请求里没带的头要清空，而不是沿用源对象的。
+		// 否则客户端无法通过 REPLACE 移除一个不再适用的 Cache-Control。
+		httpMeta = opt.HTTPMeta
 	}
 	if contentType == "" {
 		contentType = defaultContentType
@@ -159,6 +165,7 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 		Modified:    modified,
 		ExpiresAt:   s.expiresAtFor(dstBucket, modified),
 		UserMeta:    userMeta,
+		HTTPMeta:    httpMeta,
 		// 块表按值复制一份：meta 是只读快照，但两个 meta 共享同一个
 		// 底层数组会让将来的任何原地改动（如修复逻辑）同时改到源对象。
 		// 复制 1300 个块描述是微秒级操作，换掉这类隐性耦合值得。
@@ -190,6 +197,7 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 		Modified:          meta.Modified,
 		ContentType:       meta.ContentType,
 		UserMeta:          meta.UserMeta,
+		HTTPMeta:          meta.HTTPMeta,
 		Checksum:          meta.Checksum,
 		ChecksumAlgorithm: checksum.Algorithm(meta.ChecksumAlgorithm),
 		ChecksumType:      meta.ChecksumType,

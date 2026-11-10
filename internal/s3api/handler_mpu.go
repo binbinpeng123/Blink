@@ -42,6 +42,7 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 	up, err := s.store.CreateMultipartUpload(bucket, key, store.CreateMultipartOptions{
 		ContentType:       r.Header.Get("Content-Type"),
 		UserMeta:          userMetadata(r.Header),
+		HTTPMeta:          objectHTTPMeta(r.Header),
 		ChecksumAlgorithm: alg,
 		ChecksumType:      checksumType,
 	})

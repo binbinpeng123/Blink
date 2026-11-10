@@ -90,6 +90,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 	info, err := s.store.PutObject(bucket, key, r.Body, store.PutOptions{
 		ContentType:       r.Header.Get("Content-Type"),
 		UserMeta:          userMetadata(r.Header),
+		HTTPMeta:          objectHTTPMeta(r.Header),
 		ChecksumAlgorithm: alg,
 		Checksum:          declared,
 		LateChecksum:      lateChecksum,
@@ -289,6 +290,22 @@ func userMetadata(h http.Header) map[string]string {
 		out[k[len(prefix):]] = vals[0]
 	}
 	return out
+}
+
+// objectHTTPMeta 提取 S3 的「标准 HTTP 元数据」。
+//
+// Content-Encoding 必须经过 stripAWSChunked：aws-chunked 是传输层的
+// 分块框架，不是对象的真实编码。解帧之后若原样持久化，GET 回传的
+// `Content-Encoding: aws-chunked` 会让客户端按错误规则解码。
+// 其余四个头只做 trim：S3 不对它们做语义解释，回传时必须逐字节一致。
+func objectHTTPMeta(h http.Header) store.HTTPMeta {
+	return store.HTTPMeta{
+		CacheControl:       strings.TrimSpace(h.Get("Cache-Control")),
+		ContentDisposition: strings.TrimSpace(h.Get("Content-Disposition")),
+		ContentEncoding:    stripAWSChunked(h.Values("Content-Encoding")),
+		ContentLanguage:    strings.TrimSpace(h.Get("Content-Language")),
+		Expires:            strings.TrimSpace(h.Get("Expires")),
+	}
 }
 
 // isAWSChunked 判断请求体是否为 SigV4 流式签名的分块框架。

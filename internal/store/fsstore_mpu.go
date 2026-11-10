@@ -55,6 +55,7 @@ type MultipartUpload struct {
 
 	ContentType string
 	UserMeta    map[string]string
+	HTTPMeta    HTTPMeta
 	// ChecksumAlgorithm 与 ChecksumType 在建会话时确定，此后不可变：
 	// 每个分片的校验和必须按同一算法计算，否则 Complete 无从合并。
 	ChecksumAlgorithm checksum.Algorithm
@@ -65,6 +66,9 @@ type MultipartUpload struct {
 type CreateMultipartOptions struct {
 	ContentType string
 	UserMeta    map[string]string
+	// HTTPMeta 在 Complete 时写入对象元数据（会话创建时客户端声明的
+	// Cache-Control 等）。分片请求上的同名头不参与对象元数据。
+	HTTPMeta HTTPMeta
 	// ChecksumAlgorithm 为空表示客户端不要校验和。
 	ChecksumAlgorithm checksum.Algorithm
 	// ChecksumType 为空时按 02 文档归一：CRC64NVME → FULL_OBJECT，
@@ -161,12 +165,15 @@ type ListMultipartUploadsResult struct {
 // 与对象元数据一样是 JSON、一样整体原子替换：会话的字段很少、
 // 更新只在创建时发生一次，没有追加结构可言。
 type UploadState struct {
-	Version           int                `json:"version"`
-	UploadID          string             `json:"upload_id"`
-	Bucket            string             `json:"bucket"`
-	Key               string             `json:"key"`
-	ContentType       string             `json:"content_type"`
-	UserMeta          map[string]string  `json:"user_meta,omitempty"`
+	Version     int               `json:"version"`
+	UploadID    string            `json:"upload_id"`
+	Bucket      string            `json:"bucket"`
+	Key         string            `json:"key"`
+	ContentType string            `json:"content_type"`
+	UserMeta    map[string]string `json:"user_meta,omitempty"`
+	// HTTPMeta 与 ObjectMeta 的做法一致：匿名内嵌保持 upload.json
+	// 扁平，旧二进制忽略未知字段，不提升 version。
+	HTTPMeta
 	ChecksumAlgorithm checksum.Algorithm `json:"checksum_algorithm,omitempty"`
 	ChecksumType      string             `json:"checksum_type,omitempty"`
 	Initiated         time.Time          `json:"initiated"`
@@ -272,6 +279,7 @@ func NewMultipartUploadState(bucket, key, uploadID string, opt CreateMultipartOp
 		Key:               key,
 		ContentType:       contentType,
 		UserMeta:          opt.UserMeta,
+		HTTPMeta:          opt.HTTPMeta,
 		ChecksumAlgorithm: opt.ChecksumAlgorithm,
 		ChecksumType:      ct,
 		Initiated:         now.UTC().Truncate(time.Second),
@@ -635,6 +643,7 @@ func (st *UploadState) Info() *MultipartUpload {
 		Initiated:         st.Initiated,
 		ContentType:       st.ContentType,
 		UserMeta:          st.UserMeta,
+		HTTPMeta:          st.HTTPMeta,
 		ChecksumAlgorithm: st.ChecksumAlgorithm,
 		ChecksumType:      st.ChecksumType,
 	}
@@ -884,6 +893,7 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 		Modified:          modified,
 		ExpiresAt:         s.expiresAtFor(bucket, modified),
 		UserMeta:          st.UserMeta,
+		HTTPMeta:          st.HTTPMeta,
 		Blocks:            out.Blocks,
 		Checksum:          out.Checksum,
 		ChecksumAlgorithm: string(out.ChecksumAlgorithm),
@@ -918,6 +928,7 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 		Modified:          meta.Modified,
 		ContentType:       st.ContentType,
 		UserMeta:          st.UserMeta,
+		HTTPMeta:          st.HTTPMeta,
 		Checksum:          out.Checksum,
 		ChecksumAlgorithm: st.ChecksumAlgorithm,
 		ChecksumType:      st.ChecksumType,

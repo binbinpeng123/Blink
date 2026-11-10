@@ -28,6 +28,8 @@ type PutOptions struct {
 	ContentType string
 	// UserMeta 是 x-amz-meta-* 的解码结果（键已去掉前缀）。
 	UserMeta map[string]string
+	// HTTPMeta 是随对象持久化的标准 HTTP 元数据（Cache-Control 等）。
+	HTTPMeta HTTPMeta
 	// ChecksumAlgorithm 与 Checksum 是客户端声明的对象级校验和。
 	// Checksum 为 base64 编码；两者要么同时为空，要么同时非空。
 	ChecksumAlgorithm checksum.Algorithm
@@ -66,6 +68,7 @@ type ObjectInfo struct {
 
 	ContentType string
 	UserMeta    map[string]string
+	HTTPMeta    HTTPMeta
 
 	// Checksum 与 ChecksumAlgorithm 是**实际算出**的值（不是客户端声明的），
 	// 用于 ChecksumMode: ENABLED 时回传。
@@ -261,6 +264,7 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 		Modified:          modified,
 		ExpiresAt:         s.expiresAtFor(bucket, modified),
 		UserMeta:          opt.UserMeta,
+		HTTPMeta:          opt.HTTPMeta,
 		Blocks:            blocks,
 		Checksum:          actualChecksum,
 		ChecksumAlgorithm: string(opt.ChecksumAlgorithm),
@@ -292,6 +296,7 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 		Modified:          meta.Modified,
 		ContentType:       contentType,
 		UserMeta:          opt.UserMeta,
+		HTTPMeta:          opt.HTTPMeta,
 		Checksum:          actualChecksum,
 		ChecksumAlgorithm: opt.ChecksumAlgorithm,
 		ChecksumType:      checksumType,
