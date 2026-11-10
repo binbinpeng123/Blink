@@ -33,6 +33,15 @@ type Options struct {
 	// 零值关闭是刻意的：既有测试与直接使用 store 包的调用方行为不变；
 	// 服务端由 config 显式设置默认值。
 	InlineObjectMaxSize int64
+	// BucketTTL 是按桶配置的对象存活时长；nil 或空表示不启用 TTL。
+	//
+	// 写入时换算成绝对过期时刻存进 meta.json（ExpiresAt）。读取、LIST、
+	// COPY 源检查与删桶判空都把已过期的对象视为不存在；后台
+	// SweepExpired 负责回收过期对象的元数据目录（CAS 块仍由 GC 回收）。
+	//
+	// 只对单机模式生效：集群写路径不经过 Store.PutObject，无法保证每个
+	// 副本按同一策略过期，config 层在集群模式下显式拒绝该配置。
+	BucketTTL map[string]time.Duration
 	// Now 可注入时间源，便于测试断言 mtime；为零值时用 time.Now。
 	Now func() time.Time
 	// FS 可注入文件系统实现，用于故障注入测试；为零值时用真实文件系统。
@@ -107,12 +116,19 @@ type Store struct {
 	// 立即更新或失效对应条目。
 	metaCache *objectMetaCache
 
+	// bucketTTL 是 Open 时复制进来的桶级 TTL，之后只读，无需加锁。
+	bucketTTL map[string]time.Duration
+
 	locks *keyLocker
 
 	// lastScrub 保存最近一轮成功完成的全量完整性巡检摘要，见 integrity.go。
 	// 用 atomic.Pointer 而不是互斥锁：写方每 24 小时一次，读方是 /metrics
 	// 抓取，二者都不值得为一次指针读去抢锁。
 	lastScrub atomic.Pointer[ScrubStats]
+
+	// lastTTLSweep 保存最近一轮成功完成的过期对象清扫摘要，见 ttl.go。
+	// 与 lastScrub 同理：写方是低频后台任务，读方是 /metrics 抓取。
+	lastTTLSweep atomic.Pointer[TTLSweepStats]
 }
 
 // CleanupError 返回启动时清扫失败的详情（没有失败则为 nil）。
@@ -178,6 +194,22 @@ func Open(opt Options) (*Store, error) {
 			inlineObjectMax, inline)
 	}
 
+	// 复制一份 TTL 配置：调用方在 Open 之后修改自己的 map 不应改变
+	// 运行中 Store 的行为（并发读写 map 还会直接 panic）。
+	var bucketTTL map[string]time.Duration
+	for bucket, ttl := range opt.BucketTTL {
+		if err := validateBucketName(bucket); err != nil {
+			return nil, fmt.Errorf("store: bucket-ttl 中的桶名 %q 非法: %w", bucket, err)
+		}
+		if ttl <= 0 {
+			return nil, fmt.Errorf("store: bucket-ttl 中桶 %s 的时长 %v 必须为正数", bucket, ttl)
+		}
+		if bucketTTL == nil {
+			bucketTTL = make(map[string]time.Duration, len(opt.BucketTTL))
+		}
+		bucketTTL[bucket] = ttl
+	}
+
 	s := &Store{
 		root:            opt.Root,
 		fs:              fsys,
@@ -186,6 +218,7 @@ func Open(opt Options) (*Store, error) {
 		blockSize:       blockSize,
 		inlineThreshold: inline,
 		inlineObjectMax: inlineObjectMax,
+		bucketTTL:       bucketTTL,
 		verifyOnRead:    opt.VerifyOnRead,
 		buckets:         make(map[string]*bucketMeta),
 		cors:            make(map[string]*CORSConfiguration),
@@ -448,7 +481,10 @@ func (s *Store) bucketIsEmpty(bucket string) (bool, error) {
 			if err != nil {
 				return false, err
 			}
-			if !m.Deleted {
+			// 墓碑与已过期对象都没有可丢失的数据：前者是集群删除的
+			// 记录，后者在逻辑上已经不存在。删桶会连同它们一起移除，
+			// 否则一个只剩过期对象的桶将永远无法删除。
+			if !m.Deleted && !s.expiredAt(m.ExpiresAt) {
 				return false, nil
 			}
 		}

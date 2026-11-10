@@ -82,6 +82,11 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 	if src.Deleted {
 		return nil, ErrNoSuchKey
 	}
+	// 惰性过期：源对象已到期就不能再作为 COPY 源，否则客户端能把一个
+	// 自己 LIST/GET 都看不见的对象"复活"到另一个 key。
+	if s.expiredAt(src.ExpiresAt) {
+		return nil, ErrNoSuchKey
+	}
 	// EC 分片分散在集群的多个节点上，单机 meta 引用它们会指向不存在的块。
 	// 明确回 501，而不是复制出一个读一次就报 ErrCorrupt 的对象。
 	if src.Layout == LayoutEC {
@@ -103,7 +108,8 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 	switch {
 	case err == nil:
 		// 目标上的旧版本（可能是墓碑）只用于两条判断：条件写与版本递增。
-		if opt.IfNoneMatchAny && !prev.Deleted {
+		// 墓碑与已过期对象在逻辑上都不存在，不能触发 412。
+		if opt.IfNoneMatchAny && !prev.Deleted && !s.expiredAt(prev.ExpiresAt) {
 			return nil, ErrPreconditionFailed
 		}
 	case errors.Is(err, ErrNoSuchKey):
@@ -125,13 +131,17 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 		contentType = defaultContentType
 	}
 
+	// 过期时刻按**目标桶**的 TTL 重新计算，不从源对象复制：复制是
+	// 一次新的写入，目的桶的保留策略才是它应遵守的契约。
+	modified := s.now().UTC().Truncate(time.Second)
 	meta := objectMeta{
 		Version:     formatVersion,
 		Key:         dstKey,
 		Size:        src.Size,
 		ETag:        src.ETag,
 		ContentType: contentType,
-		Modified:    s.now().UTC().Truncate(time.Second),
+		Modified:    modified,
+		ExpiresAt:   s.expiresAtFor(dstBucket, modified),
 		UserMeta:    userMeta,
 		// 块表按值复制一份：meta 是只读快照，但两个 meta 共享同一个
 		// 底层数组会让将来的任何原地改动（如修复逻辑）同时改到源对象。

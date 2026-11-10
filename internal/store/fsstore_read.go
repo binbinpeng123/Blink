@@ -47,6 +47,12 @@ func (s *Store) OpenObject(bucket, key string) (Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 惰性过期：对象一旦到期，对客户端就是 NoSuchKey，即使后台清扫
+	// 还没来得及删除磁盘上的目录。顺序在墓碑检查之前：墓碑本身不会
+	// 设置 ExpiresAt，二者不会互相遮蔽。
+	if s.expiredAt(m.ExpiresAt) {
+		return nil, ErrNoSuchKey
+	}
 	return &ObjectReader{s: s, meta: m, info: objectInfoFromMeta(m)}, nil
 }
 

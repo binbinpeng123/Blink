@@ -157,7 +157,9 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 	prev, err := s.loadObjectMeta(bucket, key)
 	switch {
 	case err == nil:
-		if opt.IfNoneMatchAny {
+		// 已过期的对象在逻辑上不存在，条件写必须把它当成"没有对象"：
+		// 否则客户端会因为一个自己已经看不见的对象而拿到 412。
+		if opt.IfNoneMatchAny && !s.expiredAt(prev.ExpiresAt) {
 			return nil, ErrPreconditionFailed
 		}
 	case errors.Is(err, ErrNoSuchKey):
@@ -234,13 +236,17 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 	if contentType == "" {
 		contentType = defaultContentType
 	}
+	// Modified 与 ExpiresAt 必须来自同一个时间点：若分两次取 now，
+	// 过期时刻会比可见的修改时间略晚，测试与排障时对不上账。
+	modified := s.now().UTC().Truncate(time.Second)
 	meta := objectMeta{
 		Version:           formatVersion,
 		Key:               key,
 		Size:              total,
 		ETag:              etag,
 		ContentType:       contentType,
-		Modified:          s.now().UTC().Truncate(time.Second),
+		Modified:          modified,
+		ExpiresAt:         s.expiresAtFor(bucket, modified),
 		UserMeta:          opt.UserMeta,
 		Blocks:            blocks,
 		Checksum:          actualChecksum,

@@ -62,6 +62,9 @@ type Capacity interface {
 	// LastScrub 返回最近一轮后台完整性巡检摘要，供 /metrics 暴露。
 	// 从未跑过时返回零值（FinishedAt 为零），指标据此显示"尚未巡检"。
 	LastScrub() store.ScrubStats
+	// LastTTLSweep 返回最近一轮过期对象清扫摘要，供 /metrics 暴露。
+	// 未配置 TTL 或从未跑过时返回零值。
+	LastTTLSweep() store.TTLSweepStats
 }
 
 // Server 承载路由与共享依赖。

@@ -216,7 +216,7 @@
 | **D. 小对象打包为只读 segment（needle 思路）** | ⏸ 未实施（D0 先落地的过渡方案） | 高 | `BenchmarkPutSmallObject10k`、`BenchmarkList100kObjects` 前后对照 |
 | **E. 批量写与非标准 API** | ❌ 不做 | — | 保持"任意 S3 客户端可用"，不引入非标准接口 |
 | **F. 预热 / pin 接口** | ❌ 不做 | — | 零拷贝与内核页缓存已使热点模型自然驻留 |
-| **F'. TTL bucket（中间结果自动过期）** | ⏸ 配置驱动的后台任务，切片 9 之后 | 低 | 属策略而非机制，不占用首个切片注意力 |
+| **F'. TTL bucket（中间结果自动过期）** | ✅ 纳入（切片 18，2026-11-10，仅单机） | 低 | `TestBucketTTL*`、`TestSweepExpired*`、`TestCopyObjectUsesDestinationTTL`、`TestMultipartCompleteAppliesBucketTTL` |
 
 **为什么创新 B 对边缘场景重要**：20 GiB 模型的分片上传若在完成时重写全部数据，在 eMMC/SD 卡上会产生数十 GiB 的额外写入（写放大），显著缩短介质寿命。仅串接块表可将完成操作的开销与对象大小解耦。
 
@@ -269,6 +269,66 @@ LIST 必须读取每个对象的全部元数据，因此内联对象越多、内
 **回滚条件**：内联读写/复制/巡检/副本元数据任一致性测试失败，或内联对象的
 ETag 与同一内容的普通对象不一致，或 LIST 回退超过 25%（以
 `BenchmarkListSmallCAS` 与 `BenchmarkListSmallInline` 同机对照为准）。
+
+### 创新 F'：TTL bucket（2026-11-10 落地，仅单机）
+
+**动机**：边端 AI 负载有大量"中间结果"—— 模型分片、推理缓存、临时样本、
+评测输出。它们的生命周期以分钟/小时计，但依赖客户端自觉删除：客户端崩溃、
+任务被抢占或只是忘了清理，数据就会一直占着磁盘。桶级 TTL 把保留策略变成
+服务端契约：写入时即确定过期时刻，客户端无需再发删除请求。
+
+**做法**：
+
+- 配置 `bucket=1h,bucket2=24h` 在 `store.Open` 时复制为只读 map。`PutObject`、
+  `CopyObject`（按**目标桶**）与 MPU `CompleteMultipartUpload` 在写 `meta.json`
+  时计算 `ExpiresAt`（绝对 Unix 秒，`0` 表示永不过期），与 `Modified` 取自
+  同一时间点。COPY 从复制时刻起算、MPU 从 Complete 时刻起算，不从源对象
+  复制过期时间 —— 写入才是新的保留契约起点。
+- **惰性过期**：`OpenObject`、`ListObjects`、COPY 源校验、`DeleteBucket` 判空、
+  `If-None-Match` 条件写都把已过期对象视为不存在。正确性不依赖后台任务：
+  即使清扫从未运行，客户端也读不到、列不出、复制不走过期数据。
+- **后台清扫**（`SweepExpired`，默认每 1 分钟）：`ScanReplicaEntries` 只提供
+  候选；真正删除前在 key 锁下**绕过 `metaCache`** 重新读盘，只有磁盘上的
+  当前版本仍然过期才删除其元数据目录，否则记为 skipped。这样不会误删扫描
+  之后被覆盖写入的新版本。
+- **只删元数据目录，不碰 CAS 块**：块可能被其他 key 去重引用，只能由 GC 在
+  确认无引用后回收（与 `DeleteObject` 语义一致）。
+- **集群模式显式拒绝**：集群写路径由 `cluster` 自行写入副本，不经过
+  `Store.PutObject`，无法保证各副本按同一策略过期。`Validate` 在
+  `BLINK_CLUSTER_MODE=cluster` 且配置了 TTL 时直接报错，而不是静默不生效。
+- 可观测性：`blink_ttl_last_{expired,deleted,skipped,failed}_objects`、
+  `blink_ttl_last_duration_seconds`、`blink_ttl_last_completed_timestamp_seconds`
+  描述最近一轮清扫；`expired` 包含随后被并发覆盖的候选，`deleted + skipped`
+  才等于实际处理数。
+
+**旧版本兼容**：`ExpiresAt` 是 `meta.json` 的可选新增字段
+（`json:"expires_at,omitempty"`），不提升 `FormatVersion`（仍为 1）。
+
+- 新二进制读旧元数据：字段缺失 → `0`，按"永不过期"处理，行为与旧版本一致。
+- 旧二进制读新元数据：忽略该字段，对象**不会**自动过期且始终可见。
+  回滚到旧版本即等于停用 TTL；若需要继续执行保留策略，必须在回滚前
+  清理或等待重新升级。
+
+**默认值与开关**：默认不配置任何桶，零开销。`--bucket-ttl` /
+`BLINK_BUCKET_TTL` 配置桶级时长；`--ttl-sweep-interval` /
+`BLINK_TTL_SWEEP_INTERVAL` 配置清扫周期（默认 `1m`）。`<=0` **只禁用清扫**，
+惰性过期仍然生效 —— 这是刻意保留的降级语义：正确性不受影响，只是空间
+不会自动释放。
+
+**代价（如实记录）**：
+
+- 清扫每个周期都会完整扫描所有配置了 TTL 的桶，读取全部 `meta.json`，
+  I/O 成本与 LIST 同阶。桶大、对象多时，周期性 I/O 会抬升读延迟尾部。
+- 过期对象到清扫运行前仍占用元数据目录与块空间；**CAS 块只有在 GC 落地后
+  才会释放**。因此本切片解决的是"不可见 + 元数据可回收"，不等于"磁盘立即
+  回收"。
+- 过期时刻使用主机时钟。集群模式已排除，单机下若系统时钟回拨，过期可能
+  推迟（对象继续可见），不会提前删除未到期数据。
+
+**回滚条件**：过期对象在任一读路径（GET/HEAD/LIST/COPY 源/条件写）仍然可见
+或可被"复活"；清扫误删未过期对象；COPY 目标或 MPU Complete 的过期时刻起点
+与本文档不符；集群模式配置 TTL 未被拒绝；或清扫在 ctx 取消后写入
+`LastTTLSweep`（把未完成的一轮当成结论）。
 
 ## 分布式扩展点（v0.2.0 已落地）
 

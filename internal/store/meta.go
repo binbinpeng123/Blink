@@ -168,6 +168,16 @@ type ObjectMeta struct {
 	ETag        string    `json:"etag"`
 	ContentType string    `json:"content_type"`
 	Modified    time.Time `json:"modified"`
+	// ExpiresAt 是对象的绝对过期时刻（Unix 秒）；0 表示永不过期。
+	//
+	// 存绝对时间而不是"TTL 时长"：对象写入后过期时刻就是确定的，
+	// 之后修改桶配置只影响新写入的对象，不会让已有对象提前或延后消失。
+	// 由服务端按桶级 TTL 在写入时计算（见 ttl.go），不是客户端可设置的
+	// 响应头 —— 本版本不实现 S3 Lifecycle API（02 文档）。
+	//
+	// 可选新增字段，不提升 format_version：旧二进制读到新 meta.json
+	// 会忽略它，新二进制读到旧 meta.json 得到 0，按"永不过期"处理。
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 	// UserMeta 原样保存 x-amz-meta-* 的值。
 	UserMeta map[string]string `json:"user_meta,omitempty"`
 	// Blocks 是**有序**块描述列表：顺序即对象内容的顺序。
