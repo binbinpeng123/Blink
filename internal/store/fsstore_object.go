@@ -38,6 +38,11 @@ type PutOptions struct {
 	ContentMD5 string
 	// IfNoneMatchAny 对应 If-None-Match: *：对象已存在则失败。
 	IfNoneMatchAny bool
+	// IfNoneMatchETag 对应 If-None-Match: "etag"：仅当当前对象 ETag
+	// **不等于**该值（或对象不存在）才写。
+	//
+	// 值已由协议层去掉引号与 `W/` 前缀。
+	IfNoneMatchETag string
 	// IfMatchETag 对应 If-Match: "etag"：仅当当前对象 ETag 完全匹配才写。
 	// 对象不存在（或已过期）同样视为前置条件未满足。
 	IfMatchETag string
@@ -168,12 +173,12 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 		// 条件判定统一走 checkWriteConditions：这里刻意不直接把
 		// If-None-Match 与 If-Match 写死在分支里，避免 PUT/COPY/MPU
 		// 三条写路径对同一组头部给出不同答复。
-		if cerr := s.checkWriteConditions(prev, opt.IfNoneMatchAny, opt.IfMatchETag, opt.IfMatchAny); cerr != nil {
+		if cerr := s.checkWriteConditions(prev, opt.conditions()); cerr != nil {
 			return nil, cerr
 		}
 	case errors.Is(err, ErrNoSuchKey):
 		prev = nil
-		if cerr := s.checkWriteConditions(nil, opt.IfNoneMatchAny, opt.IfMatchETag, opt.IfMatchAny); cerr != nil {
+		if cerr := s.checkWriteConditions(nil, opt.conditions()); cerr != nil {
 			return nil, cerr
 		}
 	default:

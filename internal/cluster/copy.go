@@ -70,13 +70,14 @@ func (c *Cluster) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt st
 	defer func() { _ = pr.CloseWithError(io.ErrClosedPipe) }()
 
 	putOpt := store.PutOptions{
-		ContentType:    info.ContentType,
-		UserMeta:       info.UserMeta,
-		HTTPMeta:       info.HTTPMeta,
-		IfNoneMatchAny: opt.IfNoneMatchAny,
-		IfMatchETag:    opt.IfMatchETag,
-		IfMatchAny:     opt.IfMatchAny,
-		ExpectedSize:   info.Size,
+		ContentType:     info.ContentType,
+		UserMeta:        info.UserMeta,
+		HTTPMeta:        info.HTTPMeta,
+		IfNoneMatchAny:  opt.IfNoneMatchAny,
+		IfNoneMatchETag: opt.IfNoneMatchETag,
+		IfMatchETag:     opt.IfMatchETag,
+		IfMatchAny:      opt.IfMatchAny,
+		ExpectedSize:    info.Size,
 	}
 	if opt.ReplaceMetadata {
 		putOpt.ContentType = opt.ContentType

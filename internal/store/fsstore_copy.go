@@ -31,6 +31,9 @@ type CopyOptions struct {
 	HTTPMeta HTTPMeta
 	// IfNoneMatchAny 对应目标上的 If-None-Match: *。
 	IfNoneMatchAny bool
+	// IfNoneMatchETag 对应目标上的 If-None-Match: "etag"：仅当目标当前
+	// ETag 不等于该值（或目标不存在）才写。
+	IfNoneMatchETag string
 	// IfMatchETag 对应目标上的 If-Match: "etag"：仅当目标当前 ETag 匹配才写。
 	IfMatchETag string
 	// IfMatchAny 对应目标上的 If-Match: *：仅当目标对象存在才写。
@@ -124,12 +127,12 @@ func (s *Store) CopyObject(dstBucket, dstKey, srcBucket, srcKey string, opt Copy
 	case err == nil:
 		// 目标上的旧版本（可能是墓碑）只用于两条判断：条件写与版本递增。
 		// 墓碑与已过期对象在逻辑上都不存在，不能触发 412。
-		if cerr := s.checkWriteConditions(prev, opt.IfNoneMatchAny, opt.IfMatchETag, opt.IfMatchAny); cerr != nil {
+		if cerr := s.checkWriteConditions(prev, opt.conditions()); cerr != nil {
 			return nil, cerr
 		}
 	case errors.Is(err, ErrNoSuchKey):
 		prev = nil
-		if cerr := s.checkWriteConditions(nil, opt.IfNoneMatchAny, opt.IfMatchETag, opt.IfMatchAny); cerr != nil {
+		if cerr := s.checkWriteConditions(nil, opt.conditions()); cerr != nil {
 			return nil, cerr
 		}
 	default:

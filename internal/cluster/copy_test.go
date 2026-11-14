@@ -225,6 +225,38 @@ func TestCopyObjectErrorsInCluster(t *testing.T) {
 	}
 }
 
+// TestCopyObjectDestinationIfNoneMatchETagInCluster 验证 COPY 目标上的
+// 具体 ETag 条件没有在 Cluster.CopyObject 里被丢掉。
+func TestCopyObjectDestinationIfNoneMatchETagInCluster(t *testing.T) {
+	nodes := newTestNodes(t, 3)
+	createBucketOnAll(t, nodes, "bkt")
+
+	payload := testPayload(2 * 1024)
+	putObject(t, nodes[0].cl, "bkt", "src", payload)
+	dst := putObject(t, nodes[0].cl, "bkt", "dst", []byte("old"))
+
+	if _, err := nodes[1].cl.CopyObject("bkt", "dst", "bkt", "src", store.CopyOptions{
+		IfNoneMatchETag: dst.ETag,
+	}); !errors.Is(err, store.ErrPreconditionFailed) {
+		t.Fatalf("目标 ETag 相等时复制错误 = %v，期望 ErrPreconditionFailed", err)
+	}
+
+	if _, err := nodes[1].cl.CopyObject("bkt", "dst", "bkt", "src", store.CopyOptions{
+		IfNoneMatchETag: "deadbeef",
+	}); err != nil {
+		t.Fatalf("目标 ETag 不等时复制失败: %v", err)
+	}
+	if got := readAll(t, nodes[2].cl, "bkt", "dst"); !bytes.Equal(got, payload) {
+		t.Error("复制后内容不一致")
+	}
+
+	if _, err := nodes[1].cl.CopyObject("bkt", "fresh", "bkt", "src", store.CopyOptions{
+		IfNoneMatchETag: dst.ETag,
+	}); err != nil {
+		t.Fatalf("目标不存在时复制失败: %v", err)
+	}
+}
+
 // TestCopyObjectDestinationIfMatchInCluster 验证 COPY 目标上的 If-Match
 // 在集群路径上同样传到存储层，而不是被 CopyOptions 悄悄丢掉。
 func TestCopyObjectDestinationIfMatchInCluster(t *testing.T) {

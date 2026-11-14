@@ -183,8 +183,9 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	// 目标对象上的条件写：与普通 PUT 同一套规则（If-None-Match: * 与
-	// If-Match），复用同一个解析函数，避免两条写路径对同一个头给出不同答复。
+	// 目标对象上的条件写：与普通 PUT 同一套规则（If-None-Match 的 * 或
+	// 具体 ETag，以及 If-Match），复用同一个解析函数，避免两条写路径对
+	// 同一个头给出不同答复。
 	cond, condErr := parseWriteConditions(r)
 	if condErr != nil {
 		condErr.Write(w, r, reqID)
@@ -215,6 +216,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		UserMeta:        userMetadata(r.Header),
 		HTTPMeta:        objectHTTPMeta(r.Header),
 		IfNoneMatchAny:  cond.ifNoneMatchAny,
+		IfNoneMatchETag: cond.ifNoneMatchETag,
 		IfMatchETag:     cond.ifMatchETag,
 		IfMatchAny:      cond.ifMatchAny,
 	})

@@ -59,7 +59,7 @@ v0.1.0（单机）与 v0.2.0（集群）已经覆盖 Bucket 生命周期、对�
 | 元数据指令 | `x-amz-metadata-directive: COPY`（默认）/ `REPLACE`；其他值 400 |
 | `REPLACE` 时 | 使用请求中的 `Content-Type` 与 `x-amz-meta-*`；未提供 `Content-Type` 时落 `application/octet-stream` |
 | 源条件 | 支持 `x-amz-copy-source-if-match` / `if-none-match` / `if-modified-since` / `if-unmodified-since`；不满足分别回 412 / 304 语义（CopyObject 用 412） |
-| 目标条件 | 支持 `If-None-Match: *`；其他写条件仍回 501 |
+| 目标条件 | 支持 `If-None-Match`（`*` 或单个 ETag）与 `If-Match`（单个 ETag 或 `*`）；其余写条件回 501 |
 | 自复制 | 源与目标相同且 `COPY` → 400 `InvalidRequest`；`REPLACE` 允许，用于原地更新元数据 |
 | 大小上限 | 源对象 > 5 GiB → 400 `InvalidRequest`（与 S3 一致）；更大的复制须走分片上传 |
 | 存储类型 | `x-amz-storage-class` 非 `STANDARD` → 501 |

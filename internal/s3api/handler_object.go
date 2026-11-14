@@ -51,8 +51,8 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
-	// 条件写：If-None-Match: * 与 If-Match（具体 ETag 或 *）。
-	// 其他形式不静默忽略 —— 客户端明确要求了"仅当 ETag 不等于 X 才写"，
+	// 条件写：If-None-Match 与 If-Match（具体 ETag 或 *）。
+	// 不合法的形式不静默忽略 —— 客户端明确要求了"仅当当前值不等于 X 才写"，
 	// 忽略它就变成了无条件覆盖，是数据丢失而不是"少个特性"。
 	cond, condErr := parseWriteConditions(r)
 	if condErr != nil {
@@ -96,6 +96,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		LateChecksum:      lateChecksum,
 		ContentMD5:        contentMD5,
 		IfNoneMatchAny:    cond.ifNoneMatchAny,
+		IfNoneMatchETag:   cond.ifNoneMatchETag,
 		IfMatchETag:       cond.ifMatchETag,
 		IfMatchAny:        cond.ifMatchAny,
 		ExpectedSize:      r.ContentLength,
@@ -133,32 +134,53 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 
 // writeConditions 是写请求上已解析的前置条件。
 //
-// 三个字段同时为零值表示客户端没有提条件；存储层据此跳过旧元数据比较，
+// 四个字段同时为零值表示客户端没有提条件；存储层据此跳过旧元数据比较，
 // 但仍然会在 key 锁内读取一次 prev 以递增 obj_version。
 type writeConditions struct {
-	ifNoneMatchAny bool
-	ifMatchETag    string
-	ifMatchAny     bool
+	ifNoneMatchAny  bool
+	ifNoneMatchETag string
+	ifMatchETag     string
+	ifMatchAny      bool
+}
+
+// parseConditionETag 解析 `*` 之外的单值 ETag：去掉可选的 `W/` 与引号。
+//
+// 逗号分隔的列表返回 400：静默取第一个会把"任一匹配"变成"只认第一个"，
+// 客户端无法察觉。
+func parseConditionETag(header, raw string) (string, *s3err.Error) {
+	if strings.Contains(raw, ",") {
+		return "", s3err.New(s3err.CodeInvalidArgument).
+			WithMessage("写请求的 " + header + " 只支持单个 ETag 或 `*`。")
+	}
+	etag := strings.TrimPrefix(raw, "W/")
+	etag = strings.Trim(strings.TrimSpace(etag), `"`)
+	if etag == "" {
+		return "", s3err.New(s3err.CodeInvalidArgument).
+			WithMessage(header + " 的 ETag 不能为空。")
+	}
+	return etag, nil
 }
 
 // parseWriteConditions 解析写请求上的前置条件。
 //
-// If-None-Match 只实现 `*`；带具体 ETag 的形式返回 501。If-Match 支持
-// 单个 ETag（可带 W/ 与引号）和 `*`；逗号分隔的列表返回 400 ——
-// AWS 的条件写同样只接受单个 ETag，静默取第一个会让"任一匹配"变成
-// "只认第一个"，客户端无法察觉。
+// If-None-Match 与 If-Match 都支持单个 ETag（可带 W/ 与引号）和 `*`；
+// 具体取值由存储层在 key 锁内比较。
 //
 // 这里不做"当前对象是否匹配"的判断：那必须在存储层的 key 锁内完成，
 // 否则检查与提交之间会插入别的写者。
 func parseWriteConditions(r *http.Request) (writeConditions, *s3err.Error) {
 	var cond writeConditions
 
-	if v := strings.TrimSpace(r.Header.Get("If-None-Match")); v != "" {
-		if v != "*" {
-			return cond, s3err.New(s3err.CodeNotImplemented).
-				WithMessage("仅支持 `If-None-Match: *`。")
+	if raw := strings.TrimSpace(r.Header.Get("If-None-Match")); raw != "" {
+		if raw == "*" {
+			cond.ifNoneMatchAny = true
+		} else {
+			etag, err := parseConditionETag("If-None-Match", raw)
+			if err != nil {
+				return cond, err
+			}
+			cond.ifNoneMatchETag = etag
 		}
-		cond.ifNoneMatchAny = true
 	}
 
 	raw := strings.TrimSpace(r.Header.Get("If-Match"))
@@ -169,16 +191,9 @@ func parseWriteConditions(r *http.Request) (writeConditions, *s3err.Error) {
 		cond.ifMatchAny = true
 		return cond, nil
 	}
-	if strings.Contains(raw, ",") {
-		return cond, s3err.New(s3err.CodeInvalidArgument).
-			WithMessage("写请求的 If-Match 只支持单个 ETag 或 `*`。")
-	}
-
-	etag := strings.TrimPrefix(raw, "W/")
-	etag = strings.Trim(strings.TrimSpace(etag), `"`)
-	if etag == "" {
-		return cond, s3err.New(s3err.CodeInvalidArgument).
-			WithMessage("If-Match 的 ETag 不能为空。")
+	etag, err := parseConditionETag("If-Match", raw)
+	if err != nil {
+		return cond, err
 	}
 	cond.ifMatchETag = etag
 	return cond, nil
