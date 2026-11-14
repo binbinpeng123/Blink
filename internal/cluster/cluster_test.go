@@ -375,6 +375,46 @@ func TestReplicatedConditionalPut(t *testing.T) {
 	}
 }
 
+// TestReplicatedIfNoneMatchETagPut 验证具体 ETag 的 If-None-Match
+// 同样在跨节点写前 barrier 上求值：其他协调者写入的当前版本必须被看见。
+func TestReplicatedIfNoneMatchETagPut(t *testing.T) {
+	nodes := newTestNodes(t, 3)
+	const bucket, key = "test-bucket", "if-none-match-etag.txt"
+	createBucketOnAll(t, nodes, bucket)
+
+	first := putObject(t, nodes[0].cl, bucket, key, []byte("first"))
+
+	_, err := nodes[1].cl.PutObject(bucket, key, strings.NewReader("second"), store.PutOptions{
+		ExpectedSize:    6,
+		IfNoneMatchETag: first.ETag,
+	})
+	if !errors.Is(err, store.ErrPreconditionFailed) {
+		t.Fatalf("ETag 相等时条件写错误 = %v，期望 ErrPreconditionFailed", err)
+	}
+
+	// 给定 ETag 不是当前版本 → 覆盖安全。
+	info, err := nodes[1].cl.PutObject(bucket, key, strings.NewReader("second"), store.PutOptions{
+		ExpectedSize:    6,
+		IfNoneMatchETag: "deadbeef",
+	})
+	if err != nil {
+		t.Fatalf("ETag 不等时条件写失败: %v", err)
+	}
+	for _, n := range nodes {
+		if got := string(readAll(t, n.cl, bucket, key)); got != "second" {
+			t.Errorf("节点 %s 读到 %q，期望 second", n.id, got)
+		}
+	}
+
+	// 目标 key 不存在时条件成立。
+	if _, err := nodes[2].cl.PutObject(bucket, "fresh", strings.NewReader("x"), store.PutOptions{
+		ExpectedSize:    1,
+		IfNoneMatchETag: info.ETag,
+	}); err != nil {
+		t.Fatalf("对象不存在时条件写失败: %v", err)
+	}
+}
+
 // TestReplicatedOverwriteConverges 验证两个协调者先后写同一个 key 时，
 // 所有节点都收敛到版本更大（后写）的那份。
 func TestReplicatedOverwriteConverges(t *testing.T) {

@@ -156,11 +156,29 @@ func TestObjectErrors(t *testing.T) {
 		requireS3Error(t, res, http.StatusPreconditionFailed, "PreconditionFailed")
 	})
 
-	t.Run("If-None-Match 的显式 ETag 返回 501", func(t *testing.T) {
-		res := c.putObject(bucket, "cond", []byte("x"), map[string]string{
-			"If-None-Match": `"abc"`,
+	t.Run("If-None-Match 的显式 ETag 条件写", func(t *testing.T) {
+		first := c.putObject(bucket, "cond-etag", []byte("v1"), nil)
+		requireStatus(t, first, http.StatusOK)
+		etag := first.Header.Get("ETag")
+
+		// 当前值正是客户端手里的 ETag → 412，且内容不变。
+		res := c.putObject(bucket, "cond-etag", []byte("v2"), map[string]string{
+			"If-None-Match": etag,
 		})
-		requireS3Error(t, res, http.StatusNotImplemented, "NotImplemented")
+		requireS3Error(t, res, http.StatusPreconditionFailed, "PreconditionFailed")
+		if res := c.getObject(bucket, "cond-etag", nil); string(res.Body) != "v1" {
+			t.Errorf("失败的条件写改动了内容: %q", res.Body)
+		}
+
+		// ETag 不是当前版本 → 放行。
+		requireStatus(t, c.putObject(bucket, "cond-etag", []byte("v2"), map[string]string{
+			"If-None-Match": `"deadbeef"`,
+		}), http.StatusOK)
+
+		// 对象不存在时不匹配任何 ETag → 放行。
+		requireStatus(t, c.putObject(bucket, "cond-fresh", []byte("x"), map[string]string{
+			"If-None-Match": etag,
+		}), http.StatusOK)
 	})
 
 	t.Run("If-Match 条件写按 ETag 生效", func(t *testing.T) {

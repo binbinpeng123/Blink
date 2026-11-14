@@ -206,17 +206,51 @@ func TestPutObjectIfMatch(t *testing.T) {
 	}
 }
 
-// 不支持或不合法的条件写必须明确拒绝，不能静默降级成无条件覆盖。
-func TestPutObjectUnsupportedPreconditions(t *testing.T) {
+// TestPutObjectIfNoneMatchETag 验证 `If-None-Match: "etag"`：
+// 当前值等于给定 ETag 才 412；不等或对象不存在都放行。
+func TestPutObjectIfNoneMatchETag(t *testing.T) {
+	h := objectTestServer(t)
+	first := putObject(t, h, "/bkt/cond-etag", "v1", nil)
+	if first.Code != http.StatusOK {
+		t.Fatalf("首次写入失败: %d (%s)", first.Code, first.Body.String())
+	}
+	etag := first.Header().Get("ETag")
+
+	rec := putObject(t, h, "/bkt/cond-etag", "v2", func(r *http.Request) {
+		r.Header.Set("If-None-Match", etag)
+	})
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("ETag 相等时状态码 = %d，期望 412 (%s)", rec.Code, rec.Body.String())
+	}
+
+	// W/ 前缀与引号在比较前被剥掉，弱比较对 ETag 等价。
+	rec = putObject(t, h, "/bkt/cond-etag", "v2", func(r *http.Request) {
+		r.Header.Set("If-None-Match", `W/"deadbeef"`)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ETag 不等时状态码 = %d，期望 200 (%s)", rec.Code, rec.Body.String())
+	}
+
+	// 对象不存在时不匹配任何 ETag，条件成立。
+	rec = putObject(t, h, "/bkt/cond-fresh", "x", func(r *http.Request) {
+		r.Header.Set("If-None-Match", etag)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("对象不存在时状态码 = %d，期望 200 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// 不合法的条件写必须明确拒绝，不能静默降级成无条件覆盖。
+func TestPutObjectInvalidPreconditions(t *testing.T) {
 	h := objectTestServer(t)
 	cases := []struct {
 		name, header, value string
 		status              int
 		code                string
 	}{
-		// If-None-Match 只实现 `*`：具体 ETag 的"不匹配才写"本版本没有。
-		{"If-None-Match 具体 ETag", "If-None-Match", `"some-etag"`, http.StatusNotImplemented, "NotImplemented"},
 		// 多值列表会让"任一匹配"退化成"只认第一个"，必须拒绝。
+		{"If-None-Match 列表", "If-None-Match", `"a", "b"`, http.StatusBadRequest, "InvalidArgument"},
+		{"If-None-Match 空 ETag", "If-None-Match", `""`, http.StatusBadRequest, "InvalidArgument"},
 		{"If-Match 列表", "If-Match", `"a", "b"`, http.StatusBadRequest, "InvalidArgument"},
 		{"If-Match 空 ETag", "If-Match", `""`, http.StatusBadRequest, "InvalidArgument"},
 	}

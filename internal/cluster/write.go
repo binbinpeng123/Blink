@@ -65,17 +65,22 @@ func (c *Cluster) PutObject(bucket, key string, body io.Reader, opt store.PutOpt
 	if opt.IfNoneMatchAny && liveCount(probe) > 0 {
 		return nil, store.ErrPreconditionFailed
 	}
-	// If-Match 比较的是"当前可见对象"的 ETag，因此用 latestLiveMeta：
+	// 基于 ETag 的条件比较的是"当前可见对象"，因此用 latestLiveMeta：
 	// latestMeta 会返回墓碑，而墓碑的 ETag 是删除前的旧值。
 	//
 	// 这是**尽力而为**的判定（02 文档例外一）：probe 与随后的 meta 提交
 	// 之间没有全局锁，另一个协调者对同一 key 的并发写可以插在中间。条件
 	// 写能挡住顺序覆盖与客户端重试带来的"读旧值写新值"，但不提供跨节点
 	// 的线性化保证 —— 需要严格 CAS 的调用方必须接受这一点。
-	if opt.IfMatchETag != "" || opt.IfMatchAny {
+	if opt.IfNoneMatchETag != "" || opt.IfMatchETag != "" || opt.IfMatchAny {
 		live := latestLiveMeta(probe)
-		if live == nil || (!opt.IfMatchAny && live.ETag != opt.IfMatchETag) {
+		if opt.IfNoneMatchETag != "" && live != nil && live.ETag == opt.IfNoneMatchETag {
 			return nil, store.ErrPreconditionFailed
+		}
+		if opt.IfMatchETag != "" || opt.IfMatchAny {
+			if live == nil || (!opt.IfMatchAny && live.ETag != opt.IfMatchETag) {
+				return nil, store.ErrPreconditionFailed
+			}
 		}
 	}
 

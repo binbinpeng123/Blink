@@ -162,12 +162,12 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		condErr.Write(w, r, reqID)
 		return
 	}
-	if cond.ifMatchETag != "" || cond.ifMatchAny {
-		// Complete 的 If-Match 需要把条件传入存储层的 key 锁内；本切片
-		// 只给 PUT/COPY 落地，这里必须显式拒绝而不是接受后忽略 ——
-		// 忽略等于把"仅当目标版本未变才提交"降级成无条件覆盖。
+	if cond.ifMatchETag != "" || cond.ifMatchAny || cond.ifNoneMatchETag != "" {
+		// 除 If-None-Match:* 之外的写条件都需要把条件传入存储层的 key 锁内；
+		// Complete 的存储接口目前只接受这一个布尔条件，这里必须显式拒绝而
+		// 不是接受后忽略 —— 忽略等于把"仅当目标版本未变才提交"降级成无条件覆盖。
 		s3err.New(s3err.CodeNotImplemented).
-			WithMessage("CompleteMultipartUpload 暂不支持 If-Match 条件写。").
+			WithMessage("CompleteMultipartUpload 暂不支持该写条件（仅支持 `If-None-Match: *`）。").
 			Write(w, r, reqID)
 		return
 	}

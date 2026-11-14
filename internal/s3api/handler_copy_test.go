@@ -248,25 +248,50 @@ func TestCopyObjectSourceConditionOnMissingKey(t *testing.T) {
 	}
 }
 
-// TestCopyObjectDestinationCondition 验证目标上的 If-None-Match: *。
+// TestCopyObjectDestinationCondition 验证目标上的 If-None-Match。
 func TestCopyObjectDestinationCondition(t *testing.T) {
 	h := objectTestServer(t)
 	putObject(t, h, "/bkt/src", "payload", nil)
-	putObject(t, h, "/bkt/dst", "already here", nil)
+	dst := putObject(t, h, "/bkt/dst", "already here", nil)
+	if dst.Code != http.StatusOK {
+		t.Fatalf("目标初始化失败: %d (%s)", dst.Code, dst.Body.String())
+	}
+	etag := dst.Header().Get("ETag")
 
-	rec := doCopy(t, h, "/bkt/dst", "/bkt/src", func(r *http.Request) {
-		r.Header.Set("If-None-Match", "*")
+	t.Run("`*` 对已存在目标返回 412", func(t *testing.T) {
+		rec := doCopy(t, h, "/bkt/dst", "/bkt/src", func(r *http.Request) {
+			r.Header.Set("If-None-Match", "*")
+		})
+		if rec.Code != http.StatusPreconditionFailed {
+			t.Fatalf("状态码 = %d，期望 412 (%s)", rec.Code, rec.Body.String())
+		}
+		if got := decodeError(t, rec).Code; got != string(s3err.CodePreconditionFailed) {
+			t.Errorf("Code = %q，期望 PreconditionFailed", got)
+		}
 	})
-	if rec.Code != http.StatusPreconditionFailed {
-		t.Fatalf("状态码 = %d，期望 412 (%s)", rec.Code, rec.Body.String())
-	}
-	if got := decodeError(t, rec).Code; got != string(s3err.CodePreconditionFailed) {
-		t.Errorf("Code = %q，期望 PreconditionFailed", got)
-	}
 
-	// 目标不存在时必须放行。
-	mustCopy(t, h, "/bkt/fresh", "/bkt/src", func(r *http.Request) {
-		r.Header.Set("If-None-Match", "*")
+	t.Run("具体 ETag 相等时返回 412", func(t *testing.T) {
+		rec := doCopy(t, h, "/bkt/dst", "/bkt/src", func(r *http.Request) {
+			r.Header.Set("If-None-Match", etag)
+		})
+		if rec.Code != http.StatusPreconditionFailed {
+			t.Fatalf("状态码 = %d，期望 412 (%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("具体 ETag 不等时放行", func(t *testing.T) {
+		mustCopy(t, h, "/bkt/dst", "/bkt/src", func(r *http.Request) {
+			r.Header.Set("If-None-Match", `"deadbeef"`)
+		})
+	})
+
+	t.Run("目标不存在时两种形式都放行", func(t *testing.T) {
+		mustCopy(t, h, "/bkt/fresh-star", "/bkt/src", func(r *http.Request) {
+			r.Header.Set("If-None-Match", "*")
+		})
+		mustCopy(t, h, "/bkt/fresh-etag", "/bkt/src", func(r *http.Request) {
+			r.Header.Set("If-None-Match", etag)
+		})
 	})
 }
 

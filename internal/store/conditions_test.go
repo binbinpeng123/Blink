@@ -128,6 +128,100 @@ func TestCopyIfMatchTarget(t *testing.T) {
 	}
 }
 
+// TestPutIfNoneMatchETag 验证 `If-None-Match: "etag"`：
+// 当前 ETag 等于给定值才 412；不等或对象不存在都放行。
+func TestPutIfNoneMatchETag(t *testing.T) {
+	s := newSmallBlockStore(t, 64, 16)
+	first := putString(t, s, "bkt", "k", "v1")
+
+	if err := mustPutConditional(t, s, "bkt", "k", "v2", PutOptions{
+		IfNoneMatchETag: first.ETag,
+	}); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("ETag 相等时 If-None-Match 应 412，实际 %v", err)
+	}
+	meta, err := s.loadObjectMeta("bkt", "k")
+	if err != nil {
+		t.Fatalf("loadObjectMeta 失败: %v", err)
+	}
+	if got := string(readBlocks(t, s, meta)); got != "v1" {
+		t.Errorf("失败的 If-None-Match 不应改动内容，实际 %q", got)
+	}
+
+	// 客户端手里的 ETag 不是当前版本 → 覆盖是安全的。
+	if err := mustPutConditional(t, s, "bkt", "k", "v2", PutOptions{
+		IfNoneMatchETag: "deadbeef",
+	}); err != nil {
+		t.Fatalf("ETag 不等时 If-None-Match 应成功，实际 %v", err)
+	}
+
+	// 对象不存在时不匹配任何 ETag，条件成立。
+	if err := mustPutConditional(t, s, "bkt", "missing", "x", PutOptions{
+		IfNoneMatchETag: first.ETag,
+	}); err != nil {
+		t.Fatalf("对象不存在时 If-None-Match 应成功，实际 %v", err)
+	}
+}
+
+// TestPutIfNoneMatchETagIgnoresTombstoneAndExpiry 验证墓碑与过期对象
+// 在 If-None-Match 的具体 ETag 形式上同样视为不存在。
+func TestPutIfNoneMatchETagIgnoresTombstoneAndExpiry(t *testing.T) {
+	t.Run("墓碑", func(t *testing.T) {
+		s := newSmallBlockStore(t, 64, 16)
+		first := putString(t, s, "bkt", "k", "v1")
+		if err := s.DeleteObject("bkt", "k"); err != nil {
+			t.Fatalf("DeleteObject 失败: %v", err)
+		}
+		if err := mustPutConditional(t, s, "bkt", "k", "v2", PutOptions{
+			IfNoneMatchETag: first.ETag,
+		}); err != nil {
+			t.Fatalf("删除后旧 ETag 的 If-None-Match 应成立，实际 %v", err)
+		}
+	})
+
+	t.Run("过期", func(t *testing.T) {
+		clock := &testClock{now: time.Unix(1_700_000_000, 0).UTC()}
+		s := newTTLTestStore(t, clock, map[string]time.Duration{"tmp": time.Minute})
+		mustCreateBucket(t, s, "tmp")
+
+		first := putString(t, s, "tmp", "k", "old")
+		clock.Advance(time.Minute)
+
+		if err := mustPutConditional(t, s, "tmp", "k", "new", PutOptions{
+			IfNoneMatchETag: first.ETag,
+		}); err != nil {
+			t.Fatalf("过期对象上旧 ETag 的 If-None-Match 应成立，实际 %v", err)
+		}
+	})
+}
+
+// TestCopyIfNoneMatchETagTarget 验证 COPY 目标上的具体 ETag 条件。
+func TestCopyIfNoneMatchETagTarget(t *testing.T) {
+	s := newSmallBlockStore(t, 64, 16)
+	if err := s.CreateBucket("dst"); err != nil {
+		t.Fatalf("CreateBucket(dst) 失败: %v", err)
+	}
+	putString(t, s, "bkt", "src", "payload")
+	dst := putString(t, s, "dst", "k", "old")
+
+	if _, err := s.CopyObject("dst", "k", "bkt", "src", CopyOptions{
+		IfNoneMatchETag: dst.ETag,
+	}); !errors.Is(err, ErrPreconditionFailed) {
+		t.Fatalf("目标 ETag 相等时 COPY 应 412，实际 %v", err)
+	}
+
+	if _, err := s.CopyObject("dst", "k", "bkt", "src", CopyOptions{
+		IfNoneMatchETag: "deadbeef",
+	}); err != nil {
+		t.Fatalf("目标 ETag 不等时 COPY 应成功，实际 %v", err)
+	}
+
+	if _, err := s.CopyObject("dst", "fresh", "bkt", "src", CopyOptions{
+		IfNoneMatchETag: dst.ETag,
+	}); err != nil {
+		t.Fatalf("目标不存在时 COPY 应成功，实际 %v", err)
+	}
+}
+
 // TestPutIfMatchConcurrent 验证条件判定与写入在同一把 key 锁内：
 // N 个并发写者拿着同一个 ETag，只能有一个成功。
 //
