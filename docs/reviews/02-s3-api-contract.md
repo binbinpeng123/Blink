@@ -26,6 +26,7 @@
 | 7 | `HEAD` | `/{bucket}/{key}` | HeadObject |
 | 8 | `DELETE` | `/{bucket}/{key}` | DeleteObject |
 | 9 | `GET` | `/{bucket}?list-type=2` | ListObjectsV2 |
+| 9a | `GET` | `/{bucket}?location` | GetBucketLocation |
 | 10 | `GET` | `/healthz`、`/readyz`、`/version` | 非 S3 端点，免签名 |
 
 ### 分片上传（独立切片，纳入首个可用版本）
@@ -70,8 +71,11 @@
 | `PUT /{bucket}/?acl`、`?tagging`、`?lifecycle`、`?encryption`、`?versioning`、`?policy`、`?replication`、`?object-lock` | `501 NotImplemented` |
 | `GET /{bucket}/?versions` | `501 NotImplemented` |
 | `PUT /{bucket}/{key}?acl`、`?tagging`、`?legal-hold`、`?retention` | `501 NotImplemented` |
-| `POST /{bucket}/{key}?restore`、`?select` | `501 NotImplemented` |
+| `POST /{bucket}/{key}?restore`、`?select`、`?select-type` | `501 NotImplemented` |
 | `GET /{bucket}/{key}?torrent` | `501 NotImplemented` |
+| `GET /{bucket}/{key}?attributes`、`GET /{bucket}?policyStatus` | `501 NotImplemented`（未实现的对象/桶属性查询，**不得**回落为下载对象或列举桶） |
+| 任意方法 `/{bucket}/{key}?versionId=...` | `501 NotImplemented`（本版本无多版本） |
+| 非 `GET /{bucket}?location` | `405 MethodNotAllowed` |
 | `PUT`/`GET`/`DELETE /{bucket}/{key}?cors`（对象级 CORS，S3 无此语义） | `501 NotImplemented` |
 | Range 请求含多个区间（逗号分隔） | `501 NotImplemented` |
 | 任意未知查询参数组合 | `501 NotImplemented` |
@@ -132,7 +136,7 @@
 
 ### CreateBucket `PUT /{bucket}`
 
-- 请求体可空（`aws s3 mb` 发送空体）；`LocationConstraint` 可选并接受。
+- 请求体可空（`aws s3 mb` 发送空体）；`LocationConstraint` 可选并接受，但**不落盘** —— `GetBucketLocation` 始终返回服务端区域。
 - 成功 `200`，`Location: /{bucket}`。
 - 重复创建同名桶 → `409 BucketAlreadyOwnedByYou`。
 - 桶名校验：长度 3–63，仅 `[a-z0-9.-]`，首尾必须为 `[a-z0-9]`，不含 `..`，不形如 IPv4，不以 `xn--` 开头。
@@ -141,6 +145,14 @@
 
 - `HEAD /{bucket}` 成功 `200` 空体并返回 `x-amz-bucket-region`；不存在 `404`（HEAD 无响应体）。
 - `DELETE /{bucket}`：空桶 `204`；非空 `409 BucketNotEmpty`。判定"非空"需同时检查对象目录与进行中的分片上传。
+
+### GetBucketLocation `GET /{bucket}?location`
+
+- 桶不存在 → `404 NoSuchBucket`；成功 `200`，响应体为 `<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`。
+- 返回**服务端配置的区域**（`BLINK_REGION`，默认 `us-east-1`）。本版本不支持桶级独立区域：`CreateBucket` 收到的 `LocationConstraint` 仍被接受但不落盘。
+- 按 AWS 语义，`us-east-1` 返回空的 `<LocationConstraint/>`，其余区域返回区域名。
+- `?location` 必须先于通用方法分派处理：非 `GET` 一律 `405 MethodNotAllowed`，**不得**回落到 `PUT`/`DELETE /{bucket}` 而误创建或误删除桶。
+- 带 key 的 `?location` 无 S3 语义 → `501 NotImplemented`。
 
 ### ListBuckets `GET /`
 

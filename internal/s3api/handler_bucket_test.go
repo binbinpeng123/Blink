@@ -25,6 +25,13 @@ import (
 // 真实的 ErrBucketNotFound 之类。
 func bucketTestServer(t *testing.T) http.Handler {
 	t.Helper()
+	return bucketTestServerWithRegion(t, "us-east-1")
+}
+
+// bucketTestServerWithRegion 与 bucketTestServer 相同，但可指定区域，
+// 供 GetBucketLocation 的 us-east-1 特例与普通区域两条分支使用。
+func bucketTestServerWithRegion(t *testing.T, region string) http.Handler {
+	t.Helper()
 	st, err := store.Open(store.Options{Root: filepath.Join(t.TempDir(), "data")})
 	if err != nil {
 		t.Fatalf("打开存储失败: %v", err)
@@ -32,7 +39,7 @@ func bucketTestServer(t *testing.T) http.Handler {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return New(Options{
 		Logger:      logger,
-		Region:      "us-east-1",
+		Region:      region,
 		DisableAuth: true,
 		Store:       st,
 	}).Handler()
@@ -382,5 +389,145 @@ func TestISO8601Format(t *testing.T) {
 	}
 	if got != "2026-10-23T12:00:00.000Z" {
 		t.Errorf("iso8601 = %q，期望 2026-10-23T12:00:00.000Z", got)
+	}
+}
+
+func TestGetBucketLocation(t *testing.T) {
+	cases := []struct {
+		region string
+		want   string
+	}{
+		// AWS 语义：us-east-1 返回空元素，其余区域返回区域名。
+		{"us-east-1", ""},
+		{"cn-north-1", "cn-north-1"},
+	}
+	for _, c := range cases {
+		t.Run(c.region, func(t *testing.T) {
+			h := bucketTestServerWithRegion(t, c.region)
+			if rec := do(t, h, http.MethodPut, "/located"); rec.Code != http.StatusOK {
+				t.Fatalf("建桶状态码 = %d", rec.Code)
+			}
+
+			rec := do(t, h, http.MethodGet, "/located?location")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GetBucketLocation 状态码 = %d：%s", rec.Code, rec.Body.String())
+			}
+			if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/xml") {
+				t.Errorf("Content-Type = %q", ct)
+			}
+			// 根元素必须带 S3 命名空间，否则部分 SDK 解析失败。
+			if !strings.Contains(rec.Body.String(),
+				`xmlns="http://s3.amazonaws.com/doc/2006-03-01/"`) {
+				t.Errorf("响应缺少 S3 命名空间: %s", rec.Body.String())
+			}
+			var got locationConstraint
+			if err := xml.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatalf("响应体不是合法 XML: %v (%s)", err, rec.Body.String())
+			}
+			if got.Value != c.want {
+				t.Errorf("LocationConstraint = %q，期望 %q", got.Value, c.want)
+			}
+		})
+	}
+}
+
+func TestGetBucketLocationMissingBucket(t *testing.T) {
+	h := bucketTestServer(t)
+	rec := do(t, h, http.MethodGet, "/no-such-bucket?location")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("状态码 = %d，期望 404", rec.Code)
+	}
+	if code := decodeError(t, rec).Code; code != string(s3err.CodeNoSuchBucket) {
+		t.Errorf("Code = %q，期望 NoSuchBucket", code)
+	}
+}
+
+// TestBucketLocationWrongMethodDoesNotMutate 覆盖一个高危回归：
+// ?location 若没有在通用方法分派之前拦下，PUT 会创建桶、DELETE 会删除桶。
+func TestBucketLocationWrongMethodDoesNotMutate(t *testing.T) {
+	h := bucketTestServer(t)
+	if rec := do(t, h, http.MethodPut, "/keep"); rec.Code != http.StatusOK {
+		t.Fatalf("建桶状态码 = %d", rec.Code)
+	}
+
+	for _, method := range []string{
+		http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodHead,
+	} {
+		rec := do(t, h, method, "/keep?location")
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s /keep?location 状态码 = %d，期望 405", method, rec.Code)
+		}
+	}
+	// 桶必须仍然存在：DELETE ?location 不能真的删掉它。
+	if rec := do(t, h, http.MethodHead, "/keep"); rec.Code != http.StatusOK {
+		t.Errorf("桶被误操作，HEAD 状态码 = %d", rec.Code)
+	}
+
+	// PUT ?location 也不能凭空创建桶。
+	rec := do(t, h, http.MethodPut, "/ghost?location")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT /ghost?location 状态码 = %d，期望 405", rec.Code)
+	}
+	if rec := do(t, h, http.MethodHead, "/ghost"); rec.Code != http.StatusNotFound {
+		t.Errorf("PUT ?location 误创建了桶，HEAD 状态码 = %d", rec.Code)
+	}
+}
+
+func TestBucketLocationObjectPathNotImplemented(t *testing.T) {
+	h := bucketTestServer(t)
+	if rec := do(t, h, http.MethodPut, "/bkt"); rec.Code != http.StatusOK {
+		t.Fatalf("建桶状态码 = %d", rec.Code)
+	}
+	rec := do(t, h, http.MethodGet, "/bkt/obj.txt?location")
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("对象级 ?location 状态码 = %d，期望 501", rec.Code)
+	}
+	if code := decodeError(t, rec).Code; code != string(s3err.CodeNotImplemented) {
+		t.Errorf("Code = %q，期望 NotImplemented", code)
+	}
+}
+
+// TestUnsupportedSubresourcesDoNotHitDataPath 锁住"未知子资源必须 501"
+// 这条契约。这些请求曾经会静默返回对象内容或桶列举结果：HTTP 200，
+// 但客户端把数据当成属性文档解析，错误要到很久之后才暴露。
+func TestUnsupportedSubresourcesDoNotHitDataPath(t *testing.T) {
+	h := bucketTestServer(t)
+	if rec := do(t, h, http.MethodPut, "/bkt"); rec.Code != http.StatusOK {
+		t.Fatalf("建桶状态码 = %d", rec.Code)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/bkt/obj.txt", strings.NewReader("payload"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("上传状态码 = %d：%s", rec.Code, rec.Body.String())
+	}
+
+	cases := []struct {
+		method string
+		target string
+	}{
+		{http.MethodGet, "/bkt/obj.txt?attributes"},
+		{http.MethodPut, "/bkt/obj.txt?attributes"},
+		{http.MethodGet, "/bkt/obj.txt?policyStatus"},
+		{http.MethodPost, "/bkt/obj.txt?select&select-type=2"},
+		{http.MethodGet, "/bkt/obj.txt?versionId=v1"},
+		{http.MethodHead, "/bkt/obj.txt?versionId=v1"},
+		{http.MethodDelete, "/bkt/obj.txt?versionId=v1"},
+		{http.MethodGet, "/bkt?policyStatus"},
+	}
+	for _, c := range cases {
+		t.Run(c.method+" "+c.target, func(t *testing.T) {
+			rec := do(t, h, c.method, c.target)
+			if rec.Code != http.StatusNotImplemented {
+				t.Fatalf("状态码 = %d，期望 501（响应体：%s）", rec.Code, rec.Body.String())
+			}
+			// HEAD 按 HTTP 语义没有响应体，只校验状态码。
+			if c.method == http.MethodHead {
+				return
+			}
+			if code := decodeError(t, rec).Code; code != string(s3err.CodeNotImplemented) {
+				t.Errorf("Code = %q，期望 NotImplemented", code)
+			}
+		})
 	}
 }
