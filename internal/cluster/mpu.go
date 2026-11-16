@@ -244,7 +244,7 @@ func (c *Cluster) UploadPart(bucket, key, uploadID string, partNumber int, body 
 // CompleteMultipartUpload 串接分片块表并提交对象元数据。
 //
 // 锁顺序与单机一致：先 uploadId 锁、再 key 锁。
-func (c *Cluster) CompleteMultipartUpload(bucket, key, uploadID string, parts []store.CompletePart, declaredChecksum string, ifNoneMatchAny bool) (*store.ObjectInfo, error) {
+func (c *Cluster) CompleteMultipartUpload(bucket, key, uploadID string, parts []store.CompletePart, opt store.CompleteOptions) (*store.ObjectInfo, error) {
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("%w: 分片列表为空", store.ErrInvalidPartOrder)
 	}
@@ -270,7 +270,7 @@ func (c *Cluster) CompleteMultipartUpload(bucket, key, uploadID string, parts []
 			return nil, store.ErrInvalidPart
 		}
 		return ps, nil
-	}, declaredChecksum)
+	}, opt.DeclaredChecksum)
 	if err != nil {
 		return nil, err
 	}
@@ -284,8 +284,22 @@ func (c *Cluster) CompleteMultipartUpload(bucket, key, uploadID string, parts []
 		return nil, fmt.Errorf("%w: 只有 %d/%d 个对象副本响应，需要 %d",
 			store.ErrUnavailable, responded, len(ts), c.cfg.ReadQuorum)
 	}
-	if ifNoneMatchAny && liveCount(probe) > 0 {
+	if opt.IfNoneMatchAny && liveCount(probe) > 0 {
 		return nil, store.ErrPreconditionFailed
+	}
+	// 与 Cluster.PutObject 同一套尽力而为判定（02 文档例外一）：probe 与
+	// meta 提交之间没有跨节点锁，条件写能挡住顺序覆盖与客户端重试，
+	// 但不提供跨节点的线性化保证。
+	if opt.IfNoneMatchETag != "" || opt.IfMatchETag != "" || opt.IfMatchAny {
+		live := latestLiveMeta(probe)
+		if opt.IfNoneMatchETag != "" && live != nil && live.ETag == opt.IfNoneMatchETag {
+			return nil, store.ErrPreconditionFailed
+		}
+		if opt.IfMatchETag != "" || opt.IfMatchAny {
+			if live == nil || (!opt.IfMatchAny && live.ETag != opt.IfMatchETag) {
+				return nil, store.ErrPreconditionFailed
+			}
+		}
 	}
 	var seen uint64
 	if m := latestMeta(probe); m != nil {

@@ -135,7 +135,7 @@ func TestMultipartUploadAcrossNodes(t *testing.T) {
 	obj, err := nodes[1].cl.CompleteMultipartUpload(bucket, key, up.UploadID, []store.CompletePart{
 		{PartNumber: 1, ETag: `"` + info1.ETag + `"`},
 		{PartNumber: 2, ETag: info2.ETag},
-	}, "", false)
+	}, store.CompleteOptions{})
 	if err != nil {
 		t.Fatalf("Complete 失败: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestMultipartUploadAbort(t *testing.T) {
 	}
 	if _, err := nodes[2].cl.CompleteMultipartUpload(bucket, key, up.UploadID, []store.CompletePart{
 		{PartNumber: 1, ETag: etagOf(testPayload(5 << 20))},
-	}, "", false); !errors.Is(err, store.ErrNoSuchUpload) {
+	}, store.CompleteOptions{}); !errors.Is(err, store.ErrNoSuchUpload) {
 		t.Fatalf("Abort 后 Complete 错误 = %v，期望 ErrNoSuchUpload", err)
 	}
 	if err := nodes[2].cl.AbortMultipartUpload(bucket, key, up.UploadID); !errors.Is(err, store.ErrNoSuchUpload) {
@@ -234,7 +234,7 @@ func TestMultipartUploadSurvivesCoordinatorFailure(t *testing.T) {
 	obj, err := nodes[1].cl.CompleteMultipartUpload(bucket, key, up.UploadID, []store.CompletePart{
 		{PartNumber: 1, ETag: info1.ETag},
 		{PartNumber: 2, ETag: info2.ETag},
-	}, "", false)
+	}, store.CompleteOptions{})
 	if err != nil {
 		t.Fatalf("创建者宕机后 Complete 失败: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestMultipartUploadChecksumAdoption(t *testing.T) {
 	obj, err := nodes[0].cl.CompleteMultipartUpload(bucket, key, up.UploadID, []store.CompletePart{
 		{PartNumber: 1, ETag: info1.ETag},
 		{PartNumber: 2, ETag: info2.ETag},
-	}, "", false)
+	}, store.CompleteOptions{})
 	if err != nil {
 		t.Fatalf("Complete 失败: %v", err)
 	}
@@ -333,15 +333,22 @@ func TestMultipartUploadConditionalComplete(t *testing.T) {
 	info := uploadPart(t, nodes[0].cl, bucket, key, up.UploadID, 1, data, store.UploadPartOptions{})
 	parts := []store.CompletePart{{PartNumber: 1, ETag: info.ETag}}
 
-	if _, err := nodes[1].cl.CompleteMultipartUpload(bucket, key, up.UploadID, parts, "", true); !errors.Is(err, store.ErrPreconditionFailed) {
-		t.Fatalf("条件 Complete 错误 = %v，期望 ErrPreconditionFailed", err)
+	if _, err := nodes[1].cl.CompleteMultipartUpload(bucket, key, up.UploadID, parts, store.CompleteOptions{IfNoneMatchAny: true}); !errors.Is(err, store.ErrPreconditionFailed) {
+		t.Fatalf("If-None-Match:* 条件 Complete 错误 = %v，期望 ErrPreconditionFailed", err)
+	}
+	// 具体 ETag 与 If-Match 同样在 probe barrier 上判定，语义与 PUT 一致。
+	if _, err := nodes[1].cl.CompleteMultipartUpload(bucket, key, up.UploadID, parts, store.CompleteOptions{IfNoneMatchETag: oldInfo.ETag}); !errors.Is(err, store.ErrPreconditionFailed) {
+		t.Fatalf("If-None-Match 命中已有 ETag 错误 = %v，期望 ErrPreconditionFailed", err)
+	}
+	if _, err := nodes[1].cl.CompleteMultipartUpload(bucket, key, up.UploadID, parts, store.CompleteOptions{IfMatchETag: "deadbeef"}); !errors.Is(err, store.ErrPreconditionFailed) {
+		t.Fatalf("If-Match 不匹配错误 = %v，期望 ErrPreconditionFailed", err)
 	}
 	// 失败不能消耗会话。
 	if _, err := nodes[2].cl.ListParts(bucket, key, up.UploadID, store.ListPartsOptions{MaxParts: 10}); err != nil {
 		t.Fatalf("条件失败后会话不可用: %v", err)
 	}
 
-	obj, err := nodes[0].cl.CompleteMultipartUpload(bucket, key, up.UploadID, parts, "", false)
+	obj, err := nodes[0].cl.CompleteMultipartUpload(bucket, key, up.UploadID, parts, store.CompleteOptions{IfMatchETag: oldInfo.ETag})
 	if err != nil {
 		t.Fatalf("Complete 失败: %v", err)
 	}
@@ -425,7 +432,7 @@ func TestMultipartPartBoundsAcrossNodes(t *testing.T) {
 	info2 := uploadPart(t, nodes[2].cl, bucket, key, up.UploadID, 2, part2, store.UploadPartOptions{})
 
 	obj, err := nodes[1].cl.CompleteMultipartUpload(bucket, key, up.UploadID,
-		[]store.CompletePart{{PartNumber: 1, ETag: info1.ETag}, {PartNumber: 2, ETag: info2.ETag}}, "", false)
+		[]store.CompletePart{{PartNumber: 1, ETag: info1.ETag}, {PartNumber: 2, ETag: info2.ETag}}, store.CompleteOptions{})
 	if err != nil {
 		t.Fatalf("Complete 失败: %v", err)
 	}
@@ -479,7 +486,7 @@ func TestClusterCopyDropsPartBounds(t *testing.T) {
 	info1 := uploadPart(t, nodes[0].cl, bucket, srcKey, up.UploadID, 1, part1, store.UploadPartOptions{})
 	info2 := uploadPart(t, nodes[1].cl, bucket, srcKey, up.UploadID, 2, part2, store.UploadPartOptions{})
 	if _, err := nodes[2].cl.CompleteMultipartUpload(bucket, srcKey, up.UploadID,
-		[]store.CompletePart{{PartNumber: 1, ETag: info1.ETag}, {PartNumber: 2, ETag: info2.ETag}}, "", false); err != nil {
+		[]store.CompletePart{{PartNumber: 1, ETag: info1.ETag}, {PartNumber: 2, ETag: info2.ETag}}, store.CompleteOptions{}); err != nil {
 		t.Fatalf("Complete 失败: %v", err)
 	}
 

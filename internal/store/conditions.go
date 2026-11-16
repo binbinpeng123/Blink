@@ -37,6 +37,16 @@ func (o CopyOptions) conditions() writeConditions {
 	}
 }
 
+// conditions 把 CompleteOptions 上的条件字段归一成存储层判定结构。
+func (o CompleteOptions) conditions() writeConditions {
+	return writeConditions{
+		ifNoneMatchAny:  o.IfNoneMatchAny,
+		ifNoneMatchETag: o.IfNoneMatchETag,
+		ifMatchETag:     o.IfMatchETag,
+		ifMatchAny:      o.IfMatchAny,
+	}
+}
+
 // checkWriteConditions 在持有目标 key 锁时判定写请求的前置条件。
 //
 // 调用方必须在 key 锁内读取 prev 并调用本函数，否则"检查"与"提交"之间

@@ -189,7 +189,7 @@ func TestMultipartPersistsHTTPMeta(t *testing.T) {
 	pi := uploadPart(t, s, "mpu.bin", up.UploadID, 1, part, UploadPartOptions{})
 
 	info, err := s.CompleteMultipartUpload("bkt", "mpu.bin", up.UploadID,
-		[]CompletePart{{1, pi.ETag}}, "", false)
+		[]CompletePart{{1, pi.ETag}}, CompleteOptions{})
 	if err != nil {
 		t.Fatalf("CompleteMultipartUpload 失败: %v", err)
 	}

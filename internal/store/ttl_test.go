@@ -396,7 +396,7 @@ func TestMultipartCompleteAppliesBucketTTL(t *testing.T) {
 		t.Fatalf("UploadPart 失败: %v", err)
 	}
 	if _, err := s.CompleteMultipartUpload("models", "w.bin", up.UploadID,
-		[]CompletePart{{PartNumber: 1, ETag: info.ETag}}, "", false); err != nil {
+		[]CompletePart{{PartNumber: 1, ETag: info.ETag}}, CompleteOptions{}); err != nil {
 		t.Fatalf("CompleteMultipartUpload 失败: %v", err)
 	}
 
@@ -440,7 +440,7 @@ func TestMultipartCompleteIfNoneMatchIgnoresExpired(t *testing.T) {
 		t.Fatalf("UploadPart 失败: %v", err)
 	}
 	if _, err := s.CompleteMultipartUpload("tmp", "k", up.UploadID,
-		[]CompletePart{{PartNumber: 1, ETag: info.ETag}}, "", true); err != nil {
+		[]CompletePart{{PartNumber: 1, ETag: info.ETag}}, CompleteOptions{IfNoneMatchAny: true}); err != nil {
 		t.Fatalf("过期对象不应触发 412: %v", err)
 	}
 }

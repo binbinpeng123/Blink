@@ -102,6 +102,24 @@ type CompletePart struct {
 	ETag string
 }
 
+// CompleteOptions 是 CompleteMultipartUpload 的补充参数。
+//
+// 条件字段与 PutOptions / CopyOptions 同名同义：Complete 是"把已有的
+// 分片结果提交成对象"，对目标对象的可见性要求与普通写入完全一致，
+// 因此三条写路径共用同一套判定。ETag 已由协议层去掉引号与 `W/`。
+type CompleteOptions struct {
+	// DeclaredChecksum 是客户端在 Complete 请求里声明的全对象校验和。
+	DeclaredChecksum string
+	// IfNoneMatchAny 对应 If-None-Match: *：目标对象已存在则失败。
+	IfNoneMatchAny bool
+	// IfNoneMatchETag 对应 If-None-Match: "etag"：目标 ETag 等于该值时失败。
+	IfNoneMatchETag string
+	// IfMatchETag 对应 If-Match: "etag"：目标不存在或 ETag 不匹配时失败。
+	IfMatchETag string
+	// IfMatchAny 对应 If-Match: *：目标不存在时失败。
+	IfMatchAny bool
+}
+
 // PartInfo 是 UploadPart 的结果，也是 ListParts 的条目。
 type PartInfo struct {
 	PartNumber int
@@ -836,9 +854,13 @@ func (s *Store) loadPartState(uploadID string, partNumber int) (*PartState, erro
 // 写入量都与对象大小无关 —— 20 GiB 对象与 20 MiB 对象的 Complete
 // 成本相同（BenchmarkCompleteMultipart20GB 断言这一点）。
 //
+// 目标对象的写条件（If-None-Match / If-Match 的 `*` 与具体 ETag）在
+// key 锁内由 checkWriteConditions 判定，与 PUT/COPY 共用同一套语义；
+// 条件失败时返回 ErrPreconditionFailed，分片会话保持不变供客户端重试。
+//
 // 锁顺序：先 uploadId 锁、再 key 锁。反向（先 key 再 uploadId）会与
 // 本函数竞争出死锁，因此全包统一这一个顺序。
-func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletePart, declaredChecksum string, ifNoneMatchAny bool) (*ObjectInfo, error) {
+func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletePart, opt CompleteOptions) (*ObjectInfo, error) {
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("%w: 分片列表为空", ErrInvalidPartOrder)
 	}
@@ -856,7 +878,7 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 
 	out, err := AssembleMultipart(st, parts, func(n int) (*PartState, error) {
 		return s.loadPartState(uploadID, n)
-	}, declaredChecksum)
+	}, opt.DeclaredChecksum)
 	if err != nil {
 		return nil, err
 	}
@@ -869,12 +891,12 @@ func (s *Store) CompleteMultipartUpload(bucket, key, uploadID string, parts []Co
 	case err == nil:
 		// 与 PUT/COPY 共用同一套判定：墓碑与已过期对象在逻辑上都不存在，
 		// 不能因为它们触发 412。
-		if cerr := s.checkWriteConditions(prev, writeConditions{ifNoneMatchAny: ifNoneMatchAny}); cerr != nil {
+		if cerr := s.checkWriteConditions(prev, opt.conditions()); cerr != nil {
 			return nil, cerr
 		}
 	case errors.Is(err, ErrNoSuchKey):
 		prev = nil
-		if cerr := s.checkWriteConditions(nil, writeConditions{ifNoneMatchAny: ifNoneMatchAny}); cerr != nil {
+		if cerr := s.checkWriteConditions(nil, opt.conditions()); cerr != nil {
 			return nil, cerr
 		}
 	default:

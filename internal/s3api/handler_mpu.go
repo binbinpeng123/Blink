@@ -157,18 +157,11 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket
 func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) {
 	uploadID := r.URL.Query().Get("uploadId")
 
+	// Complete 与 PUT/COPY 的目标是同一个对象，写条件必须同一套语义。
+	// 条件由存储层在提交 meta 的 key 锁内判定，这里只做解析。
 	cond, condErr := parseWriteConditions(r)
 	if condErr != nil {
 		condErr.Write(w, r, reqID)
-		return
-	}
-	if cond.ifMatchETag != "" || cond.ifMatchAny || cond.ifNoneMatchETag != "" {
-		// 除 If-None-Match:* 之外的写条件都需要把条件传入存储层的 key 锁内；
-		// Complete 的存储接口目前只接受这一个布尔条件，这里必须显式拒绝而
-		// 不是接受后忽略 —— 忽略等于把"仅当目标版本未变才提交"降级成无条件覆盖。
-		s3err.New(s3err.CodeNotImplemented).
-			WithMessage("CompleteMultipartUpload 暂不支持该写条件（仅支持 `If-None-Match: *`）。").
-			Write(w, r, reqID)
 		return
 	}
 
@@ -200,8 +193,13 @@ func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	info, err := s.store.CompleteMultipartUpload(bucket, key, uploadID, parts, declared,
-		cond.ifNoneMatchAny)
+	info, err := s.store.CompleteMultipartUpload(bucket, key, uploadID, parts, store.CompleteOptions{
+		DeclaredChecksum: declared,
+		IfNoneMatchAny:   cond.ifNoneMatchAny,
+		IfNoneMatchETag:  cond.ifNoneMatchETag,
+		IfMatchETag:      cond.ifMatchETag,
+		IfMatchAny:       cond.ifMatchAny,
+	})
 	if err != nil {
 		s.writeStoreErr(w, r, reqID, err)
 		return

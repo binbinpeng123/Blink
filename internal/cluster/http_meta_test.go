@@ -114,7 +114,7 @@ func TestMultipartHTTPMetaAcrossNodes(t *testing.T) {
 	info := uploadPart(t, nodes[1].cl, bucket, key, up.UploadID, 1, part, store.UploadPartOptions{})
 
 	obj, err := nodes[2].cl.CompleteMultipartUpload(bucket, key, up.UploadID,
-		[]store.CompletePart{{PartNumber: 1, ETag: info.ETag}}, "", false)
+		[]store.CompletePart{{PartNumber: 1, ETag: info.ETag}}, store.CompleteOptions{})
 	if err != nil {
 		t.Fatalf("Complete 失败: %v", err)
 	}
