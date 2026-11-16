@@ -56,7 +56,7 @@ type Backend interface {
 	// 分片上传。
 	CreateMultipartUpload(bucket, key string, opt CreateMultipartOptions) (*MultipartUpload, error)
 	UploadPart(bucket, key, uploadID string, partNumber int, body io.Reader, opt UploadPartOptions) (*PartInfo, error)
-	CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletePart, declaredChecksum string, ifNoneMatchAny bool) (*ObjectInfo, error)
+	CompleteMultipartUpload(bucket, key, uploadID string, parts []CompletePart, opt CompleteOptions) (*ObjectInfo, error)
 	AbortMultipartUpload(bucket, key, uploadID string) error
 	ListParts(bucket, key, uploadID string, opt ListPartsOptions) (*ListPartsResult, error)
 	ListMultipartUploads(bucket string, opt ListMultipartUploadsOptions) (*ListMultipartUploadsResult, error)

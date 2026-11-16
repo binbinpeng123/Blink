@@ -640,22 +640,94 @@ func TestGetObjectPartNumberAfterComplete(t *testing.T) {
 	}
 }
 
-// TestCompleteMultipartUploadRejectsIfMatch 验证 Complete 上显式拒绝 If-Match。
+// uploadSinglePart 建会话并上传唯一的一个末片。
 //
-// 接受后忽略会把"仅当目标版本未变才提交"降级成无条件覆盖 —— 这是数据
-// 丢失，不是少个特性。If-None-Match:* 仍然支持（store 已在 key 锁内判定）。
-func TestCompleteMultipartUploadRejectsIfMatch(t *testing.T) {
-	h := objectTestServer(t)
-	for _, v := range []string{`"some-etag"`, "*"} {
-		t.Run(v, func(t *testing.T) {
-			rec := mpuRequest(t, h, http.MethodPost, "/bkt/k?uploadId=whatever",
-				strings.NewReader(`<CompleteMultipartUpload></CompleteMultipartUpload>`),
-				func(r *http.Request) { r.Header.Set("If-Match", v) })
-			if rec.Code != http.StatusNotImplemented {
-				t.Fatalf("状态码 = %d，期望 501 (%s)", rec.Code, rec.Body.String())
+// 单分片就是末片，不受 5 MiB 下限约束，用例可以保持很小。
+func uploadSinglePart(t *testing.T, h http.Handler, key string) (uploadID, partETag string) {
+	t.Helper()
+	uploadID = createUploadHTTP(t, h, key, nil)
+	rec := mpuRequest(t, h, http.MethodPut, "/bkt/"+key+"?partNumber=1&uploadId="+uploadID,
+		bytes.NewReader(mpuPayload(1024, 0x33)), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("UploadPart = %d：%s", rec.Code, rec.Body.String())
+	}
+	return uploadID, rec.Header().Get("ETag")
+}
+
+// completeUpload 用给定的 uploadId 提交 Complete；mutate 用来注入写条件头。
+func completeUpload(t *testing.T, h http.Handler, key, uploadID, partETag string, mutate func(*http.Request)) *httptest.ResponseRecorder {
+	t.Helper()
+	body := fmt.Sprintf(
+		`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`,
+		partETag)
+	return mpuRequest(t, h, http.MethodPost, "/bkt/"+key+"?uploadId="+uploadID,
+		strings.NewReader(body), mutate)
+}
+
+// TestCompleteMultipartUploadWriteConditions 验证 Complete 与 PUT/COPY
+// 共享同一套目标写条件语义。
+//
+// Complete 是"把已有分片提交成对象"，目标可见性要求与普通写入完全一致；
+// 接受后忽略会把"仅当目标版本未变才提交"降级成无条件覆盖。
+func TestCompleteMultipartUploadWriteConditions(t *testing.T) {
+	const key = "cond"
+
+	cases := []struct {
+		name   string
+		header string
+		// value 为空表示用已有对象的 ETag；`*` 与固定值按字面发送。
+		value string
+		want  int
+	}{
+		{"If-None-Match 命中已有 ETag", "If-None-Match", "", http.StatusPreconditionFailed},
+		{"If-None-Match 星号且对象存在", "If-None-Match", "*", http.StatusPreconditionFailed},
+		{"If-None-Match 未命中", "If-None-Match", `W/"deadbeef"`, http.StatusOK},
+		{"If-Match 命中", "If-Match", "", http.StatusOK},
+		{"If-Match 星号且对象存在", "If-Match", "*", http.StatusOK},
+		{"If-Match 不匹配", "If-Match", `"deadbeef"`, http.StatusPreconditionFailed},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// 每个子用例用独立服务器：已有对象的 ETag 是条件求值的输入。
+			h := mpuTestServer(t)
+			rec := mpuRequest(t, h, http.MethodPut, "/bkt/"+key,
+				strings.NewReader("v1"), nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("准备对象 = %d：%s", rec.Code, rec.Body.String())
 			}
-			if got := decodeError(t, rec).Code; got != "NotImplemented" {
-				t.Errorf("Code = %q，期望 NotImplemented", got)
+			etag := rec.Header().Get("ETag")
+
+			value := tc.value
+			if value == "" {
+				value = etag
+			}
+			uploadID, partETag := uploadSinglePart(t, h, key)
+			rec = completeUpload(t, h, key, uploadID, partETag, func(r *http.Request) {
+				r.Header.Set(tc.header, value)
+			})
+			if rec.Code != tc.want {
+				t.Fatalf("Complete 状态码 = %d，期望 %d：%s", rec.Code, tc.want, rec.Body.String())
+			}
+
+			if tc.want == http.StatusPreconditionFailed {
+				if got := decodeError(t, rec).Code; got != "PreconditionFailed" {
+					t.Errorf("Code = %q，期望 PreconditionFailed", got)
+				}
+				// 失败的那次不能改动目标对象。
+				get := mpuRequest(t, h, http.MethodGet, "/bkt/"+key, nil, nil)
+				if got := get.Body.String(); got != "v1" {
+					t.Errorf("对象内容 = %q，期望条件失败后仍是 v1", got)
+				}
+				// 条件失败不能消耗会话：沿用同一个 uploadId 去掉条件重试必须成功。
+				rec = completeUpload(t, h, key, uploadID, partETag, nil)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("去条件重试 = %d，期望 200：%s", rec.Code, rec.Body.String())
+				}
+				get = mpuRequest(t, h, http.MethodGet, "/bkt/"+key, nil, nil)
+				if !bytes.Equal(get.Body.Bytes(), mpuPayload(1024, 0x33)) {
+					t.Error("重试成功后对象内容应替换为分片数据")
+				}
 			}
 		})
 	}

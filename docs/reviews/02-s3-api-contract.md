@@ -262,7 +262,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - `UploadPartCopy`：与 `UploadPart` 同路由，以 `x-amz-copy-source` 非空为唯一判据分流。支持 `x-amz-copy-source-range: bytes=first-last`（两端必填，不支持开放/后缀/多区间）；缺省复制整个源对象。源条件与 CopyObject 同一套 `x-amz-copy-source-if-*`；源不存在 → `404 NoSuchKey`；区间越界 → `416 InvalidRange` 且带 `Content-Range: bytes */<源大小>`；单次复制 > 5 GiB → `400 InvalidRequest`。响应 `<CopyPartResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyPartResult>`，ETag 按目标分片内容重算，与随后 `ListParts` 一致。
 - 单机与集群的 `UploadPartCopy` 都走 `OpenObject` + `io.Pipe` + `UploadPart`：**不是零拷贝**，数据经协调者读一次、写一次（与集群 CopyObject 同理）。
 - `CompleteMultipartUpload` 必须校验分片序号升序（否则 `400 InvalidPartOrder`）、分片存在且 ETag 匹配（否则 `400 InvalidPart`）、尺寸约束（否则 `400 EntityTooSmall`）。
-- `CompleteMultipartUpload` 支持 `If-None-Match: *`（对象已存在 → `412`）；带具体 ETag 的 `If-None-Match` 与 `If-Match` → `501 NotImplemented` —— 条件必须进入存储层 key 锁才有意义，本版本只给 PutObject 与 CopyObject 目标落地，接受后忽略会把"仅当目标版本未变才提交"降级成无条件覆盖。
+- `CompleteMultipartUpload` 与 `PutObject`、`CopyObject` 目标共用同一套写条件：`If-None-Match`（`*` 或单个 ETag）与 `If-Match`（单个 ETag 或 `*`），失败 → `412 PreconditionFailed`。单机在存储层 key 锁内判定；集群在写前 `probeMetas` barrier 上尽力而为判定（与普通写入同一例外）。条件失败**不消耗分片会话**，客户端去掉条件后可用同一 `uploadId` 重试；接受后忽略会把"仅当目标版本未变才提交"降级成无条件覆盖。
 - 完成后的 `ETag` 为 `"<md5(各分片 MD5 拼接)>-<N>"`。
 - 完成后先原子提交元数据与块表，再删除分片上传的临时状态。
 - `AbortMultipartUpload` → `204`，清理临时状态；不存在的 uploadId → `404 NoSuchUpload`。

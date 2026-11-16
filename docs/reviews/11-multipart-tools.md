@@ -66,7 +66,7 @@
 | 单分片上限 | 5 GiB（`5 << 30`）；超过 `400 InvalidRequest` |
 | 源条件 | 与 CopyObject 同一套四个头；不满足 `412 PreconditionFailed` |
 | 源不存在 | 先 `404`，再谈条件（与 CopyObject 一致） |
-| 目标条件 | 分片复制没有目标对象级条件；`If-None-Match` 等写条件只在 Complete 生效 |
+| 目标条件 | 分片复制没有目标对象级条件；`If-None-Match` / `If-Match`（`*` 或单个 ETag）只在 Complete 对目标对象生效，与 PUT/COPY 同一套语义 |
 | 存储类型 | `x-amz-storage-class` 非 `STANDARD` → `501`；分片本身不携带存储类型 |
 | 加密/标签头 | 与 CopyObject 相同：出现即 `501`，不静默忽略 |
 | 元数据指令 | `x-amz-metadata-directive` 在分片复制上无定义，忽略 |

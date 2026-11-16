@@ -107,7 +107,7 @@ func TestMultipartFullObjectHappyPath(t *testing.T) {
 	parts := []CompletePart{{1, i1.ETag}, {2, `"` + i2.ETag + `"`}}
 	// 客户端在 Complete 时可以带引号；服务端必须接受。
 	full := sumOf(t, checksum.AlgCRC64NVME, want)
-	info, err := s.CompleteMultipartUpload("bkt", "models/weights.bin", up.UploadID, parts, full, false)
+	info, err := s.CompleteMultipartUpload("bkt", "models/weights.bin", up.UploadID, parts, CompleteOptions{DeclaredChecksum: full})
 	if err != nil {
 		t.Fatalf("CompleteMultipartUpload 失败: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestUploadPartAdoptsChecksumAlgorithm(t *testing.T) {
 	})
 	full := sumOf(t, checksum.AlgCRC64NVME, want)
 	info, err := s.CompleteMultipartUpload("bkt", "adopted.bin", up.UploadID,
-		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, full, false)
+		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, CompleteOptions{DeclaredChecksum: full})
 	if err != nil {
 		t.Fatalf("CompleteMultipartUpload 失败: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestMultipartCompositeChecksum(t *testing.T) {
 		t.Fatal("MergeComposite 失败")
 	}
 	info, err := s.CompleteMultipartUpload("bkt", "k", up.UploadID,
-		[]CompletePart{{1, ia.ETag}, {2, ib.ETag}}, want, false)
+		[]CompletePart{{1, ia.ETag}, {2, ib.ETag}}, CompleteOptions{DeclaredChecksum: want})
 	if err != nil {
 		t.Fatalf("CompleteMultipartUpload 失败: %v", err)
 	}
@@ -275,7 +275,7 @@ func TestMultipartCompleteValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := s.CompleteMultipartUpload("bkt", "obj", up.UploadID, tc.parts, "", false)
+			_, err := s.CompleteMultipartUpload("bkt", "obj", up.UploadID, tc.parts, CompleteOptions{})
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("得到 %v，期望 %v", err, tc.want)
 			}
@@ -289,7 +289,7 @@ func TestMultipartCompleteValidation(t *testing.T) {
 
 	// 声明了错误的全对象校验和 → BadDigest。
 	_, err := s.CompleteMultipartUpload("bkt", "obj", up.UploadID,
-		[]CompletePart{{4, e4.ETag}}, "AAAA", false)
+		[]CompletePart{{4, e4.ETag}}, CompleteOptions{DeclaredChecksum: "AAAA"})
 	if !errors.Is(err, ErrBadDigest) {
 		t.Fatalf("错误的全对象校验和应返回 ErrBadDigest，得到 %v", err)
 	}
@@ -353,7 +353,7 @@ func TestMultipartAbort(t *testing.T) {
 		t.Fatalf("Abort 后 ListParts 应返回 ErrNoSuchUpload，得到 %v", err)
 	}
 	if _, err := s.CompleteMultipartUpload("bkt", "obj", up.UploadID,
-		[]CompletePart{{1, ""}}, "", false); !errors.Is(err, ErrNoSuchUpload) {
+		[]CompletePart{{1, ""}}, CompleteOptions{}); !errors.Is(err, ErrNoSuchUpload) {
 		t.Fatalf("Abort 后 Complete 应返回 ErrNoSuchUpload，得到 %v", err)
 	}
 
@@ -525,12 +525,12 @@ func TestMultipartIfNoneMatchAndVersion(t *testing.T) {
 	p := mpuBytes(minPartSize, 7)
 	ip := uploadPart(t, s, "obj", up.UploadID, 1, p, UploadPartOptions{})
 	if _, err := s.CompleteMultipartUpload("bkt", "obj", up.UploadID,
-		[]CompletePart{{1, ip.ETag}}, "", true); !errors.Is(err, ErrPreconditionFailed) {
+		[]CompletePart{{1, ip.ETag}}, CompleteOptions{IfNoneMatchAny: true}); !errors.Is(err, ErrPreconditionFailed) {
 		t.Fatalf("If-None-Match:* 且对象存在时应返回 ErrPreconditionFailed，得到 %v", err)
 	}
 	// 条件失败不消耗会话。
 	info, err := s.CompleteMultipartUpload("bkt", "obj", up.UploadID,
-		[]CompletePart{{1, ip.ETag}}, "", false)
+		[]CompletePart{{1, ip.ETag}}, CompleteOptions{})
 	if err != nil {
 		t.Fatalf("CompleteMultipartUpload 失败: %v", err)
 	}
@@ -570,7 +570,7 @@ func TestMultipartSurvivesRestart(t *testing.T) {
 		t.Fatalf("重启后分片不一致: %+v", r.Parts)
 	}
 	info, err := s2.CompleteMultipartUpload("bkt", "obj", up.UploadID,
-		[]CompletePart{{1, ip.ETag}}, "", false)
+		[]CompletePart{{1, ip.ETag}}, CompleteOptions{})
 	if err != nil {
 		t.Fatalf("重启后 Complete 失败: %v", err)
 	}
@@ -685,7 +685,7 @@ func BenchmarkCompleteMultipartBlockTable(b *testing.B) {
 			parts = append(parts, CompletePart{PartNumber: j + 1, ETag: pi.ETag})
 		}
 		t0 := time.Now()
-		if _, err := s.CompleteMultipartUpload("bkt", "bench", up.UploadID, parts, "", false); err != nil {
+		if _, err := s.CompleteMultipartUpload("bkt", "bench", up.UploadID, parts, CompleteOptions{}); err != nil {
 			b.Fatalf("Complete 失败: %v", err)
 		}
 		completeNS += time.Since(t0).Nanoseconds()
@@ -733,7 +733,7 @@ func TestMultipartPartBoundsPersisted(t *testing.T) {
 	i1 := uploadPart(t, s, key, up.UploadID, 1, p1, UploadPartOptions{})
 	i2 := uploadPart(t, s, key, up.UploadID, 2, p2, UploadPartOptions{})
 	info, err := s.CompleteMultipartUpload("bkt", key, up.UploadID,
-		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, "", false)
+		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, CompleteOptions{})
 	if err != nil {
 		t.Fatalf("Complete 失败: %v", err)
 	}
@@ -811,7 +811,7 @@ func TestCopyObjectDropsPartBounds(t *testing.T) {
 	i1 := uploadPart(t, s, srcKey, up.UploadID, 1, p1, UploadPartOptions{})
 	i2 := uploadPart(t, s, srcKey, up.UploadID, 2, p2, UploadPartOptions{})
 	if _, err := s.CompleteMultipartUpload("bkt", srcKey, up.UploadID,
-		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, "", false); err != nil {
+		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, CompleteOptions{}); err != nil {
 		t.Fatalf("Complete 失败: %v", err)
 	}
 
