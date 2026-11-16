@@ -201,6 +201,13 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 桶级 location 子资源（?location）必须显式分派：它和普通桶级
+	// GET 共用同一路径，若不在这里拦下，GET 会被误当成 ListObjects V1，
+	// PUT/DELETE 更会误创建或误删除桶。
+	if s.dispatchBucketLocation(w, r, bucket, key, reqID) {
+		return
+	}
+
 	// 桶级 CORS 子资源（?cors）同样在通用方法分派之前处理。
 	if s.dispatchCORS(w, r, bucket, key, reqID) {
 		return
@@ -339,6 +346,13 @@ var unsupportedSubresources = map[string]bool{
 	"requestPayment": true, "object-lock": true, "legal-hold": true,
 	"retention": true, "inventory": true, "metrics": true, "analytics": true,
 	"publicAccessBlock": true, "ownershipControls": true, "intelligent-tiering": true,
+	// attributes / policyStatus / select 是尚未实现的**查询**子资源。
+	// 漏掉它们比漏掉写类子资源更隐蔽：请求会静默走对象下载或桶列举，
+	// 客户端拿到 200 却把响应解析成属性文档，错误要到很久之后才暴露。
+	"attributes": true, "policyStatus": true, "select": true, "select-type": true,
+	// 本版本没有多版本：带 versionId 的读写必须明确拒绝，不能把
+	// "操作某个历史版本"降级成"操作当前对象"。
+	"versionId": true,
 }
 
 // dispatchMultipart 处理分片上传的四个子资源。

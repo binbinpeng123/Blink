@@ -69,6 +69,74 @@ func (s *Server) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucket
 	w.WriteHeader(http.StatusOK)
 }
 
+// dispatchBucketLocation 处理桶级 `?location` 子资源。
+//
+// 返回 true 表示请求已被处理（成功或已写出错误响应），调用方必须立即返回。
+//
+// 必须早于按方法分派：`GET /{bucket}?location` 与 ListObjects V1 共用
+// 同一路径，`PUT`/`DELETE` 则会命中 CreateBucket/DeleteBucket。
+// 不拦截的后果不是"少一个 API"，而是把一次区域查询变成创建或删除桶。
+func (s *Server) dispatchBucketLocation(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) bool {
+	if !r.URL.Query().Has("location") {
+		return false
+	}
+	// `/{bucket}/{key}?location` 在 S3 里没有定义，明确 501，
+	// 不能让它落到对象读写。
+	if bucket == "" || key != "" {
+		notImplemented("?location 只支持桶级请求：GET /{bucket}?location。").
+			Write(w, r, reqID)
+		return true
+	}
+	// 只有 GetBucketLocation 合法。非 GET 回 405 而不是 501：
+	// 子资源存在，只是方法不对（与 ?cors 的约定一致）。
+	if r.Method != http.MethodGet {
+		s3err.New(s3err.CodeMethodNotAllowed).Write(w, r, reqID)
+		return true
+	}
+	if !s.requireStore(w, r, reqID) {
+		return true
+	}
+	s.handleGetBucketLocation(w, r, bucket, reqID)
+	return true
+}
+
+// handleGetBucketLocation 处理 GET /{bucket}?location。
+//
+// 本版本不支持桶级独立区域，`CreateBucket` 收到 LocationConstraint
+// 也不落盘，因此这里统一返回服务端配置的区域。AWS 的语义是
+// us-east-1 对应**空**元素，其余区域返回区域名；照此返回，
+// 让 SDK 的 "create bucket in us-east-1" 判定与真实 S3 一致。
+func (s *Server) handleGetBucketLocation(w http.ResponseWriter, r *http.Request, bucket, reqID string) {
+	ok, err := s.store.BucketExists(bucket)
+	if err != nil {
+		s.writeStoreErr(w, r, reqID, err)
+		return
+	}
+	if !ok {
+		s3err.New(s3err.CodeNoSuchBucket).Write(w, r, reqID)
+		return
+	}
+
+	region := s.region
+	if region == "us-east-1" {
+		region = ""
+	}
+	writeXMLBody(w, r, http.StatusOK, locationConstraint{Value: region})
+	loggerFrom(r.Context(), s.logger).Debug("bucket_location",
+		slog.String("bucket", bucket),
+		slog.String("region", s.region),
+	)
+}
+
+// locationConstraint 是 GetBucketLocation 的响应体。
+//
+// 命名空间必须写进标签：客户端（含 aws-sdk-go 的 LocationConstraint
+// 解析）按带 xmlns 的根元素解包，缺了它部分 SDK 会判为无法识别。
+type locationConstraint struct {
+	XMLName xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ LocationConstraint"`
+	Value   string   `xml:",chardata"`
+}
+
 // handleListBuckets 处理 GET /（根路径，无 bucket 名）。
 //
 // 本版本在切片 3 就实现它，而不是等到切片 6：`aws s3 ls` 不带参数时
