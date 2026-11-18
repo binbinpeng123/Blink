@@ -1048,7 +1048,11 @@ func AssembleMultipart(st *UploadState, parts []CompletePart, load func(int) (*P
 		// 分片边界直接取 PartState.Size。不重新用块表累计：两者不一致
 		// 说明状态文件被改过，随后的 out.Size 校验会暴露它，而不是
 		// 把错误长度静默写进 meta。
-		out.Parts = append(out.Parts, PartDesc{Number: p.PartNumber, Size: ps.Size})
+		out.Parts = append(out.Parts, PartDesc{
+			Number:   p.PartNumber,
+			Size:     ps.Size,
+			Checksum: ps.Checksum,
+		})
 
 		raw, err := hex.DecodeString(ps.ETag)
 		if err != nil || len(raw) != md5.Size {

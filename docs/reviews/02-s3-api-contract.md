@@ -61,6 +61,7 @@
 | 21 | `GET` | `/{bucket}?marker=...`（不带 `list-type` 或 `list-type=1`） | ListObjects V1 |
 | 22 | `PUT` | `/{bucket}/{key}` + `x-amz-copy-source` | CopyObject（服务端复制） |
 | 23 | `POST` | `/{bucket}?delete` | DeleteObjects（单次最多 1000 个） |
+| 24 | `GET` | `/{bucket}/{key}?attributes` | GetObjectAttributes（按需返回 ETag/Checksum/ObjectParts/ObjectSize/StorageClass） |
 
 ## 明确不支持的接口
 
@@ -73,7 +74,7 @@
 | `PUT /{bucket}/{key}?acl`、`?tagging`、`?legal-hold`、`?retention` | `501 NotImplemented` |
 | `POST /{bucket}/{key}?restore`、`?select`、`?select-type` | `501 NotImplemented` |
 | `GET /{bucket}/{key}?torrent` | `501 NotImplemented` |
-| `GET /{bucket}/{key}?attributes`、`GET /{bucket}?policyStatus` | `501 NotImplemented`（未实现的对象/桶属性查询，**不得**回落为下载对象或列举桶） |
+| `GET /{bucket}?policyStatus` | `501 NotImplemented`（未实现的桶属性查询，**不得**回落为列举桶） |
 | 任意方法 `/{bucket}/{key}?versionId=...` | `501 NotImplemented`（本版本无多版本） |
 | 非 `GET /{bucket}?location` | `405 MethodNotAllowed` |
 | `PUT`/`GET`/`DELETE /{bucket}/{key}?cors`（对象级 CORS，S3 无此语义） | `501 NotImplemented` |
@@ -264,6 +265,22 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 类型规则：`CRC64NVME` 未声明类型时默认 `FULL_OBJECT`（分片完成时用 CRC combine 合并，**不重读数据**）；`CRC32`/`CRC32C` 默认 `COMPOSITE`；`SHA1`/`SHA256` 只支持 `COMPOSITE`。
 - `COMPOSITE` 的值 = 对各分片**原始校验值字节**再算一次，形如 `<base64>-<分片数>`。
 - 分片下载（206）不回传校验和；完整对象下载、HEAD（带 `x-amz-checksum-mode: ENABLED`）、分片完成响应都回传。
+
+### GetObjectAttributes `GET /{bucket}/{key}?attributes`
+
+- 必填请求头 `x-amz-object-attributes`：逗号分隔的属性名，合法值为 `ETag`、`Checksum`、`ObjectParts`、`StorageClass`、`ObjectSize`（大小写不敏感，忽略空白）。头缺失、为空、含空项或含未知属性 → `400 InvalidArgument`。
+- 响应体根元素 `<GetObjectAttributesResponse xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`，只包含被请求的属性；未请求的属性**不出现**（不能用空元素冒充）。
+- `ETag`：不带引号（与 GET/HEAD 响应头不同）。
+- `Checksum`：仅在请求 `Checksum` 且对象有已持久化校验和时返回；算法值放在对应的 `<ChecksumCRC32>` / `<ChecksumCRC32C>` / `<ChecksumCRC64NVME>` / `<ChecksumSHA1>` / `<ChecksumSHA256>` 元素里，并带 `<ChecksumType>`（`FULL_OBJECT` / `COMPOSITE`）。对象无校验和时整个 `<Checksum>` 省略，而不是返回空元素。
+- `ObjectSize`：对象字节数。
+- `StorageClass`：本版本恒为 `STANDARD`。
+- `ObjectParts`：请求时总会出现。非分片上传产生的对象返回空分片集合与 0 计数。
+  - 参数 `max-parts`（缺省 1000，上限 1000，非负整数）与 `part-number-marker`（缺省 0，非负整数），语义与 ListParts 一致：只返回编号大于 marker 的分片。
+  - 元素 `<MaxParts>` 回显**生效**的 `max-parts`（请求值超过 1000 时按 1000 截断后回显），`<PartNumberMarker>` 回显请求的 marker；`<IsTruncated>` 表示是否还有下一页；`<PartsCount>` 是本页返回的分片数，`<TotalPartsCount>` 是对象分片总数；截断时带 `<NextPartNumberMarker>`。
+  - 每个 `<Part>` 含 `<PartNumber>`、`<Size>`，以及该分片的原始校验和（仅当对象有校验和时）。
+- 桶不存在 → `404 NoSuchBucket`；对象不存在 → `404 NoSuchKey`；非 `GET` → `405 MethodNotAllowed`；带 `versionId` / `uploadId` / `partNumber` → `501 NotImplemented`（本版本无多版本，不允许把属性查询降级成对当前对象或某次上传的查询）。
+- 响应头带 `Last-Modified`。
+- 分片校验和从 `meta.json` 的 `parts[].checksum` 读取（可选字段，不提升 `format_version`；旧 meta 没有该字段时省略分片校验和，而不是回退为对象级校验和）。
 
 ### 分片上传家族
 

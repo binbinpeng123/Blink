@@ -213,6 +213,12 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 对象属性查询（?attributes）与普通对象下载共用同一路径，必须在
+	// 通用分派**之前**拦下，否则 GET 会被误当成一次完整对象下载。
+	if s.dispatchObjectAttributes(w, r, bucket, key, reqID) {
+		return
+	}
+
 	// 分片上传的四个子资源在通用方法分派**之前**处理：它们的语义由
 	// 子资源决定（同一路径上的 POST 既可能是 Complete 也可能是 Create），
 	// 先按方法分派会立刻分错。
@@ -346,10 +352,11 @@ var unsupportedSubresources = map[string]bool{
 	"requestPayment": true, "object-lock": true, "legal-hold": true,
 	"retention": true, "inventory": true, "metrics": true, "analytics": true,
 	"publicAccessBlock": true, "ownershipControls": true, "intelligent-tiering": true,
-	// attributes / policyStatus / select 是尚未实现的**查询**子资源。
+	// policyStatus / select 是尚未实现的**查询**子资源。
 	// 漏掉它们比漏掉写类子资源更隐蔽：请求会静默走对象下载或桶列举，
 	// 客户端拿到 200 却把响应解析成属性文档，错误要到很久之后才暴露。
-	"attributes": true, "policyStatus": true, "select": true, "select-type": true,
+	// `attributes` 已由 dispatchObjectAttributes 实现，不再列在这里。
+	"policyStatus": true, "select": true, "select-type": true,
 	// 本版本没有多版本：带 versionId 的读写必须明确拒绝，不能把
 	// "操作某个历史版本"降级成"操作当前对象"。
 	"versionId": true,
