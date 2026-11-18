@@ -125,6 +125,11 @@ func defaultServerArgs(addr, dataDir string) []string {
 		"--data-dir", dataDir,
 		"--region", testRegion,
 		"--log-level", "debug",
+		// 集成测试跑在开发机或 CI 的真实卷上，默认 90% 高水位会被宿主
+		// 磁盘占用误触发（写请求变成 507），结果随机器漂移而非随代码。
+		// 显式关掉写阻断：磁盘满的协议行为由 store/s3api 的单元测试覆盖，
+		// 这里要验证的是与磁盘余额无关的 S3 语义。
+		"--disk-high-watermark", "1",
 	}
 }
 

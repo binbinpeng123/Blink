@@ -106,6 +106,8 @@ type ObjectPart struct {
 	Number int
 	Offset int64
 	Size   int64
+	// Checksum 是该分片的原始校验和（base64）；空表示未记录。
+	Checksum string
 }
 
 // PartBounds 把落盘的分片长度描述换算成带绝对偏移的读取视图。
@@ -119,7 +121,12 @@ func PartBounds(parts []PartDesc) []ObjectPart {
 	out := make([]ObjectPart, 0, len(parts))
 	var off int64
 	for _, p := range parts {
-		out = append(out, ObjectPart{Number: p.Number, Offset: off, Size: p.Size})
+		out = append(out, ObjectPart{
+			Number:   p.Number,
+			Offset:   off,
+			Size:     p.Size,
+			Checksum: p.Checksum,
+		})
 		off += p.Size
 	}
 	return out

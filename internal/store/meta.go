@@ -285,6 +285,13 @@ type ObjectMeta struct {
 type PartDesc struct {
 	Number int   `json:"number"`
 	Size   int64 `json:"size"`
+	// Checksum 是该分片自身的校验和（base64），仅当会话声明了
+	// ChecksumAlgorithm 时存在。GetObjectAttributes 的 ObjectParts 需要
+	// 逐片回传；只存对象级校验和无法还原分片值（COMPOSITE 是二次哈希）。
+	//
+	// 可选新增字段，不提升 format_version：旧二进制忽略它，新二进制读到
+	// 旧 meta.json 得到空串，按"该分片未记录校验和"处理。
+	Checksum string `json:"checksum,omitempty"`
 }
 
 // 数据布局常量。

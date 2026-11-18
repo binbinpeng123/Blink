@@ -506,8 +506,6 @@ func TestUnsupportedSubresourcesDoNotHitDataPath(t *testing.T) {
 		method string
 		target string
 	}{
-		{http.MethodGet, "/bkt/obj.txt?attributes"},
-		{http.MethodPut, "/bkt/obj.txt?attributes"},
 		{http.MethodGet, "/bkt/obj.txt?policyStatus"},
 		{http.MethodPost, "/bkt/obj.txt?select&select-type=2"},
 		{http.MethodGet, "/bkt/obj.txt?versionId=v1"},
@@ -529,5 +527,17 @@ func TestUnsupportedSubresourcesDoNotHitDataPath(t *testing.T) {
 				t.Errorf("Code = %q，期望 NotImplemented", code)
 			}
 		})
+	}
+
+	// ?attributes 已实现，不再是"不支持的子资源"，但同样不能被漏进数据面：
+	// GET 的正确行为是属性文档（缺请求头 → 400），PUT 必须是 405。
+	// 漏进下载路径会返回 200，漏进上传路径会覆盖对象。
+	rec = do(t, h, http.MethodGet, "/bkt/obj.txt?attributes")
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("GET ?attributes 缺请求头 = %d，期望 400（响应体：%s）", rec.Code, rec.Body.String())
+	}
+	rec = do(t, h, http.MethodPut, "/bkt/obj.txt?attributes")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("PUT ?attributes = %d，期望 405（响应体：%s）", rec.Code, rec.Body.String())
 	}
 }
