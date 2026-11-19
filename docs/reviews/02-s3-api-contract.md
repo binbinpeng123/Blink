@@ -209,6 +209,18 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 带 `uploadId` 的 `GET` 仍走 `ListParts`；`uploadId` + `partNumber` 继续 `501`。
 - **复制后的对象不保留分片边界**：`CopyObject` 与 `UploadPartCopy` 的目标边界由本次上传决定，源对象边界不继承。
 
+#### 响应头覆盖 `response-*`
+
+预签名 URL 最常用的能力：在不复制对象的前提下，让同一次下载按调用方要求返回不同的响应头（典型场景是浏览器直链下载时临时指定 `Content-Disposition: attachment; filename=...`）。
+
+- 支持的查询参数与覆盖目标：`response-cache-control` → `Cache-Control`、`response-content-disposition` → `Content-Disposition`、`response-content-encoding` → `Content-Encoding`、`response-content-language` → `Content-Language`、`response-content-type` → `Content-Type`、`response-expires` → `Expires`。
+- 仅 `GET` 生效（含 `partNumber` 分片下载）。`HEAD` 携带这些参数时**忽略**：HEAD 没有响应体，覆盖实体头没有意义，S3 也只对 GET 定义该行为。
+- `200`/`206` 覆盖全部六个头；`304` 只覆盖 `Cache-Control` 与 `Expires`——RFC 9110 要求 304 回传会影响缓存判定的头，而 `Content-Type` 等实体头不属于 304。
+- 参数存在但值为空时视为**未提供**，保留对象自身元数据：返回空 `Content-Type` 会让部分客户端按未知类型处理甚至触发内容嗅探，与"显式清空"的收益不成比例。
+- 值含控制字符（CR、LF、NUL 及其它 `< 0x20`、除 HTAB 外）→ `400 InvalidArgument`。不静默清洗成空格：客户端会以为覆盖按原值生效。
+- 覆盖只改变本次响应头，不修改持久化元数据，也不影响 `ETag`、`Range`、`Content-Length`、checksum 语义。
+- 本服务没有匿名读，所有请求都在鉴权之后；参数位于 SigV4 canonical query 中，未签名篡改会导致 `401`，因此不需要额外的"仅签名请求可用"检查。
+
 ### DeleteObject `DELETE /{bucket}/{key}`
 
 - **幂等**：对象不存在也返回 `204 No Content`（S3 语义，客户端依赖）。
