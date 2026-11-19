@@ -55,6 +55,14 @@ func (s *Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, buck
 func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) {
 	logger := loggerFrom(r.Context(), s.logger)
 
+	// response-* 在打开对象之前校验：参数写错了就是 400，不该因为对象
+	// 恰好不存在而变成 404。HEAD 返回 nil，后续覆盖全部跳过。
+	overrides, overrideErr := parseResponseOverrides(r)
+	if overrideErr != nil {
+		overrideErr.Write(w, r, reqID)
+		return
+	}
+
 	reader, err := s.store.OpenObject(bucket, key)
 	if err != nil {
 		s.writeStoreErr(w, r, reqID, err)
@@ -75,10 +83,18 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 		h.Set("Last-Modified", httpTime(info.Modified))
 		// RFC 7232 要求 304 回传会影响缓存判定的头：客户端据此刷新
 		// 缓存条目的新鲜度，而不是只更新"上次校验时间"。
-		if info.HTTPMeta.CacheControl != "" {
+		//
+		// response-* 只覆盖这两个：304 没有实体，Content-Type 等实体头
+		// 不属于它；而 Cache-Control/Expires 若被覆盖，就必须与 200
+		// 时保持一致，否则客户端会缓存成一个不存在的策略。
+		if v, ok := overrides["Cache-Control"]; ok {
+			h.Set("Cache-Control", v)
+		} else if info.HTTPMeta.CacheControl != "" {
 			h.Set("Cache-Control", info.HTTPMeta.CacheControl)
 		}
-		if info.HTTPMeta.Expires != "" {
+		if v, ok := overrides["Expires"]; ok {
+			h.Set("Expires", v)
+		} else if info.HTTPMeta.Expires != "" {
 			h.Set("Expires", info.HTTPMeta.Expires)
 		}
 		w.WriteHeader(http.StatusNotModified)
@@ -91,6 +107,9 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 
 	h := w.Header()
 	setObjectHeaders(h, info)
+	// 覆盖必须在 setObjectHeaders 之后：先写对象自身元数据，再让
+	// 本次请求的 response-* 覆盖它。顺序反了会让覆盖被元数据盖回去。
+	applyResponseOverrides(h, overrides)
 
 	// partNumber 把响应的"单位"从对象换成单个分片：Range 在分片内解析，
 	// 但 Content-Range 仍用对象绝对偏移，客户端才能按分片拼回完整对象。
