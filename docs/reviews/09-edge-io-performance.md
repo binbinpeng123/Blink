@@ -206,6 +206,39 @@ CPU profile 显示 `crypto/md5.block` 占 54–60%。**该尺寸在此硬件上�
 按 03 文档纪律（无前后对照的优化一律回滚），代码已完整移除：`localBlockWriter`、
 `blockWriteParallel`、`Store.blockBufs` 与相关 `sync` import 均不在最终 diff 中。
 
+### 逐块内核预读提示（实测无收益，默认关闭，切片 27）
+
+**假设**：顺序 Range 下载时，客户端会在一段时间内连续请求相邻区间；每次
+`copyBlockSegment` 打开块文件后先 `fadvise(WILLNEED)` 把接下来要读的字节拉进
+页缓存，应能把"每块一次 I/O 等待"叠成一串。
+
+**实现**：`internal/store/readahead_{linux,darwin,other}.go`，经 `syscall.Conn`
+取 fd，`SYS_FADVISE64(GOARCH != arm)` / `fcntl(F_RDADVISE)`；拿不到 fd 或平台
+不支持时静默跳过。开关 `--readahead` / `BLINK_READAHEAD`。
+
+**实测**（`VirtualApple @ 2.50GHz` 上的 Linux 容器，`drop_caches` 逐次造冷缓存，
+完整对照程序与数据见 03 文档「预读实测结论」）：
+
+| 场景 | 不提示 | `WILLNEED(64 KiB)` | `WILLNEED(到块尾)` |
+| --- | --- | --- | --- |
+| 单次 64 KiB 冷读（32 次取中位） | 11.65 µs | 10.77 µs | 12.67 µs |
+| 清缓存后顺序下载 64 MiB（1024 × 64 KiB，3 轮取中位） | **5.21 ms** | 5.47 ms | 7.54 ms |
+
+本机页缓存热态下 `BenchmarkGetRangeSequential` 的 A/B 同样无差异，而且开启后
+每次读取的分配数还从 8 升到 11（`syscall.Conn` 断言与 `Control` 闭包的开销）：
+
+```text
+BenchmarkGetRangeSequential-10                 59.1–68.3 µs   1176 B/op    8 allocs/op
+BenchmarkGetRangeSequentialWithReadahead-10    58.8–82.3 µs   1216 B/op   11 allocs/op
+```
+
+热态下这段多出来的开销被页缓存命中掩盖，冷态下则叠在更贵的 I/O 上——两头都不划算。
+
+**结论**：顺序下载是唯一能体现预读价值的负载，而它恰好变慢——内核 readahead
+启发式已在做同一件事，重复投递只是增加队列竞争。因此**默认关闭**，代码保留为
+可选实验项（`readahead_test.go` 只验证"纯提示、失败静默、不改变读路径语义"，
+不声称任何性能收益）。门槛不变：没有任何性能指标因为这项改动而上调或下调。
+
 ## 未达标项与客观原因
 
 以下门槛**未达到**，且不通过调参掩饰。原因经实测定位，不是"再优化一下"就能解决。
@@ -274,6 +307,11 @@ LIST 的读放大随内联对象占比上升。1000 对象微基准为 +14%～18
   对写放大与介质寿命的实际收益。
 - 集群模式不产生内联对象这一结论的端到端验证（当前由代码路径保证，未在
   多节点环境实测）。
+- 内核预读提示在**真实慢盘**（eMMC、SD 卡、机械盘、网络块设备）上的收益：
+  本机只有在 overlayfs 上模拟的冷缓存，且结果为默认关闭。若将来在具体硬件上
+  重新验证，必须给出同机、同负载、逐次冷缓存的 A/B 数据，才能考虑改变默认值。
+- 32 位 ARM（`GOARCH=arm`）上预读为空实现（`SYS_ARM_FADVISE64_64` 参数寄存器
+  排布不同，不做猜测），因此该架构上无论开关如何都不产生系统调用。
 
 ## 验证命令
 
@@ -293,3 +331,7 @@ go test ./internal/store/ -run '^$' -bench 'Benchmark(Put|Get|List)Small' -bench
 ```
 
 LIST 基准会预置 10 万对象（约 176 MB 写入），单独运行并计入本机写入总量。
+
+`-bench 'BenchmarkGetRangeSequential'` 是前缀匹配，会同时跑默认（预读关闭）与
+`BenchmarkGetRangeSequentialWithReadahead` 两个基准。后者只用来把"默认关闭"
+这个实测结论钉在回归基线里，**不能**用它证明预读有收益。

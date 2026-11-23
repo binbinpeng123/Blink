@@ -326,6 +326,74 @@ func TestIfRangeFallsBackToFullObject(t *testing.T) {
 	}
 }
 
+// TestIfRangeDateForm 固定日期形式：对象修改时间不晚于 If-Range 日期
+// 才允许分段；日期早于对象修改时间时回退完整响应。
+func TestIfRangeDateForm(t *testing.T) {
+	h := objectTestServer(t)
+	put := putObject(t, h, "/bkt/ifrange-date", "hello world", nil)
+	lastModified := put.Header().Get("Last-Modified")
+	lm, err := http.ParseTime(lastModified)
+	if err != nil {
+		t.Fatalf("解析 Last-Modified 失败: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		date     string
+		wantCode int
+		wantBody string
+	}{
+		// 与修改时间相同：不晚于 → 成立。
+		{"相同时间", lm.UTC().Format(http.TimeFormat), http.StatusPartialContent, "hello"},
+		// 晚于修改时间：成立。
+		{"更晚时间", lm.Add(time.Hour).UTC().Format(http.TimeFormat), http.StatusPartialContent, "hello"},
+		// 早于修改时间：对象可能已变化 → 回退完整响应。
+		{"更早时间", lm.Add(-time.Hour).UTC().Format(http.TimeFormat), http.StatusOK, "hello world"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := objectRequest(t, h, http.MethodGet, "/bkt/ifrange-date", func(r *http.Request) {
+				r.Header.Set("Range", "bytes=0-4")
+				r.Header.Set("If-Range", c.date)
+			})
+			if rec.Code != c.wantCode {
+				t.Fatalf("状态码 = %d，期望 %d", rec.Code, c.wantCode)
+			}
+			if got := rec.Body.String(); got != c.wantBody {
+				t.Errorf("响应体 = %q，期望 %q", got, c.wantBody)
+			}
+		})
+	}
+}
+
+// TestIfRangeWeakETagNeverMatches 弱标签一律不成立：If-Range 要求
+// 强校验，弱标签无法证明字节未变。
+func TestIfRangeWeakETagNeverMatches(t *testing.T) {
+	h := objectTestServer(t)
+	put := putObject(t, h, "/bkt/ifrange-weak", "hello world", nil)
+	etag := put.Header().Get("ETag")
+
+	rec := objectRequest(t, h, http.MethodGet, "/bkt/ifrange-weak", func(r *http.Request) {
+		r.Header.Set("Range", "bytes=0-4")
+		r.Header.Set("If-Range", "W/"+etag)
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200", rec.Code)
+	}
+	if got := rec.Body.String(); got != "hello world" {
+		t.Errorf("响应体 = %q，期望完整内容", got)
+	}
+
+	// 无法解析的日期同样按不成立处理（与日期形式共享"解析失败"分支）。
+	rec = objectRequest(t, h, http.MethodGet, "/bkt/ifrange-weak", func(r *http.Request) {
+		r.Header.Set("Range", "bytes=0-4")
+		r.Header.Set("If-Range", "not-an-etag-or-date")
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("非法 If-Range 状态码 = %d，期望 200", rec.Code)
+	}
+}
+
 func TestChecksumMode(t *testing.T) {
 	h := objectTestServer(t)
 	const body = "checksum me"

@@ -201,6 +201,19 @@ func (f *faultFile) Truncate(size int64) error {
 	return tr.Truncate(size)
 }
 
+// SyscallConn 让包装层对"预读提示"透明。
+//
+// setReadahead 通过 syscall.Conn 取 fd。不转发的话，faultFS 上的读路径
+// 会静默走"拿不到 fd"分支，测试覆盖的就只是空实现，而不是真实的
+// fadvise 调用路径。
+func (f *faultFile) SyscallConn() (syscall.RawConn, error) {
+	sc, ok := f.ReadWriteCloser.(syscall.Conn)
+	if !ok {
+		return nil, errors.New("faultFS: 底层文件不支持原始 fd")
+	}
+	return sc.SyscallConn()
+}
+
 func (f *faultFile) Seek(offset int64, whence int) (int64, error) {
 	seeker, ok := f.ReadWriteCloser.(io.Seeker)
 	if !ok {

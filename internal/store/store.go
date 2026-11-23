@@ -52,6 +52,13 @@ type Options struct {
 	// 关闭时吞吐最高（见 03 文档"校验读 vs 零拷贝读"）。
 	// 打开后只读路径多一次 CRC 计算，换"绝不把损坏数据发给客户端"。
 	VerifyOnRead bool
+	// Readahead 在读取 CAS 块前给内核一个预读提示（创新 C' 的尝试）。
+	//
+	// 这是纯提示：不支持的平台或包装层拿不到 fd 时静默跳过，读路径
+	// 语义完全不变。零值关闭，服务端也默认关闭 —— 冷缓存实测里它没有
+	// 收益、顺序下载反而更慢（docs/reviews/09），保留只为了能在慢盘上
+	// 重新验证。
+	Readahead bool
 	// HighWatermark 是拒绝写入的已用率上限；<=0 表示禁用容量保护。
 	HighWatermark float64
 	// LowWatermark 是恢复接受的已用率下限，必须小于 HighWatermark。
@@ -82,6 +89,8 @@ type Store struct {
 	inlineObjectMax int64
 	// verifyOnRead 见 Options.VerifyOnRead。只读，不需要同步。
 	verifyOnRead bool
+	// readahead 见 Options.Readahead；只读，不需要同步。
+	readahead bool
 	// disk 是容量水位状态；为 nil 表示未启用容量保护。
 	disk *diskState
 	// nodeID 是这块盘的稳定标识，写进每个对象的 meta.json。
@@ -249,6 +258,7 @@ func Open(opt Options) (*Store, error) {
 		inlineObjectMax: inlineObjectMax,
 		bucketTTL:       bucketTTL,
 		verifyOnRead:    opt.VerifyOnRead,
+		readahead:       opt.Readahead,
 		buckets:         make(map[string]*bucketMeta),
 		cors:            make(map[string]*CORSConfiguration),
 		metaCache:       newObjectMetaCache(defaultMetaCacheBytes, defaultMetaCacheEntries),

@@ -172,6 +172,24 @@ func (s *Store) copyBlockSegment(w io.Writer, b BlockDesc, start, stop int64) er
 
 	rel := start - b.Offset
 	n := stop - start
+
+	// 顺序预读提示：在真正读取之前告诉内核本区间马上要用。
+	//
+	// 默认关闭，而且**不要指望它带来收益**：冷缓存实测显示内核的
+	// readahead 启发式已经在为顺序块读预取，用户态再投递 WILLNEED
+	// 只会增加一次系统调用与队列竞争，顺序下载场景反而更慢。保留
+	// 这段代码与开关，只是为了在慢盘/机械盘上能重新验证，而不是
+	// 因为它现在有效。数据见 docs/reviews/09。
+	// 纯提示：不支持的平台、包装层拿不到 fd 时静默跳过。
+	if s.readahead {
+		if s.verifyOnRead {
+			// 校验读要整块读入，预读范围就是整块。
+			setReadahead(f, 0, b.Length)
+		} else {
+			setReadahead(f, rel, n)
+		}
+	}
+
 	if s.verifyOnRead {
 		// 校验读：整块读入并核对 CRC32C 后才写出任何字节。
 		// 这一步刻意放在所有写操作之前 —— 先写后校验等于把损坏数据

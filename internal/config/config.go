@@ -117,6 +117,12 @@ const (
 	EnvFsyncPolicy     = "BLINK_FSYNC_POLICY"
 	EnvClusterMode     = "BLINK_CLUSTER_MODE"
 	EnvVerifyRead      = "BLINK_VERIFY_READ"
+	// EnvReadahead 控制块读取前的内核预读提示；默认为 false。
+	//
+	// 实测（docs/reviews/09）显示内核自身的顺序预取已经覆盖了这个场景，
+	// 用户态再投递 WILLNEED 反而在顺序下载时更慢，因此默认关闭，只作为
+	// 特定磁盘上的可选实验项保留。
+	EnvReadahead = "BLINK_READAHEAD"
 	// EnvIntegrityInterval 是后台全量完整性巡检周期；<=0 禁用。
 	//
 	// 与 EnvScrubInterval（集群反熵，按环扫描分片）是两件事：
@@ -206,6 +212,13 @@ type Config struct {
 	// 默认关闭以保留 sendfile 零拷贝读路径；打开后每块先校验再写出，
 	// 代价是数据要经过用户态。见 03 文档"校验读 vs 零拷贝读"。
 	VerifyOnRead bool
+	// Readahead 开启块读取前的内核预读提示（创新 C 的尝试之一）。
+	//
+	// 默认关闭。冷缓存实测（docs/reviews/09）里，内核的顺序预取已经覆盖
+	// 了逐块顺序读，用户态再 fadvise(WILLNEED) 只多一次系统调用；顺序
+	// 下载整个对象时反而更慢（预取与真实读争抢 I/O 队列）。它仍是纯提示、
+	// 失败静默，保留开关是为了在慢盘/机械盘等特定环境下能重新验证。
+	Readahead bool
 	// IntegrityInterval 是后台全量完整性巡检周期；<=0 表示禁用。
 	//
 	// 与 ScrubInterval（集群反熵）相互独立：后者在集群环上检查分片
@@ -450,16 +463,18 @@ func Default() Config {
 		BlockSize:           DefaultBlockSize,
 		InlineThreshold:     DefaultInlineThreshold,
 		InlineObjectMaxSize: DefaultInlineObjectMaxSize,
-		HighWatermark:       DefaultHighWatermark,
-		LowWatermark:        DefaultLowWatermark,
-		MaxBucketCount:      DefaultMaxBucketCount,
-		ClusterMode:         DefaultClusterMode,
-		InternalAddr:        DefaultInternalAddr,
-		ReplicaCount:        DefaultReplicaCount,
-		WriteQuorum:         DefaultWriteQuorum,
-		ReadQuorum:          DefaultReadQuorum,
-		VNodes:              DefaultVNodes,
-		PeerTimeout:         DefaultPeerTimeout,
+		// 预读默认关闭：实测内核顺序预取已覆盖该场景，见 docs/reviews/09。
+		Readahead:      false,
+		HighWatermark:  DefaultHighWatermark,
+		LowWatermark:   DefaultLowWatermark,
+		MaxBucketCount: DefaultMaxBucketCount,
+		ClusterMode:    DefaultClusterMode,
+		InternalAddr:   DefaultInternalAddr,
+		ReplicaCount:   DefaultReplicaCount,
+		WriteQuorum:    DefaultWriteQuorum,
+		ReadQuorum:     DefaultReadQuorum,
+		VNodes:         DefaultVNodes,
+		PeerTimeout:    DefaultPeerTimeout,
 
 		RepairInterval:       DefaultRepairInterval,
 		ScrubInterval:        DefaultScrubInterval,
@@ -535,6 +550,7 @@ func Load(args []string, out io.Writer) (Config, error) {
 	fs.Float64Var(&cfg.LowWatermark, "disk-low-watermark", cfg.LowWatermark, "恢复写入的磁盘水位")
 	fs.IntVar(&cfg.MaxBucketCount, "max-buckets", cfg.MaxBucketCount, "桶数量软上限")
 	fs.BoolVar(&cfg.VerifyOnRead, "verify-read", cfg.VerifyOnRead, "读取时逐块校验 CRC32C（环境变量 "+EnvVerifyRead+"；关闭时走 sendfile 零拷贝）")
+	fs.BoolVar(&cfg.Readahead, "readahead", cfg.Readahead, "块读取前的内核预读提示（环境变量 "+EnvReadahead+"；纯提示，失败静默）")
 	fs.StringVar(&cfg.TLSCert, "tls-cert", cfg.TLSCert, "TLS 证书链 PEM 路径（环境变量 "+EnvTLSCert+"；与 --tls-key 成对提供）")
 	fs.StringVar(&cfg.TLSKey, "tls-key", cfg.TLSKey, "TLS 私钥 PEM 路径（环境变量 "+EnvTLSKey+"；与 --tls-cert 成对提供）")
 
@@ -618,6 +634,14 @@ func applyEnv(cfg *Config) {
 			cfg.addEnvErr(fmt.Errorf("%s 取值 %q 不是合法的布尔值", EnvVerifyRead, v))
 		} else {
 			cfg.VerifyOnRead = b
+		}
+	}
+	if v := os.Getenv(EnvReadahead); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			cfg.addEnvErr(fmt.Errorf("%s 取值 %q 不是合法的布尔值", EnvReadahead, v))
+		} else {
+			cfg.Readahead = b
 		}
 	}
 	if v := os.Getenv(EnvReadDegraded); v != "" {
@@ -1034,6 +1058,7 @@ func (c Config) Redacted() map[string]string {
 		"inline_threshold":       strconv.FormatInt(c.InlineThreshold, 10),
 		"inline_object_max_size": strconv.FormatInt(c.InlineObjectMaxSize, 10),
 		"verify_read":            strconv.FormatBool(c.VerifyOnRead),
+		"readahead":              strconv.FormatBool(c.Readahead),
 		"bucket_ttl":             formatBucketTTL(c.BucketTTL),
 		"ttl_sweep_interval_sec": strconv.FormatInt(int64(c.TTLSweepInterval.Seconds()), 10),
 		"high_watermark":         strconv.FormatFloat(c.HighWatermark, 'f', 2, 64),
@@ -1095,7 +1120,7 @@ func (c Config) String() string {
 	m := c.Redacted()
 	keys := []string{
 		"addr", "data_dir", "region", "access_key", "secret_key",
-		"log_level", "fsync_policy", "cluster_mode", "node_id", "verify_read", "tls_enabled",
+		"log_level", "fsync_policy", "cluster_mode", "node_id", "verify_read", "readahead", "tls_enabled",
 	}
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
