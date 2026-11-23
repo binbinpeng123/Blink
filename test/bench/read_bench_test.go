@@ -27,6 +27,22 @@ const rangeSize = 64 << 10
 // 读取写入 io.Discard —— 这里量的是存储读路径，网络发送由部署环境决定。
 func BenchmarkGetRangeSequential(b *testing.B) {
 	s := openBenchStore(b)
+	benchmarkGetRangeSequential(b, s)
+}
+
+// BenchmarkGetRangeSequentialWithReadahead 是同一负载在显式开启预读时的对照。
+//
+// 它存在的意义是**锁住"默认关闭"这个实测结论**（docs/reviews/09）：两个
+// 基准共用同一实现，只有预读开关不同，否则"差别"里会混进代码差异。
+// 在页缓存热态的本机上两者本就没有可测差异，所以这组数字不足以支持
+// 任何性能声明；真正的冷缓存对照需要逐次清页缓存，脚本与数据在 09 文档。
+func BenchmarkGetRangeSequentialWithReadahead(b *testing.B) {
+	s := openBenchStoreReadahead(b, true)
+	benchmarkGetRangeSequential(b, s)
+}
+
+func benchmarkGetRangeSequential(b *testing.B, s *store.Store) {
+	b.Helper()
 	body := benchBody(benchObjectSize)
 	if _, err := s.PutObject("bench", "model.bin", bytes.NewReader(body), store.PutOptions{
 		ExpectedSize: int64(len(body)),
@@ -70,8 +86,21 @@ func openBenchStore(b *testing.B) *store.Store {
 // 拉到分钟级，量到的却全是写入成本。
 func openBenchStoreRoot(b *testing.B) (*store.Store, string) {
 	b.Helper()
+	return openBenchStoreRootOpts(b, store.Options{})
+}
+
+// openBenchStoreReadahead 打开一个显式指定预读开关的基准存储。
+func openBenchStoreReadahead(b *testing.B, readahead bool) *store.Store {
+	b.Helper()
+	s, _ := openBenchStoreRootOpts(b, store.Options{Readahead: readahead})
+	return s
+}
+
+func openBenchStoreRootOpts(b *testing.B, opt store.Options) (*store.Store, string) {
+	b.Helper()
 	root := b.TempDir()
-	s, err := store.Open(store.Options{Root: root})
+	opt.Root = root
+	s, err := store.Open(opt)
 	if err != nil {
 		b.Fatalf("打开存储失败: %v", err)
 	}

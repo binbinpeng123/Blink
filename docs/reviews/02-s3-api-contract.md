@@ -192,6 +192,8 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 响应头：`Content-Length`、`Content-Type`（默认 `application/octet-stream`）、`ETag`、`Last-Modified`、`Accept-Ranges: bytes`、`x-amz-meta-*`、`x-amz-storage-class`，以及对象上已持久化的标准 HTTP 元数据（`Cache-Control`、`Content-Disposition`、`Content-Encoding`、`Content-Language`、`Expires`，见「对象属性语义」）。
 - **Range**：支持 `bytes=start-end`、`bytes=start-`、`bytes=-suffix`；越界 → `416` 且带 `Content-Range: bytes */<size>`；多区间 → `501`。
 - **条件请求**：`If-Match` 不匹配 → `412`；`If-None-Match` 匹配 → `304`（带 ETag、无体）；`If-Modified-Since` 未修改 → `304`；`If-Unmodified-Since` 已修改 → `412`。`304` 额外回传 `Cache-Control` 与 `Expires`（RFC 7232 要求影响缓存判定的头保持一致）。
+- **If-Range**（配合 `Range` 的续传校验）：值为 ETag 时按**强匹配**比较对象 ETag——弱标签（`W/"..."`）一律不匹配，因为 RFC 9110 §13.1.5 规定 If-Range 只接受强校验；值为 HTTP 日期时，仅当对象未被修改（`Last-Modified <= 该日期`）才匹配。匹配 → 正常 `206`；不匹配或值无法解析 → **忽略 `Range`，返回 `200` 整个对象**（服务端不能对可能已变化的实体做区间覆盖）。
+  - 求值的永远是**对象本身**的 ETag/修改时间，与 `If-Match` 等常规条件头彼此独立：If-Range 只在"已经决定要发 206"这一步起作用，`If-None-Match`/`If-Modified-Since` 的 304/412 仍按 RFC 9110 §13.2.2 的优先级先行判定。
 - `ChecksumMode: ENABLED` → 必须回传 checksum 头，并同时回传 `x-amz-checksum-type`。
 - **部分响应（206）不回传任何 checksum 头**：存储的是整个对象的校验和，附在一段字节上会让按规范校验的客户端判定为不匹配。实测 `aws s3 cp` 下载 12 MiB 对象发出两个 Range 请求（`0-8388607`、`8388608-12582911`），依赖的正是这一条。
 - 空对象必须显式 `Content-Length: 0`，不发送 `Transfer-Encoding: chunked`。
@@ -203,6 +205,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 分片存在 → `206`，`Content-Range: bytes <start>-<end>/<对象总大小>`（绝对偏移），并带 `x-amz-mp-parts-count: <分片数>`。
 - `Range` 相对**分片**解析，`Content-Range` 仍用对象绝对偏移；分片内越界 → `416 InvalidRange`，`Content-Range: bytes */<分片大小>`。
 - 分片号不在对象的 `parts` 中 → `416 InvalidPartNumber`；`partNumber` 非整数或不在 1–10000 → `400 InvalidArgument`（与 `UploadPart` 同一套编号校验）。
+- **`If-Range` 与 `partNumber` 同时出现**：If-Range 不成立时回退的是**整个分片**（`200` + 该分片的完整字节），不是整个对象。客户端按分片号续传时，它要的就是这一分片；把整个对象发回去会让 `x-amz-mp-parts-count` 与 `Content-Range` 的语义全部失配。
 - 非分片对象：`partNumber=1` 返回 `200` 完整对象（不伪造 `Content-Range`）；`partNumber>1` → `416 InvalidPartNumber`。
 - 空分片（长度为 0）→ `200` + `Content-Length: 0`，不构造非法 `Content-Range`。
 - `206` 分片响应不回传对象级校验和；普通 `GET`/`HEAD` 不带 `x-amz-mp-parts-count`。

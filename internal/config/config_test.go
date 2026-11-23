@@ -59,6 +59,8 @@ func TestLoadDefaults(t *testing.T) {
 		{"MaxBucketCount", cfg.MaxBucketCount, 1000},
 		// 校验读默认关闭：保留 sendfile 零拷贝路径。
 		{"VerifyOnRead", cfg.VerifyOnRead, false},
+		// 预读默认关闭：实测内核顺序预取已覆盖逐块顺序读（docs/reviews/09）。
+		{"Readahead", cfg.Readahead, false},
 		// TTL 默认不启用任何桶，但清扫周期有默认值：运维一旦配置
 		// bucket-ttl，不需要再记一个必须同时打开的开关。
 		{"TTLSweepInterval", cfg.TTLSweepInterval, DefaultTTLSweepInterval},
@@ -302,6 +304,73 @@ func TestVerifyReadSources(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), EnvVerifyRead) {
 			t.Errorf("错误信息 %q 未指明 %s", err.Error(), EnvVerifyRead)
+		}
+	})
+}
+
+// TestReadaheadSources 预读默认关闭；环境变量与命令行都能开启，
+// 且非法布尔值必须拒绝启动而不是静默降级。
+//
+// 默认值两侧都要锁住：实测在先（docs/reviews/09），谁想把默认改回 true
+// 都得先拿出新的对照数据。
+func TestReadaheadSources(t *testing.T) {
+	t.Run("默认关闭", func(t *testing.T) {
+		clearEnv(t)
+		// 凭据是启动的硬性前提（见 TestCredentialsRequired），这里
+		// 只关心预读默认值，因此仍需提供一组。
+		t.Setenv(EnvAccessKey, testAK)
+		t.Setenv(EnvSecretKey, testSK)
+		cfg, err := Load(nil, io.Discard)
+		if err != nil {
+			t.Fatalf("Load 失败: %v", err)
+		}
+		if cfg.Readahead {
+			t.Error("预读默认应关闭：实测内核顺序预取已覆盖该场景")
+		}
+	})
+
+	t.Run("环境变量开启", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvAccessKey, testAK)
+		t.Setenv(EnvSecretKey, testSK)
+		t.Setenv(EnvReadahead, "true")
+
+		cfg, err := Load(nil, io.Discard)
+		if err != nil {
+			t.Fatalf("Load 失败: %v", err)
+		}
+		if !cfg.Readahead {
+			t.Error("BLINK_READAHEAD=true 应开启预读")
+		}
+	})
+
+	t.Run("命令行覆盖环境变量", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvAccessKey, testAK)
+		t.Setenv(EnvSecretKey, testSK)
+		t.Setenv(EnvReadahead, "true")
+
+		cfg, err := Load([]string{"--readahead=false"}, io.Discard)
+		if err != nil {
+			t.Fatalf("Load 失败: %v", err)
+		}
+		if cfg.Readahead {
+			t.Error("--readahead=false 应覆盖 BLINK_READAHEAD=true")
+		}
+	})
+
+	t.Run("非法布尔值拒绝启动", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv(EnvAccessKey, testAK)
+		t.Setenv(EnvSecretKey, testSK)
+		t.Setenv(EnvReadahead, "on")
+
+		_, err := Load(nil, io.Discard)
+		if err == nil {
+			t.Fatal("BLINK_READAHEAD=on 应拒绝启动")
+		}
+		if !strings.Contains(err.Error(), EnvReadahead) {
+			t.Errorf("错误信息 %q 未指明 %s", err.Error(), EnvReadahead)
 		}
 	})
 }

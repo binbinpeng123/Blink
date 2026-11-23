@@ -147,6 +147,7 @@ func run(args []string, stderr io.Writer) error {
 		InlineThreshold:     cfg.InlineThreshold,
 		InlineObjectMaxSize: cfg.InlineObjectMaxSize,
 		VerifyOnRead:        cfg.VerifyOnRead,
+		Readahead:           cfg.Readahead,
 		HighWatermark:       cfg.HighWatermark,
 		LowWatermark:        cfg.LowWatermark,
 		BucketTTL:           cfg.BucketTTL,
@@ -167,6 +168,9 @@ func run(args []string, stderr io.Writer) error {
 		slog.Int64("inline_object_max_size", cfg.InlineObjectMaxSize),
 		// 校验读会影响读吞吐，属于"事后必须能从日志复原"的部署参数。
 		slog.Bool("verify_read", cfg.VerifyOnRead),
+		// 预读默认关闭（实测无收益，见 09 文档）；日志要能看出它是不是
+		// 被显式打开过，否则"换机器后为什么不一样"无从复现。
+		slog.Bool("readahead", cfg.Readahead),
 		// TTL 桶决定"数据为什么会自己消失"，必须能从启动日志复原；
 		// 具体的桶与时长在 config 的脱敏输出里，这里只给数量。
 		slog.Int("ttl_buckets", len(cfg.BucketTTL)),
