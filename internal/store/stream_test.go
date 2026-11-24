@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"runtime"
 	"testing"
@@ -107,6 +108,83 @@ func TestStreamBlocksParallelHashes(t *testing.T) {
 	if want := hex.EncodeToString(sum[:]); got.ETag != want {
 		t.Fatalf("ETag = %s，期望 %s", got.ETag, want)
 	}
+}
+
+// TestStreamBlocksMD5Pipeline 断言"MD5 与块回调重叠"路径的块表、
+// 逐块哈希与 ETag 仍与对原始内容独立重算的结果一致。
+//
+// 这条路径让 MD5 goroutine 与回调同时读同一块缓冲，且缓冲在回调返回
+// 之前不会复用。等待时机写错、或提前读下一块，症状是内容拼接错位、
+// 块哈希漂移或 ETag 偶发不一致，因此这里逐块重算全部字段并比对
+// 回调看到的完整内容。
+func TestStreamBlocksMD5Pipeline(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("GOMAXPROCS=1 时不会走 MD5 流水线")
+	}
+	const blockSize = int64(md5PipelineMinBlock)
+	s := newSmallBlockStore(t, blockSize, 64<<10)
+
+	// 3 个满块 + 1 个不满块，块长正好落在流水线阈值上。
+	body := patternBytes(int(blockSize*3+777), 29)
+	var streamed []byte
+	got, err := s.StreamBlocksSized(bytes.NewReader(body), "", "md5-pipeline", int64(len(body)), func(b Block) error {
+		streamed = append(streamed, b.Data...)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamBlocksSized 失败: %v", err)
+	}
+	if !bytes.Equal(streamed, body) {
+		t.Fatal("回调看到的字节流与输入不一致（缓冲被提前复用？）")
+	}
+	if len(got.Blocks) != 4 {
+		t.Fatalf("块数 = %d，期望 4", len(got.Blocks))
+	}
+	for i, b := range got.Blocks {
+		seg := body[b.Offset : b.Offset+b.Length]
+		if want := hex.EncodeToString(mustSHA256(seg)); b.Hash != want {
+			t.Fatalf("第 %d 块 Hash = %s，期望 %s", i, b.Hash, want)
+		}
+		if want := checksum.BlockCRC32C(seg); b.CRC32C != want {
+			t.Fatalf("第 %d 块 CRC32C = %#x，期望 %#x", i, b.CRC32C, want)
+		}
+	}
+	sum := md5.Sum(body)
+	if want := hex.EncodeToString(sum[:]); got.ETag != want {
+		t.Fatalf("ETag = %s，期望 %s", got.ETag, want)
+	}
+}
+
+// TestStreamBlocksMD5PipelineCallbackError 断言回调报错时流水线能
+// 立即返回错误，不会因为等待后台 MD5 而死锁。
+func TestStreamBlocksMD5PipelineCallbackError(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 2 {
+		t.Skip("GOMAXPROCS=1 时不会走 MD5 流水线")
+	}
+	const blockSize = int64(md5PipelineMinBlock)
+	s := newSmallBlockStore(t, blockSize, 64<<10)
+
+	sentinel := errors.New("回调故意失败")
+	calls := 0
+	_, err := s.StreamBlocks(bytes.NewReader(patternBytes(int(blockSize*2+1), 5)), "", "md5-pipeline-err", func(Block) error {
+		calls++
+		if calls == 2 {
+			return sentinel
+		}
+		return nil
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v，期望 %v", err, sentinel)
+	}
+	if calls != 2 {
+		t.Fatalf("回调次数 = %d，期望 2（报错后必须立即停止）", calls)
+	}
+}
+
+// mustSHA256 返回内容 SHA-256 的原始字节，仅供测试断言使用。
+func mustSHA256(b []byte) []byte {
+	sum := sha256.Sum256(b)
+	return sum[:]
 }
 
 // TestStreamBlocksSizedIgnoresWrongHint 断言提示值与实际长度不符时

@@ -34,7 +34,9 @@ func sizeName(n int64) string {
 //
 // 每次迭代使用**不同的 key**：内容寻址会去重相同内容，重复写同一个 key
 // 从第二次起只改 meta，量到的就不再是写入成本。key 不同但内容相同仍会
-// 命中 CAS 去重，因此每个对象的内容前缀写入一个序号，确保真正落盘。
+// 命中 CAS 去重，因此每次在内容前缀写入一个序号。注意序号只让第一块唯一：
+// 16 MiB 的后三块仍会去重，需要每块都真正落盘时用
+// BenchmarkPutObjectUniqueBlocks16MiB。
 //
 // 内容模板在计时开始前生成一次，迭代内只做 memcpy + 改前缀：旧写法
 // 每轮用字节循环重新生成 16 MiB，生成成本会盖过 PUT 本身（CPU profile
@@ -64,6 +66,38 @@ func BenchmarkPutObjectSizes(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// BenchmarkPutObjectUniqueBlocks16MiB 测量"每个 4 MiB 块都真正落盘"的 16 MiB PUT。
+//
+// BenchmarkPutObjectSizes 每轮只改内容前缀：16 MiB 里只有第一块唯一，后三块命中
+// CAS 去重，量到的写盘成本只有真实上传的四分之一。真实的大对象内容几乎不会复用
+// 已有块，因此另设本基准——每个块前缀都写序号，四块全部走 write/fsync/rename。
+//
+// 它也是"MD5 与块落盘重叠"（切片 30）的回归基准：串行实现里 MD5 与写盘互斥，
+// 重叠实现能把 MD5 藏进持久化等待里。用 BenchmarkPutObjectSizes 评估该改动
+// 会得出"无差异"的错误结论。
+func BenchmarkPutObjectUniqueBlocks16MiB(b *testing.B) {
+	const (
+		size      = 16 << 20
+		blockSize = 4 << 20
+	)
+	s := openBenchStore(b)
+	body := make([]byte, size)
+	b.SetBytes(size)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for off := 0; off < size; off += blockSize {
+			binary.LittleEndian.PutUint64(body[off:], uint64(i)*7919+uint64(off))
+		}
+		key := fmt.Sprintf("put-unique/16MiB/%d", i)
+		if _, err := s.PutObject("bench", key, bytes.NewReader(body), store.PutOptions{
+			ExpectedSize: size,
+		}); err != nil {
+			b.Fatalf("PutObject(16 MiB, 每块唯一) 失败: %v", err)
+		}
 	}
 }
 
