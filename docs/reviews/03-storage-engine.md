@@ -118,7 +118,12 @@
 
 ## 读路径
 
-- 大对象 GET 使用 `sendfile` 零拷贝：定位偏移、声明 `Content-Length`、直接搬运数据，避免用户态缓冲区拷贝。
+- 大对象 GET 走 `sendfile` 零拷贝：定位偏移、声明 `Content-Length`、直接搬运数据，避免用户态缓冲区拷贝。
+  前提是 HTTP 中间件的 writer 包装层**透传 `io.ReaderFrom`**——否则 `io.Copy` 只会看到
+  "只有 `Write` 的 writer"，零拷贝分支永远不可达。切片 28 修复了 `statusRecorder`
+  这一处（`internal/s3api/middleware.go`），16 MiB 端到端吞吐 569–612 → 1237–1327 MB/s
+  （Apple M4/APFS 本机回环，详见 [09 文档](./09-edge-io-performance.md)）。
+  `sendfile` 仅在 Linux / FreeBSD / Solaris / macOS 可达；其它平台自动退化为用户态拷贝。
 - Range 请求在块边界内直接定位，不读取无关块。
 - 对象元数据带**有界 LRU 缓存**（默认 4 MiB / 1024 条，单条 ≤128 KiB）；写、覆盖写、删除与副本元数据变更时同步更新或失效。缓存只服务 `OpenObject` 等点查路径，LIST 仍直接扫盘，不着色结果。命中后 1 KiB GET 从 113–159 µs 降到 55–58 µs（详见 [09 文档](./09-edge-io-performance.md)）。
 
@@ -238,7 +243,7 @@
 | --- | --- | --- | --- |
 | **A. 内容寻址块 + 每块 CRC32C，跨桶/跨 key 天然去重** | ✅ 纳入 | 低（布局自带） | `BenchmarkDedupSecondCopy/1GiB` 断言写入字节数不增长 |
 | **B. 分片上传完成时仅串接块表，不重写数据** | ✅ 纳入 | 中 | `BenchmarkCompleteMultipart20GB` 断言耗时与写入量不随对象增长 |
-| **C. `sendfile` 零拷贝读路径** | ✅ 纳入 | 低 | `BenchmarkGetRangeSequential` 前后对照（8 allocs/op 的基线） |
+| **C. `sendfile` 零拷贝读路径** | ✅ 纳入（切片 28 修复中间件阻挡，端到端可达） | 低 | `BenchmarkHTTPGetObject`（真实 TCP）与 `BenchmarkGetRangeSequential` 前后对照 |
 | **C'. 逐块内核预读提示（`fadvise(WILLNEED)` / `F_RDADVISE`）** | ⚠️ 已实现但默认关闭 | 低 | 冷缓存 A/B 实测无收益、顺序下载场景更慢（见下方「预读实测结论」） |
 | **D0. 小对象内容内联进 `meta.json`** | ✅ 纳入（默认 ≤4 KiB，`0` 关闭） | 中 | `BenchmarkGetSmallInline`、`BenchmarkListSmallInline`、`BenchmarkPutSmallInline` 前后对照 |
 | **D. 小对象打包为只读 segment（needle 思路）** | ⏸ 本版本不实施（基线已测，见下方评估） | 高 | `BenchmarkPutSmallObject10k`、`BenchmarkList100kObjects` 前后对照 |
@@ -426,7 +431,7 @@ LIST 一侧沿用已实现的 `BenchmarkList100kObjects`。
 | `store.Backend` 接口 | `internal/store/backend.go` | `*store.Store` 直接实现，**零额外调用跳转** | `*cluster.Cluster` 实现，内部持有本地 `*store.Store` 作为"副本引擎" |
 | `node_id` | `blink-meta.json` | 首次启动生成并持久化 | 由 `BLINK_NODE_ID` 提供，参与 LWW 决胜 |
 | 放置 | `internal/cluster/ring.go` | 不参与 | 128 vnode 一致性哈希，`Replicas(key, N)` |
-| 块读取 | 块读取路径 | 只读本地 CAS | 本地命中走 `sendfile`，未命中经内部接口流式拉取 |
+| 块读取 | 块读取路径 | 只读本地 CAS | 本地命中走 `sendfile`（需 writer 透传 `io.ReaderFrom`，见切片 28），未命中经内部接口流式拉取 |
 | 元数据版本 | `meta.json` | `obj_version` 单调递增 | HLC `(physical_ms, counter)` + `node_id` 决胜 |
 | 配置段 | `internal/config` | `BLINK_CLUSTER_MODE=single`（默认） | `cluster`，启动时强校验 peers/secret/quorum |
 

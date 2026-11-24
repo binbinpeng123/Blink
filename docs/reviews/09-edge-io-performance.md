@@ -191,6 +191,72 @@ SHA-256 与 CRC32C 放进一个 goroutine，与主 goroutine 的整对象 MD5 �
 CRC32C 藏进 MD5 的墙钟；进一步提升需要"MD5 与落盘重叠"或硬件加速 MD5，需另设
 基准。
 
+### HTTP 端到端读路径：中间件挡住了零拷贝（已落地，切片 28）
+
+**问题**：`copyBlockSegment` 一直用 `io.Copy(w, f)` 写响应，看起来"零拷贝已经
+启用"。但 `io.Copy` 的判定顺序是**先看 src 是否实现 `io.WriterTo`，再看 dst
+是否实现 `io.ReaderFrom`**。`*os.File` 实现了 `WriteTo`，于是 `io.Copy` 先问它：
+
+- darwin 上 `os.File.writeTo` 是空实现（`os/zero_copy_stub.go`，
+  `//go:build !freebsd && !linux && !solaris`，返回 `handled=false`）；
+- Linux 上它要求 writer 满足 `syscall.Conn` 且 `PollFD().Network()` 是 tcp/unix
+  流，普通 `http.ResponseWriter` 不满足。
+
+两条路最后都退回 `genericWriteTo` → `io.Copy(w, fileWithoutWriteTo{f})`，此时
+能否零拷贝取决于 **dst**。真正可达 sendfile 的是 `net/http` 的
+`*response.ReadFrom`：它先窥探 `SniffLen` 字节补齐响应头，再把剩余数据交给底层
+`*net.TCPConn.ReadFrom` → `internal/poll.SendFile` → `sendfile(2)`。
+
+而中间件里的 `statusRecorder`（`internal/s3api/middleware.go`）当时只透传了
+`http.Flusher`，没有透传 `io.ReaderFrom`。`withRequestContext` 与 `withAudit`
+各套一层，`io.Copy` 看到的始终是"只会 `Write` 的 writer"，零拷贝分支在生产
+路径上**永远不可达**——这条链路在 profile 里也不显形，因为开销表现成普通的
+`syscall.read`/`syscall.write`。
+
+**做法**：给 `statusRecorder` 增加 `ReadFrom`，转发给底层 `ResponseWriter`；
+底层不支持时退化为 `io.Copy(writerOnly{底层}, src)`——`writerOnly` 遮住本类型的
+`ReadFrom`，避免 `io.Copy` 再次选中它形成递归。字节数只在 `ReadFrom` 里累加
+一次，**不能**再靠 `Write` 累加，否则审计日志与 `blink_http_response_bytes_total`
+会翻倍（`TestGetObjectCountsResponseBytesOnce` 锁住这一点）。
+`TestGetObjectStreamsThroughReaderFrom` 用真实 TCP 断言响应确实经过 `ReadFrom`，
+该测试在修复前稳定失败。
+
+**实测**（`BenchmarkHTTPGetObject`，16 MiB 对象，真实 `s3api` 中间件链 +
+`httptest.NewServer` 真实 TCP 回环，Apple M4 / APFS，`-benchtime=60x`）。
+
+先在同一会话内做 A/B：基线是从 `795a11a` 检出的独立 worktree（仅拷入同一份
+基准文件，生产代码零改动），两条边各跑 5 次 `-count=5`。
+
+| | 样本（ns/op） | 吞吐 | 内存 |
+| --- | --- | --- | --- |
+| 修复前（5 次） | 27.4–29.5 ms，中位 28.7 ms | 569–612 MB/s | ≈147 KB/op，174 allocs/op |
+| 修复后（5 次） | 12.6–13.6 ms，中位 12.9 ms | 1237–1327 MB/s | ≈18.8 KB/op，193 allocs/op |
+
+另在开发分支上单独追加 10 次（`-count=10`），修复后落在 12.5–16.5 ms、
+1017–1346 MB/s；修复前的 8 次历史样本为 26.2–45.1 ms、372–641 MB/s。两批
+数据方向与量级一致，取同会话 A/B 的 5 次作为本文正式数字。
+
+吞吐约 2.2×，每操作字节分配降到约 1/8。alloc 次数从 174 升到 193：多出的是
+`response.ReadFrom` 引入的嗅探缓冲（来自 `sync.Pool`）与包装链上新增的一层
+`ReadFrom` 调用，可接受。
+
+**为什么此前所有基准都没发现**：`test/bench` 里的 GET 基准把响应写进
+`io.Discard`，而 `io.Discard` 自己实现了 `ReaderFrom`，量到的是存储读路径，
+看不到 HTTP 层包装。只有经过真实 `ResponseWriter` 与真实 socket 才能观察到，
+因此新增 `BenchmarkHTTPGetObject`。
+
+**平台边界（不得省略）**：`os.File.writeTo` 在 darwin 上本就是空实现
+（`os/zero_copy_stub.go` 的 build tag 是 `!freebsd && !linux && !solaris`），
+所以**修复前 darwin 上是彻底的用户态拷贝**；修复后 darwin 走
+`*net.TCPConn.ReadFrom` → `spliceFrom` 为空实现后退回 `sendFile` →
+`internal/poll.SendFile` → `sendfile(2)`（`net/sendfile.go` 与
+`internal/poll/sendfile_unix.go` 的 build tag 均含 `darwin && !ios`），
+上表正是这条路径。Linux 上 `os.File.writeTo` 对裸 `*net.TCPConn` 可用，但生产
+路径上的 writer 是包装类型，同样只能靠本次的 `ReaderFrom` 透传来接上 sendfile。
+**Linux / FreeBSD / Solaris 上的数字未实测**，上表只作为本机 loopback 回归
+基线，不构成对外性能承诺。iOS 构建（`darwin && ios`）无 sendfile，退化为用户态
+拷贝——这不是本切片引入的限制，是 Go 运行时在该平台的既有行为。
+
 ## 回滚项
 
 ### 大对象并行块写入（实测无收益，已完整回滚）
@@ -295,6 +361,9 @@ LIST 的读放大随内联对象占比上升。1000 对象微基准为 +14%～18
   副本元数据校验任一测试失败。
 - 内联导致 1000 对象 LIST 相对关闭时回退超过 25%（以
   `BenchmarkListSmallCAS`/`BenchmarkListSmallInline` 同机对照为准）。
+- HTTP 响应字节被重复计数（`TestGetObjectCountsResponseBytesOnce` 失败），或
+  `TestGetObjectStreamsThroughReaderFrom` 失败——后者说明中间件链又把零拷贝
+  快路径挡住了。两处都必须回滚到"不透传 ReaderFrom"，而不是放宽断言。
 
 ## 未验证项（不得写成已通过）
 
@@ -312,6 +381,9 @@ LIST 的读放大随内联对象占比上升。1000 对象微基准为 +14%～18
   重新验证，必须给出同机、同负载、逐次冷缓存的 A/B 数据，才能考虑改变默认值。
 - 32 位 ARM（`GOARCH=arm`）上预读为空实现（`SYS_ARM_FADVISE64_64` 参数寄存器
   排布不同，不做猜测），因此该架构上无论开关如何都不产生系统调用。
+- HTTP 端到端读路径（切片 28）的 Linux / FreeBSD / Solaris 数字：本机为
+  darwin/arm64，只能确认 darwin 上 `*net.TCPConn.ReadFrom` → `sendfile(2)` 可达
+  且有 2.2× 吞吐差；其它平台按 Go 源码 build tag 推断可达，**未实测**。
 
 ## 验证命令
 
@@ -322,6 +394,8 @@ go test ./... -count=1
 
 go test ./test/bench/ -run '^$' -bench 'BenchmarkPutObjectSizes' -benchtime=200ms -count=2
 go test ./test/bench/ -run '^$' -bench 'BenchmarkGetObjectSizes' -benchtime=200ms -count=2
+go test ./test/bench/ -run '^$' -bench 'BenchmarkHTTPGetObject' -benchtime=60x -count=5
+go test ./internal/s3api/ -run 'TestStatusRecorderReadFrom|TestGetObjectStreamsThroughReaderFrom|TestGetObjectCountsResponseBytesOnce' -count=1
 go test ./test/bench/ -run '^$' -bench 'BenchmarkGetRangeSequential' -benchtime=200ms -count=2
 go test ./test/bench/ -run '^$' -bench 'BenchmarkConcurrentPut1MiB' -benchtime=200ms -count=2
 go test ./test/bench/ -run '^$' -bench 'BenchmarkList100kObjects' -benchtime=1x -count=1

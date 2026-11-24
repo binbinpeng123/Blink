@@ -2,6 +2,7 @@ package s3api
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -33,7 +34,8 @@ func loggerFrom(ctx context.Context, fallback *slog.Logger) *slog.Logger {
 
 // statusRecorder 包装 ResponseWriter 以记录实际写出的状态码与字节数。
 //
-// 同时透传 http.Flusher，使大对象下载的流式写出不被中间件挡住。
+// 同时透传 http.Flusher 与 io.ReaderFrom，使大对象下载的流式写出与
+// 零拷贝路径不被中间件挡住。
 type statusRecorder struct {
 	http.ResponseWriter
 	status  int
@@ -63,6 +65,42 @@ func (s *statusRecorder) Flush() {
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// writerOnly 隐藏 WriteTo/ReadFrom，避免 io.Copy 在包装层之间递归。
+//
+// 它存在的理由是 ReadFrom 的实现：把 src 交给底层 ResponseWriter 的
+// ReadFrom 之前，必须保证底层不会反过来调用本类型的 ReadFrom。
+type writerOnly struct{ io.Writer }
+
+// ReadFrom 透传底层 ResponseWriter 的 ReadFrom，同时累计字节数。
+//
+// 这一层不是可选的性能调优：io.Copy 的选择顺序是"先看 src 是否
+// 实现 WriterTo，再看 dst 是否实现 ReaderFrom"。`os.File` 有
+// WriteTo，但它内部只对 *net.TCPConn 之类带网络信息的 writer 走
+// sendfile；面对包装类型会退回用户态拷贝。真正能触发零拷贝的是
+// net/http 的 *response.ReadFrom：它先窥探 SniffLen 字节补齐响应头，
+// 再把剩余数据交给底层 *TCPConn.ReadFrom → sendfile(2)。
+//
+// 若不透传，本类型只有 Write，net/http 的零拷贝分支永远不可达，
+// 大对象下载全部退化为一趟用户态 read/write —— 16 MiB 端到端实测
+// 吞吐约差 2.2 倍（docs/reviews/09）。
+func (s *statusRecorder) ReadFrom(src io.Reader) (int64, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	rf, ok := s.ResponseWriter.(io.ReaderFrom)
+	if !ok {
+		// 底层不支持 ReadFrom：退回普通拷贝。目标必须是底层 writer 而不是
+		// 本类型，否则 io.Copy 会再次选中本方法形成无穷递归；而记数由这里
+		// 统一完成，不能靠 s.Write 累加，否则会与下面的 += n 重复计数。
+		n, err := io.Copy(writerOnly{s.ResponseWriter}, src)
+		s.written += n
+		return n, err
+	}
+	n, err := rf.ReadFrom(src)
+	s.written += n
+	return n, err
 }
 
 // status 返回记录到的状态码，未写出时为 200。

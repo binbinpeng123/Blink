@@ -2,7 +2,7 @@
 
 本文件记录 Blink 在开发过程中**刻意接受或无法验证**的限制。目的是避免把未验证的能力描述成已交付功能。每条限制都注明来源（设计决策或环境约束）与当前状态。
 
-最后更新：2026-11-10
+最后更新：2026-11-24
 
 ## 环境约束导致的未验证项
 
@@ -31,6 +31,7 @@
 | **4 KiB 以下对象默认内联进 `meta.json`** | 边端大量小对象的 GET 受 CAS 打开/`Stat` 主导；内联后读取只剩切片写出，PUT 也少一次块文件提交 | `meta.json` 按 base64 膨胀 4/3，LIST 读放大随内联对象占比上升。1000 对象微基准 LIST +14%～18%，10 万对象与 eMMC/SD 写放大收益均未实测。`--inline-object-max-size`（或 `BLINK_INLINE_OBJECT_MAX_SIZE`）设为 `0` 可关闭；不得设为大于 `inline-threshold` |
 | **内联对象的读取依赖 `layout` 字段** | 内容不在 CAS，旧版本按块表去 CAS 找 SHA-256 | 同内容曾以普通块写入并去重命中时，旧版本读到正确字节；否则返回 `ErrCorrupt`，**不会静默返回空对象**。`TestInlineOldVersionCompatibility` 覆盖两种结果。集群读路径同样按块哈希取数，遇到内联 meta 一并返回 `ErrCorrupt`；集群写路径不产生内联对象，把单机数据目录直接接入集群不在支持范围内 |
 | **写入时校验、读取时默认不校验** | 零拷贝读与校验读原理冲突，优先保障模型加载吞吐 | 静默损坏由后台巡检或显式开启校验读发现。**可用状态**：`--verify-read` / `BLINK_VERIFY_READ` 已实现并接入启动参数（默认关闭，打开后逐块 CRC32C 校验，代价是失去 sendfile 零拷贝）；后台巡检已由 `--integrity-interval` / `BLINK_INTEGRITY_INTERVAL` 定时调度（默认 24h，`<=0` 禁用，**首轮延迟一个周期**，不在启动时执行），结果通过 `blink_scrub_last_*` 指标与 `scrub_*` 日志暴露，**仍无 HTTP 管理入口**。巡检为单流顺序读，一轮耗时与数据量成正比；EC 对象只校验本地存在分片，缺失分片不算损坏 |
+| **零拷贝读依赖平台与 writer 包装** | `sendfile` 只在 Linux / FreeBSD / Solaris / macOS 可用；且 `io.Copy` 只有在目标 writer 透传 `io.ReaderFrom` 时才会走到它 | 切片 28 已让 `statusRecorder` 透传 `io.ReaderFrom`，darwin 本机 16 MiB 端到端 GET 实测 569–612 → 1237–1327 MB/s（回归基线，非对外承诺）。iOS 及其它平台自动退化为用户态拷贝，**不得宣称这些平台零拷贝生效**；Linux 上的数字未实测。若将来给 `ResponseWriter` 再加一层不透传 `ReaderFrom` 的包装，会静默退回慢路径——`TestGetObjectStreamsThroughReaderFrom` 用于锁住该契约 |
 | **删除对象后空间不立即释放** | 内容寻址去重共享块 + GC 宽限期（默认 1 小时）+ 周期回收（默认 1 小时） | 删除后最坏约两个周期才释放；用户可能误以为删除未生效，需结合 `blink_disk_reclaimable_bytes` 与 `/readyz.reclaimable_bytes` 解释。该数值含宽限期内与在途写入的块 |
 | **重复内容不重复占用磁盘** | 内容寻址的天然结果 | 空间释放语义不是"一对象一份空间"，与部分用户直觉不符 |
 | **不支持 ACL、Tagging、Lifecycle、Versioning、Replication、Object Lock** | 首个版本范围外，显式返回 `501` | 依赖这些特性的客户端或脚本会失败（但错误明确） |
