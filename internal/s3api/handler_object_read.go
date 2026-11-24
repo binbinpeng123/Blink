@@ -126,7 +126,7 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 		h.Set("x-amz-mp-parts-count", strconv.Itoa(len(info.Parts)))
 	}
 
-	start, length, partial, rangeErr := objectRange(r, info, span)
+	start, length, partial, ifRangeFailed, rangeErr := objectRange(r, info, span)
 	if rangeErr != nil {
 		if rangeErr.Code == s3err.CodeInvalidRange {
 			// 02 文档要求 416 带 Content-Range: bytes */<size>，
@@ -145,18 +145,26 @@ func (s *Server) serveObject(w http.ResponseWriter, r *http.Request, bucket, key
 	// 返回的也只是对象的一部分，用 200 会让"部分内容"伪装成完整响应。
 	// 空分片是唯一的例外：构造 bytes x-y/0 是非法的 Content-Range，
 	// 只能回 200 + Content-Length: 0（正常客户端不会产生这种分片）。
+	//
+	// If-Range 不成立是另一个例外：服务端必须忽略 Range、返回完整实体。
+	// 对分片请求，"完整实体"是整个分片，此时 200 才与"没有 Content-Range
+	// 的完整响应"自洽；继续回 206 会要求一个覆盖整个分片的 Content-Range，
+	// 语义上等于客户端请求了整段，和它实际发出的范围不符。
 	status := http.StatusOK
-	if (part != nil && part.Size > 0) || (part == nil && partial) {
+	switch {
+	case part != nil && part.Size > 0 && !ifRangeFailed:
+		status = http.StatusPartialContent
+	case part == nil && partial:
 		status = http.StatusPartialContent
 	}
 
 	// 只有客户端明确要求时才回传校验和：头部不是免费的，
 	// 常规下载不需要它，且 ChecksumMode 是客户端表达"我要核对"的方式。
 	//
-	// 部分响应（206）**不**回传校验和：存储的是整个对象的校验和，
-	// 附在一段字节上会让按规范校验的客户端（如 aws-cli 的 Range 下载）
-	// 判定"校验和不匹配"而报错。校验和只对完整对象有意义。
-	if status == http.StatusOK && checksumModeEnabled(r) && info.ChecksumAlgorithm != "" {
+	// 只对**完整对象**回传：存储的是整个对象的校验和，附在一段字节上
+	// （206，或 partNumber 指定的分片）会让按规范校验的客户端判定为
+	// "校验和不匹配"而报错。
+	if part == nil && status == http.StatusOK && checksumModeEnabled(r) && info.ChecksumAlgorithm != "" {
 		h.Set(info.ChecksumAlgorithm.Header(), info.Checksum)
 		// checksum-type 必须一起回传：FULL_OBJECT 与 COMPOSITE 的校验值
 		// 形状完全不同（后者带 `-N` 后缀），客户端不知道类型就无法复算。
@@ -305,20 +313,22 @@ func objectPart(r *http.Request, info store.ObjectInfo) (*store.ObjectPart, *s3e
 // If-Range 仍按对象 ETag/修改时间求值（分片不改变条件语义），不成立时
 // 回退为整个 span（分片请求回退整个分片，而不是整个对象）。
 //
-// 返回 partial=false 表示发送整个 span（无 Range，或 If-Range 不成立）。
-func objectRange(r *http.Request, info store.ObjectInfo, span int64) (start, length int64, partial bool, e *s3err.Error) {
+// 返回 partial=false 表示发送整个 span（无 Range）；ifRangeFailed 表示
+// 带了 Range 但 If-Range 校验不成立 —— 二者都会退回完整 span，但分片请求
+// 需要区分它们才能决定回 206（分片正常响应）还是 200（忽略 Range）。
+func objectRange(r *http.Request, info store.ObjectInfo, span int64) (start, length int64, partial, ifRangeFailed bool, e *s3err.Error) {
 	spec := strings.TrimSpace(r.Header.Get("Range"))
 	if spec == "" {
-		return 0, span, false, nil
+		return 0, span, false, false, nil
 	}
 	if !ifRangeApplies(r.Header.Get("If-Range"), info) {
-		return 0, span, false, nil
+		return 0, span, false, true, nil
 	}
 	start, length, e = parseRange(spec, span)
 	if e != nil {
-		return 0, 0, false, e
+		return 0, 0, false, false, e
 	}
-	return start, length, true, nil
+	return start, length, true, false, nil
 }
 
 // ifRangeApplies 判断 If-Range 是否仍然成立。

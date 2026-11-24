@@ -246,6 +246,39 @@ func TestMultipartHTTPFlow(t *testing.T) {
 	}
 }
 
+// TestListPartsMaxPartsZero 验证 max-parts=0 不会把"还有分片"谎报成"没有更多"。
+//
+// 0 是文档允许的非负值；此时必须返回空页 + IsTruncated=true，
+// 而不是让客户端以为会话里只有 0 片。
+func TestListPartsMaxPartsZero(t *testing.T) {
+	h := mpuTestServer(t)
+	uploadID := createUploadHTTP(t, h, "zero-parts.bin", nil)
+
+	rec := mpuRequest(t, h, http.MethodPut, "/bkt/zero-parts.bin?partNumber=1&uploadId="+uploadID,
+		bytes.NewReader(mpuPayload(1024, 0x33)), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("UploadPart = %d：%s", rec.Code, rec.Body.String())
+	}
+
+	rec = mpuRequest(t, h, http.MethodGet, "/bkt/zero-parts.bin?uploadId="+uploadID+"&max-parts=0", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ListParts(max-parts=0) = %d：%s", rec.Code, rec.Body.String())
+	}
+	var lp listPartsResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &lp); err != nil {
+		t.Fatalf("解析 ListParts 响应失败: %v（%s）", err, rec.Body.String())
+	}
+	if len(lp.Parts) != 0 {
+		t.Errorf("max-parts=0 返回了 %d 个分片", len(lp.Parts))
+	}
+	if !lp.IsTruncated {
+		t.Error("max-parts=0 且仍有分片时 IsTruncated 必须为 true")
+	}
+	if lp.MaxParts != 0 {
+		t.Errorf("MaxParts = %d，期望回显 0", lp.MaxParts)
+	}
+}
+
 // TestMultipartRoutingAndErrors 覆盖子资源分派的三条非法组合与常见错误。
 func TestMultipartRoutingAndErrors(t *testing.T) {
 	h := mpuTestServer(t)
@@ -615,19 +648,23 @@ func TestGetObjectPartNumberAfterComplete(t *testing.T) {
 		t.Errorf("错误码 = %q，期望 InvalidRange", got)
 	}
 
-	// If-Range 不成立时回退为整个分片（而不是整个对象）。
+	// If-Range 不成立时忽略 Range，回退为整个分片：200 + 分片完整字节，
+	// 不构造覆盖整个分片的 Content-Range（那等于声称客户端请求了整段）。
 	rec = mpuRequest(t, h, http.MethodGet, "/bkt/"+key+"?partNumber=2", nil, func(r *http.Request) {
 		r.Header.Set("Range", "bytes=0-9")
 		r.Header.Set("If-Range", `"deadbeef"`)
 	})
-	if rec.Code != http.StatusPartialContent {
-		t.Fatalf("If-Range 不成立状态码 = %d，期望 206", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("If-Range 不成立状态码 = %d，期望 200", rec.Code)
 	}
 	if !bytes.Equal(rec.Body.Bytes(), p2) {
 		t.Error("If-Range 不成立时应回退整个分片")
 	}
-	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes %d-%d/%d", size1, total-1, total); got != want {
-		t.Errorf("Content-Range = %q，期望 %q", got, want)
+	if got := rec.Header().Get("Content-Range"); got != "" {
+		t.Errorf("200 回退不应带 Content-Range，实际 %q", got)
+	}
+	if got, want := rec.Header().Get("Content-Length"), fmt.Sprintf("%d", len(p2)); got != want {
+		t.Errorf("Content-Length = %q，期望 %q", got, want)
 	}
 
 	// 普通 GET 不回传分片总数：分片元数据只在被请求时出现。

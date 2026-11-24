@@ -335,17 +335,45 @@ func validateBucketName(name string) error {
 	if strings.Contains(name, "..") {
 		return ErrInvalidBucketName
 	}
+	// xn-- 是 IDNA 的 punycode 前缀：AWS 保留它给国际化域名，
+	// 普通 bucket 不得使用，否则可能与域名混淆。
+	if strings.HasPrefix(name, "xn--") {
+		return ErrInvalidBucketName
+	}
 	// 形如 192.168.1.1 的名字是合法 DNS 但 AWS 禁止，
-	// 因为它会让 bucket 名与主机名歧义。简单近似：全部为数字与点即拒绝。
-	if isAllDigitsAndDots(name) {
+	// 因为它会让 bucket 名与主机名歧义。只拒绝真正的点分四段 IPv4：
+	// "123"、"1.2.3" 这类纯数字名 AWS 是接受的。
+	if isIPv4(name) {
 		return ErrInvalidBucketName
 	}
 	return nil
 }
 
-func isAllDigitsAndDots(s string) bool {
-	for _, r := range s {
-		if (r < '0' || r > '9') && r != '.' {
+// isIPv4 判断 s 是否是点分四段的 IPv4 字面量。
+//
+// 与 net.ParseIP 的宽松度一致：每段 0–255、不允许前导零（"01" 不是合法段，
+// net.ParseIP 同样拒绝）。不用 net.ParseIP 是为了避免它对 IPv6 的接受度
+// 与 bucket 名规则混淆。
+func isIPv4(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) == 0 || len(p) > 3 {
+			return false
+		}
+		if len(p) > 1 && p[0] == '0' {
+			return false
+		}
+		n := 0
+		for i := 0; i < len(p); i++ {
+			if p[i] < '0' || p[i] > '9' {
+				return false
+			}
+			n = n*10 + int(p[i]-'0')
+		}
+		if n > 255 {
 			return false
 		}
 	}

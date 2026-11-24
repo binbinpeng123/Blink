@@ -80,7 +80,9 @@ func toS3Error(err error) *s3err.Error {
 	case errors.Is(err, store.ErrEntityTooSmall):
 		return s3err.New(s3err.CodeEntityTooSmall).WithMessage(err.Error())
 	case errors.Is(err, store.ErrInvalidPartNumber):
-		// 02 文档的错误码表里没有专门的编号错误码，归到 InvalidArgument。
+		// 分片编号本身非法（不在 1–10000）：02 文档规定 400 InvalidArgument。
+		// 与"对象里不存在该分片号"的 416 InvalidPartNumber 是两回事，
+		// 后者由读路径直接构造，不经过这里。
 		return s3err.New(s3err.CodeInvalidArgument).WithMessage(err.Error())
 	case errors.Is(err, store.ErrNoSuchCORSConfiguration):
 		// 桶存在但没配跨域：与"桶不存在"是两个可区分的状况。

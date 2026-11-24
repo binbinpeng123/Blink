@@ -79,7 +79,8 @@
 | 非 `GET /{bucket}?location` | `405 MethodNotAllowed` |
 | `PUT`/`GET`/`DELETE /{bucket}/{key}?cors`（对象级 CORS，S3 无此语义） | `501 NotImplemented` |
 | Range 请求含多个区间（逗号分隔） | `501 NotImplemented` |
-| 任意未知查询参数组合 | `501 NotImplemented` |
+| 未实现的子资源（上表显式列出的 `?acl`、`?tagging`、`?versioning` 等） | `501 NotImplemented` |
+| 上述之外的未知查询参数（如 `?x-id=GetObject`、`?foo=bar`） | 按 S3 惯例**忽略**，不影响响应 |
 
 ## 统一错误体
 
@@ -103,7 +104,7 @@
 | `NoSuchBucket` | 404 | 目标桶不存在 |
 | `NoSuchKey` | 404 | 目标对象不存在 |
 | `BucketAlreadyOwnedByYou` | 409 | 重复创建同名桶（AWS 语义；`aws s3 mb` 视为成功） |
-| `BucketAlreadyExists` | 409 | 桶名被占用 |
+| `BucketAlreadyExists` | 409 | 桶名被他人占用。**单租户单节点不可达**（没有"他人"），仅作为错误码定义保留，为将来多租户/集群预留 |
 | `BucketNotEmpty` | 409 | 删除非空桶 |
 | `InvalidBucketName` | 400 | 桶名违反命名约束 |
 | `InvalidArgument` | 400 | 参数非法 |
@@ -161,8 +162,8 @@
 
 ### PutObject `PUT /{bucket}/{key}`
 
-- 必需 `Content-Length`，缺失 → `411 Length Required`；key 为空 → `400 InvalidArgument`。
-- 响应含 `ETag`、`Last-Modified`；若客户端通过 `x-amz-sdk-checksum-algorithm` 或 `x-amz-checksum-*` 声明算法，**必须回传对应 checksum**，且**必须同时回传 `x-amz-checksum-type`**。只回校验值不回类型，客户端无法区分 `FULL_OBJECT`（整段直算）与 `COMPOSITE`（对分片校验值再算、带 `-N` 后缀），也就无法复算。
+- 必需 `Content-Length`，缺失 → `411 Length Required`。空 key 不会进入本操作：路由层把 `PUT /{bucket}/` 解释为 CreateBucket（与 S3 一致），因此"key 为空"的 PutObject 请求在 HTTP 上不存在。
+- 响应含 `ETag`、`Last-Modified`；若客户端通过 `x-amz-sdk-checksum-algorithm` 或 `x-amz-checksum-*` 声明算法，**必须回传对应 checksum**。只要回传了 checksum，**必须同时回传 `x-amz-checksum-type`**：单次 PUT 的类型恒为 `FULL_OBJECT`（整段直算），MPU 的 `COMPOSITE` 语义见后文校验和一节。只回校验值不回类型，客户端无法区分两者，也就无法复算。
 - 客户端未声明算法时**不**回传 checksum 头（不能替客户端决定要校验什么）。
 - 条件写（在存储层 key 锁内判定，检查与提交之间不插入其他写者）：
   - `If-None-Match: *` 且对象已存在 → `412 PreconditionFailed`。
@@ -202,7 +203,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 #### 分片下载 `GET`/`HEAD /{bucket}/{key}?partNumber=N`
 
 - 仅对分片上传产生的对象有意义：完成时把分片边界写入 `meta.json` 的 `parts`（`{number,size}`，偏移由累计和推导），不提升 `format_version`。
-- 分片存在 → `206`，`Content-Range: bytes <start>-<end>/<对象总大小>`（绝对偏移），并带 `x-amz-mp-parts-count: <分片数>`。
+- 分片存在且未触发 If-Range 回退 → `206`，`Content-Range: bytes <start>-<end>/<对象总大小>`（绝对偏移），并带 `x-amz-mp-parts-count: <分片数>`。
 - `Range` 相对**分片**解析，`Content-Range` 仍用对象绝对偏移；分片内越界 → `416 InvalidRange`，`Content-Range: bytes */<分片大小>`。
 - 分片号不在对象的 `parts` 中 → `416 InvalidPartNumber`；`partNumber` 非整数或不在 1–10000 → `400 InvalidArgument`（与 `UploadPart` 同一套编号校验）。
 - **`If-Range` 与 `partNumber` 同时出现**：If-Range 不成立时回退的是**整个分片**（`200` + 该分片的完整字节），不是整个对象。客户端按分片号续传时，它要的就是这一分片；把整个对象发回去会让 `x-amz-mp-parts-count` 与 `Content-Range` 的语义全部失配。
@@ -222,7 +223,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 参数存在但值为空时视为**未提供**，保留对象自身元数据：返回空 `Content-Type` 会让部分客户端按未知类型处理甚至触发内容嗅探，与"显式清空"的收益不成比例。
 - 值含控制字符（CR、LF、NUL 及其它 `< 0x20`、除 HTAB 外）→ `400 InvalidArgument`。不静默清洗成空格：客户端会以为覆盖按原值生效。
 - 覆盖只改变本次响应头，不修改持久化元数据，也不影响 `ETag`、`Range`、`Content-Length`、checksum 语义。
-- 本服务没有匿名读，所有请求都在鉴权之后；参数位于 SigV4 canonical query 中，未签名篡改会导致 `401`，因此不需要额外的"仅签名请求可用"检查。
+- 本服务没有匿名读，所有请求都在鉴权之后；参数位于 SigV4 canonical query 中，未签名篡改会导致 `403 SignatureDoesNotMatch`（与其它签名失败一致；S3 对此类请求不回 401），因此不需要额外的"仅签名请求可用"检查。
 
 ### DeleteObject `DELETE /{bucket}/{key}`
 
@@ -259,7 +260,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 自复制：源与目标相同且 `COPY` → `400 InvalidRequest`；`REPLACE` 允许，用于原地更新元数据。
 - 大小上限：源对象 > 5 GiB → `400 InvalidRequest`。
 - `x-amz-storage-class` 只接受 `STANDARD`（缺省同义），其余 → `501 NotImplemented`。
-- `x-amz-copy-source-range`、加密/标签相关头部 → `501 NotImplemented`。
+- `x-amz-copy-source-range`、加密/标签相关头部 → `501 NotImplemented`。加密头覆盖 SSE-S3（`x-amz-server-side-encryption`）、SSE-KMS（`-aws-kms-key-id`、`-context`）与 SSE-C（`-customer-algorithm`、`-customer-key`、`-customer-key-md5`）全部形态；标签头覆盖 `x-amz-tagging` 与 `x-amz-tagging-directive`。`UploadPartCopy` 用同一份列表。
 - 响应：`200` + `<CopyObjectResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyObjectResult>`。
 - 单机模式是 **O(1) 元数据复制**（目标 meta 直接引用源块表，CAS 文件数不变）；集群模式为流式复制（源经 quorum 读、目标经 quorum 写），**不宣称零拷贝**。
 - 客户端注意：aws-cli 的 `s3 cp s3://… s3://…` 在对象超过 `s3.multipart_threshold`（默认 8 MiB）时改用 `UploadPartCopy`，本版本已支持。但 aws-cli 2.36.2 的默认 `--copy-props default` 会在复制前调用 `GetObjectTagging`（本版本 `501`），因此**大对象服务端复制需显式加 `--copy-props none`**；这与 UploadPartCopy 能力无关。
@@ -276,8 +277,8 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 
 ### 校验和（checksum）
 
-- 支持算法：`CRC32`、`CRC32C`、`CRC64NVME`、`SHA1`、`SHA256`；请求头 `x-amz-checksum-<alg>` 或 `x-amz-sdk-checksum-algorithm` 二选一即可，两者都给时必须一致。
-- 类型规则：`CRC64NVME` 未声明类型时默认 `FULL_OBJECT`（分片完成时用 CRC combine 合并，**不重读数据**）；`CRC32`/`CRC32C` 默认 `COMPOSITE`；`SHA1`/`SHA256` 只支持 `COMPOSITE`。
+- 支持算法：`CRC32`、`CRC32C`、`CRC64NVME`、`SHA1`、`SHA256`；请求头 `x-amz-checksum-<alg>` 或 `x-amz-sdk-checksum-algorithm` 二选一即可，两者都给时必须一致（不一致 → `400 InvalidArgument`）。算法头已确定算法后，**其他算法**的 `x-amz-checksum-*` 值头一律 `400 InvalidArgument`，不静默丢弃。
+- 类型规则（**仅 MPU**；单次 `PutObject` 恒为 `FULL_OBJECT`）：`CRC64NVME` 未声明类型时默认 `FULL_OBJECT`（分片完成时用 CRC combine 合并，**不重读数据**）；`CRC32`/`CRC32C` 默认 `COMPOSITE`；`SHA1`/`SHA256` 只支持 `COMPOSITE`。
 - `COMPOSITE` 的值 = 对各分片**原始校验值字节**再算一次，形如 `<base64>-<分片数>`。
 - 分片下载（206）不回传校验和；完整对象下载、HEAD（带 `x-amz-checksum-mode: ENABLED`）、分片完成响应都回传。
 
@@ -303,6 +304,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - `CreateMultipartUpload` 必须持久化客户端声明的 checksum 算法，它决定后续分片与完成的校验行为。
 - `CreateMultipartUpload` 同时持久化 `Content-Type`、`x-amz-meta-*` 与标准 HTTP 元数据（`Cache-Control` 等）到会话状态，`Complete` 时原样写入对象元数据。分片请求（`UploadPart`）上的同名头**不参与**对象元数据：一次会话只有一个最终对象，属性只能在 Initiate 时声明一次。
 - `UploadPart`：`partNumber` 范围 1–10000；除最后一个分片外，每片不小于 5 MiB。
+- `ListParts`（以及 `GetObjectAttributes` 的 `ObjectParts`）的分页语义：`max-parts` 非负整数，`part-number-marker` 非负整数，只返回编号大于 marker 的分片，按编号升序。`max-parts=0` 时本页必为空；此时若仍有分片，`IsTruncated` 必须为 `true`，`NextPartNumberMarker` 回显请求的 marker（客户端须改用非零 `max-parts` 才能推进）——把"没让你看"报成 `IsTruncated=false` 会让客户端以为会话里没有分片。
 - `UploadPartCopy`：与 `UploadPart` 同路由，以 `x-amz-copy-source` 非空为唯一判据分流。支持 `x-amz-copy-source-range: bytes=first-last`（两端必填，不支持开放/后缀/多区间）；缺省复制整个源对象。源条件与 CopyObject 同一套 `x-amz-copy-source-if-*`；源不存在 → `404 NoSuchKey`；区间越界 → `416 InvalidRange` 且带 `Content-Range: bytes */<源大小>`；单次复制 > 5 GiB → `400 InvalidRequest`。响应 `<CopyPartResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyPartResult>`，ETag 按目标分片内容重算，与随后 `ListParts` 一致。
 - 单机与集群的 `UploadPartCopy` 都走 `OpenObject` + `io.Pipe` + `UploadPart`：**不是零拷贝**，数据经协调者读一次、写一次（与集群 CopyObject 同理）。
 - `CompleteMultipartUpload` 必须校验分片序号升序（否则 `400 InvalidPartOrder`）、分片存在且 ETag 匹配（否则 `400 InvalidPart`）、尺寸约束（否则 `400 EntityTooSmall`）。
@@ -340,7 +342,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 | 规则数 | 1–100 |
 | 每规则 | 至少一个 `<AllowedOrigin>` 与一个 `<AllowedMethod>` |
 | 方法 | 仅 `GET`/`PUT`/`HEAD`/`POST`/`DELETE`（大小写不敏感，归一化为大写） |
-| 通配符 | `AllowedOrigin`、`AllowedHeader` 每条至多一个 `*`，且只能作前缀或后缀 |
+| 通配符 | `AllowedOrigin`、`AllowedHeader` 每条至多一个 `*`，可出现在任意位置（与 AWS 一致，如 `https://*.example.com`） |
 | `MaxAgeSeconds` | 非负整数；未给出时响应不出现 `Access-Control-Max-Age` |
 | 请求体大小 | ≤ 64 KiB；根元素之后不得有尾随内容（拒绝拼接攻击） |
 

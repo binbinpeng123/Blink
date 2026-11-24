@@ -6,6 +6,7 @@ package s3err
 
 import (
 	"encoding/xml"
+	"io"
 	"net/http"
 )
 
@@ -200,5 +201,8 @@ func writeXML(w http.ResponseWriter, r *http.Request, status int, body any) {
 	if r != nil && r.Method == http.MethodHead {
 		return
 	}
+	// 与 AWS 一致，错误体带 XML 声明：部分老客户端（以及 S3 兼容性
+	// 测试套件）按字节比对响应，缺声明会被判为格式错误。
+	_, _ = io.WriteString(w, xml.Header)
 	_ = xml.NewEncoder(w).Encode(body)
 }
