@@ -19,6 +19,14 @@ import (
 // 成本反而超过收益；256 KiB 以上的块（默认 4 MiB 块的前 1/16）才值得并行。
 const parallelHashMinBlock = 256 << 10
 
+// md5PipelineMinBlock 是启用"MD5 与块落盘重叠"的最小块长。
+//
+// MD5 是 ETag 的定义且链式，只能单流计算。串行循环里 md5.block 约占
+// 16 MiB PUT 四成 CPU，而块写入 CAS 的 write/fsync 又在等磁盘；两者
+// 没有数据依赖，可以重叠。块太小时起 goroutine 与同步的成本不划算，
+// 因此设 1 MiB 下限，且单核（GOMAXPROCS==1）不启用。
+const md5PipelineMinBlock = 1 << 20
+
 // blockHashes 是一块的完整性字段：内容 SHA-256 与 CRC32C。
 type blockHashes struct {
 	sum [sha256.Size]byte
@@ -30,6 +38,9 @@ type Block struct {
 	Desc BlockDesc
 	// Data 是块内容。底层缓冲在回调之间复用，因此 Data **只在本次回调
 	// 期间有效**；需要保留必须自行拷贝。
+	//
+	// 计算 ETag 的 MD5 可能与回调并发读取同一块内容（见 StreamBlocks），
+	// 因此回调不得改写 Data。
 	Data []byte
 }
 
@@ -144,6 +155,17 @@ func (s *Store) StreamBlocksSized(body io.Reader, alg checksum.Algorithm, tag st
 		}
 	}
 
+	// MD5 流水线：每块把 MD5 交给一个 goroutine，与块级哈希、fn（单机
+	// 路径即"写临时文件 + fsync + rename"）重叠；本块 MD5 结束前不读下一块，
+	// 因此缓冲不需要翻倍，也不存在拷贝。md5 状态始终只被一个 goroutine
+	// 写入（上一块的写者已 join），ETag 与串行实现逐字节一致。
+	//
+	// 只有真正跨多块的对象才启用：单块对象的回调只有一次写盘尾巴，
+	// 重叠省不下多少，反而要多付一次 goroutine 调度。
+	pipeline := runtime.GOMAXPROCS(0) > 1 &&
+		limit >= md5PipelineMinBlock &&
+		(expected < 0 || expected > int64(blockSize))
+
 	for {
 		n, err := readBlock(body, buf, prefill)
 		prefill = 0
@@ -171,7 +193,18 @@ func (s *Store) StreamBlocksSized(body io.Reader, alg checksum.Algorithm, tag st
 			}
 
 			// md5/sha 与校验和计算器都不返回错误，但接口要求处理它。
-			_, _ = md5h.Write(chunk)
+			var md5Done chan struct{}
+			if pipeline {
+				// MD5 只读 chunk；主循环要等 md5Done 才读下一块，
+				// 所以缓冲不会在计算期间被改写。
+				md5Done = make(chan struct{})
+				go func() {
+					_, _ = md5h.Write(chunk)
+					close(md5Done)
+				}()
+			} else {
+				_, _ = md5h.Write(chunk)
+			}
 			if objSum != nil {
 				_, _ = objSum.Write(chunk)
 			}
@@ -195,6 +228,12 @@ func (s *Store) StreamBlocksSized(body io.Reader, alg checksum.Algorithm, tag st
 			}
 			res.Blocks = append(res.Blocks, desc)
 			res.Size += int64(n)
+
+			// fn 返回前这块的 MD5 通常已经算完；这里等的是最坏情况。
+			// 不能省：下一轮会复用同一块缓冲。
+			if md5Done != nil {
+				<-md5Done
+			}
 		}
 		if err != nil {
 			// EOF 与 ErrUnexpectedEOF 都表示"正常读完，只是最后一块不满"；

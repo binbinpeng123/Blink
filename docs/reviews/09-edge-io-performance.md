@@ -189,9 +189,8 @@ SHA-256 与 CRC32C 放进一个 goroutine，与主 goroutine 的整对象 MD5 �
 基线 64.8–76.0 ms（中位 68.6 ms）→ 优化后 50.7–78.5 ms（中位 57.1 ms），
 约 −16.8%。端到端样本少、方差大，只作为方向性验证；稳定收益以不落盘微基准为准。
 
-**边界**：MD5 仍是唯一不能并行化的部分，也仍是理论上限。本次只是把 SHA-256/
-CRC32C 藏进 MD5 的墙钟；进一步提升需要"MD5 与落盘重叠"或硬件加速 MD5，需另设
-基准。
+**边界**：MD5 仍是唯一不能并行化的部分，本次只是把 SHA-256/CRC32C 藏进 MD5 的
+墙钟。切片 30 进一步让它与块落盘重叠（见「未达标项」一节）；硬件加速 MD5 未做。
 
 ### HTTP 端到端读路径：中间件挡住了零拷贝（已落地，切片 28）
 
@@ -284,8 +283,12 @@ overlayfs，不是真实边端硬件，**不得外推为 Linux/NVMe/eMMC 的性�
 
 **实测**：实现 `localBlockWriter` + `blockWriteParallel=4` + `blockBufs sync.Pool`
 后，16 MiB PUT 仍为 66 ms（新口径），与串行版本无差异；1 MiB 同样无差异。
-CPU profile 显示 `crypto/md5.block` 占 54–60%。**该尺寸在此硬件上的瓶颈是 ETag
-的 MD5 计算，不是块 IO 并行度。**
+CPU profile 显示 `crypto/md5.block` 占 54–60%。当时据此判断瓶颈是 ETag 的 MD5。
+
+**后记（2026-11-24 复核，切片 30）**：上面的归因不准确。单独测 `crypto/md5` 为
+819.8 MB/s，16 MiB 只要约 20 ms；66 ms 里剩余的是每块 write/fsync + rename/dirsync
+的持久化等待。"块写入并行无收益"的结论仍然成立——fsync 在设备层串行化，多开
+worker 只是排队——但"瓶颈是 MD5 计算"这一句作废。
 
 按 03 文档纪律（无前后对照的优化一律回滚），代码已完整移除：`localBlockWriter`、
 `blockWriteParallel`、`Store.blockBufs` 与相关 `sync` import 均不在最终 diff 中。
@@ -346,13 +349,46 @@ BenchmarkGetRangeSequentialWithReadahead-10    58.8–82.3 µs   1216 B/op   11 
 **未验证**：在 Linux（`fsync` 语义不同）或支持并发 flush 的 NVMe 队列上是否可达。
 不得引用本机数字外推。
 
-### 16 MiB PUT ≈ 250 MB/s 上限（切片 16 后有改善，但 MD5 仍是上限）
+### 16 MiB PUT：更正旧数字后，切片 30 把本机吞吐从 ≈240 提到 ≈300 MB/s
 
-MD5（ETag）在此硬件上约 250 MB/s，且无法并行化，是大对象写入的硬上限。并行块
-IO 无收益（见回滚项）。切片 16 把块级 SHA-256/CRC32C 移出 MD5 的关键路径后，
-不落盘微基准达到 413 MB/s、端到端中位耗时下降约 17%（见上节）；但 MD5 本身仍然
-串行，若未来需要显著更高写入吞吐，方向仍是"ETag 计算与块落盘重叠"或"硬件加速
-MD5"，两者都需要新的基准对照。
+**先更正一条错误记录**：本节曾写"MD5（ETag）在此硬件上约 250 MB/s，是大对象写入的
+硬上限"。2026-11-24 复测推翻了这个数字：
+
+| 测量 | 结果 |
+| --- | --- |
+| `crypto/md5` 单独吞吐 | **819.8 MB/s** |
+| `StreamBlocksSized` 只切块 + 算哈希、回调为空（不落盘） | 20.6–22.1 ms/16 MiB，≈762–816 MB/s |
+| 端到端 16 MiB PUT | 当时约 64.8–76.0 ms，≈220–260 MB/s |
+
+MD5 只占那 66 ms 里的约 20 ms。旧数字量的是整条串行路径，被错误归因成了 MD5 本身。
+
+**切片 30：MD5 与块落盘重叠（已落地）**。`StreamBlocksSized` 每块把
+`md5h.Write(chunk)` 交给一个 goroutine，与块级 SHA-256/CRC32C、以及 `fn`
+（单机路径即"写临时文件 + fsync + rename + dirsync"）重叠。本块的 MD5 结束前
+不读下一块，因此缓冲不翻倍、不拷贝（4.29 MB/op 不变），md5 状态始终只有一个
+写者，ETag 与串行实现逐字节一致。只在多核、块长 ≥1 MiB、且对象跨多块时启用；
+单核与单块对象保持原串行路径。新增 `TestStreamBlocksMD5Pipeline` 与
+`TestStreamBlocksMD5PipelineCallbackError`，`-race` 通过。
+
+**实测**（Apple M4 / APFS，2026-11-24，`BenchmarkPutObjectUniqueBlocks16MiB`；
+交替进行 3 组对照，每组 4–5 个样本 × 2 次迭代；每个 4 MiB 块的前缀都写序号，
+**4 块全部真正落盘**）：
+
+| | 耗时（14 个样本） | 中位 | 吞吐 | 分配 |
+| --- | --- | --- | --- | --- |
+| 切片前 | 66.6–84.5 ms | ≈70 ms | 231–245 MB/s | 4.29 MB/op |
+| 切片后 | 55.2–62.7 ms | **≈57 ms** | **267–304 MB/s** | 4.29 MB/op |
+
+≈1.2×（中位耗时约 −18%），内存零增长。APFS 的 fsync 方差很大（基线单样本可到
+84 ms），因此结论以中位为准，不引用最好/最差样本。**为什么必须单独设基准**：
+`BenchmarkPutObjectSizes/16MiB` 每轮只改内容前缀，后 3 块命中 CAS 去重，只有 1/4
+真正写盘，因此它上面这次改动落在噪声内（中位 30.0 → 29.4 ms）；用"每块唯一"的
+基准才能看到重叠窗口。
+
+**未验证**：eMMC/SD/机械盘上 fsync 更慢、重叠窗口更大，理论上收益更高，但**未实测，
+不得外推**。剩余瓶颈是 4 次持久化等待与单流 MD5；再快需要批量/异步 fsync 或硬件
+加速 MD5，均未开始。旧记录里的"≈250 MB/s 上限"不再成立，相应限制说明已在
+`docs/design/known-limitations.md` 中更正；**验收门槛本身没有也不会下调**。
 
 ### 10 万对象 LIST < 500 ms —— 仍未达标（沿用切片 9 结论）
 
