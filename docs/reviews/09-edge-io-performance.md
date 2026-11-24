@@ -40,7 +40,9 @@
 
 **未覆盖的档位**：05 文档列出 8 MiB / 128 MiB / 1 GiB 档位，本机压测总写入需
 ≤ 512 MiB，因此只测到 16 MiB；大对象连续性由 `BenchmarkGetRangeSequential`
-覆盖。跨平台结论（尤其是 Linux/NVMe）未验证。
+覆盖。跨平台结论（尤其是 Linux/NVMe）未验证：切片 29 仅用开发机 Docker 的
+Linux/amd64 容器对 **HTTP 端到端路径**做过回归基线核对（见下文），不覆盖此处的
+存储读路径。
 
 ## 基线（改动前）
 
@@ -253,9 +255,25 @@ CRC32C 藏进 MD5 的墙钟；进一步提升需要"MD5 与落盘重叠"或硬�
 `internal/poll/sendfile_unix.go` 的 build tag 均含 `darwin && !ios`），
 上表正是这条路径。Linux 上 `os.File.writeTo` 对裸 `*net.TCPConn` 可用，但生产
 路径上的 writer 是包装类型，同样只能靠本次的 `ReaderFrom` 透传来接上 sendfile。
-**Linux / FreeBSD / Solaris 上的数字未实测**，上表只作为本机 loopback 回归
-基线，不构成对外性能承诺。iOS 构建（`darwin && ios`）无 sendfile，退化为用户态
-拷贝——这不是本切片引入的限制，是 Go 运行时在该平台的既有行为。
+上表只作为本机 loopback 回归基线，不构成对外性能承诺。iOS 构建
+（`darwin && ios`）无 sendfile，退化为用户态拷贝——这不是本切片引入的限制，
+是 Go 运行时在该平台的既有行为。
+
+**Linux 交叉核对（2026-11-24，切片 29）**：开发机为 Apple M4，无法直接给出
+Linux/NVMe 数字；改用本机 Docker 的 Linux/amd64 容器（内核 overlayfs、CPU 仍被
+虚拟化为 `VirtualApple @ 2.50GHz`）做同会话 A/B。两条边各自 `git archive` 出
+独立源码树、同一容器内交叉执行 `-benchtime=60x -count=5`：
+
+| 边 | 5 次样本（ns/op） | 吞吐 |
+| --- | --- | --- |
+| 修复前（`795a11a`） | 3700 / 2647 / 3023 / 2546 / 2811 k | 4534–6591 MB/s，中位 **5969 MB/s** |
+| 修复后（`45dbf48`） | 2307 / 1808 / 1707 / 1925 / 1976 k | 7272–9827 MB/s，中位 **8715 MB/s** |
+
+中位约为 **1.46×**，分配从 ≈147 KB/op 降到 ≈18.7 KB/op（约 1/8），与 darwin
+A/B 的方向一致；幅度小于 darwin 的 2.2×，因为 Linux 上 `*net.TCPConn.ReadFrom`
+走的是 `sendfile(2)` 而非 darwin 的 `sendFile` 包装，且容器内的回环与页缓存行为
+不同。**这仍然只是虚拟化环境下的回归基线**：CPU 是虚拟化型号、存储是开发机
+overlayfs，不是真实边端硬件，**不得外推为 Linux/NVMe/eMMC 的性能承诺**。
 
 ## 回滚项
 
@@ -367,7 +385,9 @@ LIST 的读放大随内联对象占比上升。1000 对象微基准为 +14%～18
 
 ## 未验证项（不得写成已通过）
 
-- Linux / NVMe / eMMC / SD 卡上的任何一项延迟与吞吐。
+- 真实 Linux / NVMe / eMMC / SD 卡物理硬件上的任何一项延迟与吞吐。Linux 容器
+  内只对 HTTP 端到端读路径量过回归基线（见上文“Linux 交叉核对”），存储读路径
+  与真实介质均未测量。
 - 多副本与 EC 模式下缓存的内存上限：每个节点各有一份 LRU，集群规模下的总量
   未测量。
 - 1 GiB 单对象写入（受本机写入总量约束未跑）。
@@ -381,9 +401,11 @@ LIST 的读放大随内联对象占比上升。1000 对象微基准为 +14%～18
   重新验证，必须给出同机、同负载、逐次冷缓存的 A/B 数据，才能考虑改变默认值。
 - 32 位 ARM（`GOARCH=arm`）上预读为空实现（`SYS_ARM_FADVISE64_64` 参数寄存器
   排布不同，不做猜测），因此该架构上无论开关如何都不产生系统调用。
-- HTTP 端到端读路径（切片 28）的 Linux / FreeBSD / Solaris 数字：本机为
-  darwin/arm64，只能确认 darwin 上 `*net.TCPConn.ReadFrom` → `sendfile(2)` 可达
-  且有 2.2× 吞吐差；其它平台按 Go 源码 build tag 推断可达，**未实测**。
+- HTTP 端到端读路径（切片 28）的 FreeBSD / Solaris 数字：本机为 darwin/arm64，
+  darwin 上已确认 `*net.TCPConn.ReadFrom` → `sendfile(2)` 可达且有 2.2× 吞吐差；
+  Linux 已在 2026-11-24 用开发机 Docker 容器（Linux/amd64、虚拟化 CPU）做过同机
+  A/B，中位约 1.46×（见上文“Linux 交叉核对”），但**真实 Linux/NVMe 硬件仍未
+  实测**。FreeBSD / Solaris 按 Go 源码 build tag 推断可达，**未实测**。
 
 ## 验证命令
 
@@ -409,3 +431,9 @@ LIST 基准会预置 10 万对象（约 176 MB 写入），单独运行并计入
 `-bench 'BenchmarkGetRangeSequential'` 是前缀匹配，会同时跑默认（预读关闭）与
 `BenchmarkGetRangeSequentialWithReadahead` 两个基准。后者只用来把"默认关闭"
 这个实测结论钉在回归基线里，**不能**用它证明预读有收益。
+
+“Linux 交叉核对”的复现方式：用 `git archive <commit> | tar -x -C <dir>` 从
+`795a11a` 与 `45dbf48` 各导出独立源码树，分别 bind mount 进
+`golang:1.27-alpine`（实测 `go1.27.4 linux/amd64`）容器，`GOCACHE` 挂同一
+宿主机目录以复用编译缓存，再在容器内对两份源码树交叉执行
+`go test ./test/bench/ -run '^$' -bench 'BenchmarkHTTPGetObject' -benchtime=60x -count=5`。
