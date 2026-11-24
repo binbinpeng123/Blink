@@ -138,6 +138,7 @@ BenchmarkPutObjectSizes/{1KiB,64KiB,1MiB,16MiB}
 BenchmarkGetObjectSizes/{同上}
 BenchmarkGetRangeRandom/1GiB              模拟随机读
 BenchmarkGetRangeSequential               模拟模型顺序加载
+BenchmarkHTTPGetObject                    真实中间件链 + TCP 的端到端整对象 GET
 BenchmarkPutSmallObject10k                 创新 D 对照组
 BenchmarkList100kObjects                   创新 D 对照组
 BenchmarkConcurrentPut/{4,16,64}（当前实现：BenchmarkConcurrentPut1MiB，64 worker）
@@ -154,6 +155,13 @@ BenchmarkSigV4Verify                       签名开销
 "本机压测总写入 ≤ 512 MiB"约束未执行，不得写成已通过。上表中
 `BenchmarkGetRangeRandom/1GiB`、`BenchmarkDedupSecondCopy/1GiB`、
 `BenchmarkCompleteMultipart20GB` 目前仍是**计划项**，未实现为可执行基准。
+
+`BenchmarkHTTPGetObject` 已于 2026-11-24 实现（`test/bench/http_read_bench_test.go`），
+补齐"存储读路径"与"HTTP 写出路径"之间的缺口：其余 GET 基准把响应写进
+`io.Discard`（它自带 `ReaderFrom`），量不到中间件是否挡住了零拷贝。该基准走
+真实的 `s3api` 中间件链与 `httptest.NewServer` 的 TCP 回环，16 MiB 对象、
+`-benchtime=60x`；默认不随 `go test ./...` 运行。切片 28 用它测出
+`statusRecorder` 未透传 `io.ReaderFrom` 导致的约 2.2× 吞吐差（569–612 → 1237–1327 MB/s）。
 
 `BenchmarkPutSmallObject10k` 已于 2026-11-10 实现（`test/bench/small_object_bench_test.go`），
 补齐创新 D 的前置基线：10,000 个 1 KiB 对象、默认内容内联、`-benchtime=1x`，
@@ -173,7 +181,7 @@ BenchmarkSigV4Verify                       签名开销
 | --- | --- | --- |
 | 1 KiB PUT P50 | < 2 ms | 小对象元数据路径开销 |
 | 1 MiB GET 吞吐 | > 500 MB/s | 常规读路径 |
-| 1 GiB 顺序 GET 吞吐 | 显著高于用户态拷贝路径 | 零拷贝生效的证据 |
+| 1 GiB 顺序 GET 吞吐 | 显著高于用户态拷贝路径 | 零拷贝生效的证据（受本机写入约束未测；以 16 MiB `BenchmarkHTTPGetObject` 为替代证据，见 09 文档） |
 | 64 并发 1 MiB PUT | > 300 MB/s | 并发写扩展性 |
 | 100 万对象启动 | < 500 ms | 证明启动代价与规模弱相关 |
 | 10 万对象 LIST（**单机**） | < 500 ms | 当前主要性能风险的基线；集群模式不沿用此目标 |
