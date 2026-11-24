@@ -10,6 +10,7 @@
 | 层次 | 范围 | 运行方式 |
 | --- | --- | --- |
 | 单元测试 | 元数据、路径、布局、校验和、错误处理、签名算法 | `go test ./...`，无网络、无磁盘依赖 |
+| 模糊测试 | 所有解析客户端输入的纯函数（见"模糊测试"小节） | 种子随 `go test ./...`；有界探索用 `scripts/fuzz.sh` |
 | 集成测试 | S3 API、文件系统、重启恢复 | `go test -tags integration ./test/integration/` |
 | 互操作测试 | AWS CLI 真实二进制；纯标准库手写客户端 | `scripts/aws-cli-smoke.sh` 与 `test/interop/` |
 | 故障测试 | 进程中断、磁盘满、对象损坏、并发冲突 | `faultFS` 注入 + 子进程 `SIGKILL` |
@@ -25,6 +26,55 @@
 - **路由与响应**：分派表全表驱动、不支持参数返回 `501`、Range 解析边界（`bytes=0-0`、开放区间、后缀区间、越界、非法）、XML 转义。
 - **CRC64NVME**：与已知向量比对，并验证分片校验和的合并结果等于整体计算值。
 - **CORS**：配置往返（含 `MaxAgeSeconds` 指针语义）、重启后仍可读、未配置与桶不存在可区分、删除幂等、删桶后同名重建不继承旧配置、写入为深拷贝、损坏文件报 `ErrCorrupt`；协议层覆盖 `?cors` 三种方法、10 类非法 XML 全部回 `400` 且不破坏已有配置、100 条规则上限、单通配符匹配（`*`、前缀、后缀、大小写敏感 origin vs 不敏感 header）、预检成功/缺 Origin/缺方法/未配置/源不匹配/方法不匹配/请求头不匹配/桶不存在、实际请求头注入、以及"预检免签但配置读写仍需签名"。
+
+### 模糊测试（协议解析基线）
+
+单元测试只覆盖"想得到的输入"。协议解析层面对的是**客户端完全控制的字节**，
+因此每个解析函数都配一个 Go 原生 `Fuzz` 目标，断言的不只是"不 panic"，
+还包括解析成功时必须成立的不变量：
+
+| 目标 | 核心不变量 |
+| --- | --- |
+| `FuzzParseRange` | 区间完整落在对象内；成功结果重写为 `bytes=start-end` 后解析一致 |
+| `FuzzParseCopyPartRange` | 空串等价整段；非空时严格在界内；结果可重写再解析 |
+| `FuzzS3URLEncode` | 输出只含 unreserved + `/` + 合法 `%XX`；`PathUnescape` 逐字节还原 |
+| `FuzzDecodeListToken` | 能解码则 `After` 非空；重签后解码语义不变 |
+| `FuzzParseTrailerNames` | 名字非空、小写、字符集合法、去重；与 `hasTrailerName` 一致 |
+| `FuzzParseCopySource` | `Bucket`/`Key` 非空；重新百分号编码拼接后解析结果相同（覆盖"先切分后解码"语义） |
+| `FuzzParseContentMD5` | 成功值为 16 字节 base64 对应的 32 位小写十六进制 |
+| `FuzzParseDecodedContentLength` | 成功值等于去空白后的十进制字面值，且非负 |
+| `FuzzCanonicalQueryString` | 规范化幂等；键值对按原始编码字节序非降，键中无 `=` |
+| `FuzzParseChunkHeader` | 长度非负；签名缺省或 64 位十六进制；块头可重写再解析 |
+| `FuzzParseTrailerLine` | 名字非空、已小写、字符集合法；`name:value` 可重写再解析 |
+| `FuzzParseAuthorization` | 成功结果 `accessKeyID`/`signature` 非空、`dateStamp` 8 位、`signedHeaders` 非空；重复解析逐字段相等 |
+| `FuzzValidateBucketName` | 与**独立重写**的 AWS 规则做差分对照；失败必须是 `ErrInvalidBucketName`；确定性 |
+| `FuzzParsePartFileName` | 编号落在 `1..10000`；重写为规范文件名后解析一致 |
+
+运行方式：种子语料随 `go test ./...` 每次执行（毫秒级，充当回归）；有界随机探索用
+
+```text
+scripts/fuzz.sh            # 每个目标 20 s
+scripts/fuzz.sh 60         # 每个目标 60 s
+scripts/fuzz.sh 20 FuzzParseRange FuzzParseChunkHeader
+```
+
+脚本只解析内存字符串，**不启动服务、不写数据目录、不联网**。某目标失败时 Go
+会自动把输入写入 `testdata/fuzz/<目标>/<哈希>`，此后 `go test` 会把它当回归用例执行。
+
+**实测（2026-11-24，Apple M4 / macOS 24.6.0 / Go 1.27.2，`scripts/fuzz.sh 10`，
+10 个 worker）**：14 个目标全部 PASS，合计约 **1 081 万次执行**；执行次数最高的为
+`FuzzParseChunkHeader`（149 万）、`FuzzParseAuthorization`（142 万）、`FuzzParsePartFileName`（131 万）。
+
+- 唯一被证伪的断言：`FuzzParseCopySource` 在 20 s 运行时约 2.5 s 找到 `%2F/0`
+  （`{Bucket:"/", Key:"0"}`）。复核结论是**测试不变量过严而非产品缺陷**：`parseCopySource`
+  先按第一个 `/` 切分再解码是设计正确的；解码出的非法桶名由下游 `store.CopyObject`
+  入口的 `validateBucketName` 在拼接路径前拒绝（400），不存在路径穿越。断言已删除并加注释，
+  该输入保留为回归种子（`internal/s3api/testdata/fuzz/FuzzParseCopySource/92f6a12f1a449e4d`）。
+- `FuzzValidateBucketName` 在第 3 秒后出现 `0 execs/sec` 停顿（Go fuzzer 在最小化超长输入），
+  11 s 内只完成约 3.8 万次执行，**探索深度明显低于其它目标**；这是记录事实，不视为通过证据的等价物。
+
+**未覆盖**：handler 级端到端 fuzz（构造完整 HTTP 请求、含中间件链与鉴权）、
+集群/EC 路径、TLS 与并发下的状态机。有界时长本身也不构成完备性证明。
 
 ### 集成测试重点
 
