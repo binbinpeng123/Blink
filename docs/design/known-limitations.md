@@ -19,6 +19,7 @@
 | **16 MiB 对象写入受持久化等待与单流 MD5 约束** | ETag 必须在写 meta 前算出；MD5 链式依赖只能单流计算；每块 write/fsync + rename/dirsync 在设备层串行 | 切片 16 把块级 SHA-256/CRC32C 与 MD5 并行（不落盘微基准 308 → 413 MB/s）。切片 30 让 MD5 与块落盘重叠：本机「每块唯一、4 块全部真正落盘」的 16 MiB PUT 中位约 **70 → 57 ms**（231–245 → **267–304 MB/s**，≈1.2×，内存不变 4.29 MB/op；APFS fsync 方差大，以中位为准）。旧记录"`crypto/md5` 约 250 MB/s"已复测推翻（单独约 820 MB/s）。eMMC/SD/机械盘收益**未实测，不得外推**；更高吞吐需批量/异步 fsync 或硬件加速 MD5 |
 | **签名分块（`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`）未用真实客户端验证** | aws-cli 2.36.2 在 HTTPS 下实测只发送未签名流式载荷（`STREAMING-UNSIGNED-PAYLOAD-TRAILER`） | 签名分块已实现，并用独立 Python 实现生成的签名向量单测覆盖（含 trailer 签名）；但**没有真实客户端走过该路径，不得声称互操作已验证**。未签名流式上传（PutObject 与 UploadPart）已用 aws-cli 实测通过 |
 | **TLS 仅以自签证书 + `--no-verify-ssl` 验证** | 无生产 CA、无证书轮换机制 | 服务端 TLS 1.2+ 已验证可启动并完成上传/下载；**客户端信任链、证书续期与生产 CA 场景未验证** |
+| **模糊测试只覆盖纯解析函数，且每次为有界时长** | 14 个 fuzz 目标全部是内存字符串解析（Range、复制源、token、chunk 头、Authorization、桶名等），不启动服务、不写盘 | 2026-11-24 约 1 081 万次随机执行未发现 panic / 越界 / 不可逆缺陷（05 文档）。handler 级端到端、集群/EC 路径、TLS 与并发状态机**未做 fuzz**；有界时长不构成完备性证明 |
 
 ## 设计决策导致的限制
 
