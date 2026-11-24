@@ -314,8 +314,12 @@ func TestCopyObjectRejectsUnsupportedOptions(t *testing.T) {
 		{"非 STANDARD 存储类型", "x-amz-storage-class", "GLACIER", http.StatusNotImplemented, s3err.CodeNotImplemented},
 		{"服务端加密", "x-amz-server-side-encryption", "AES256", http.StatusNotImplemented, s3err.CodeNotImplemented},
 		{"客户密钥加密", "x-amz-server-side-encryption-customer-algorithm", "AES256", http.StatusNotImplemented, s3err.CodeNotImplemented},
+		{"客户密钥", "x-amz-server-side-encryption-customer-key", "c2VjcmV0", http.StatusNotImplemented, s3err.CodeNotImplemented},
+		{"客户密钥 MD5", "x-amz-server-side-encryption-customer-key-md5", "bWQ1", http.StatusNotImplemented, s3err.CodeNotImplemented},
 		{"KMS 密钥", "x-amz-server-side-encryption-aws-kms-key-id", "key-id", http.StatusNotImplemented, s3err.CodeNotImplemented},
+		{"KMS 上下文", "x-amz-server-side-encryption-context", "eyJrIjoidiJ9", http.StatusNotImplemented, s3err.CodeNotImplemented},
 		{"对象标签", "x-amz-tagging", "a=b", http.StatusNotImplemented, s3err.CodeNotImplemented},
+		{"标签指令", "x-amz-tagging-directive", "REPLACE", http.StatusNotImplemented, s3err.CodeNotImplemented},
 		{"非法元数据指令", "x-amz-metadata-directive", "MERGE", http.StatusBadRequest, s3err.CodeInvalidArgument},
 	}
 	for i, c := range cases {

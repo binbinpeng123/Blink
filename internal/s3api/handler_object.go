@@ -225,13 +225,18 @@ func parseContentMD5(v string) (string, bool) {
 // 返回值 declared 为空表示客户端只要"算一个给我看"，不代表出错 ——
 // 这种用法在 ChecksumMode 场景下完全合法。
 func parseChecksumHeaders(h http.Header) (alg checksum.Algorithm, declared string, e *s3err.Error) {
-	name := h.Get("x-amz-sdk-checksum-algorithm")
+	name := strings.TrimSpace(h.Get("x-amz-sdk-checksum-algorithm"))
 	if name == "" {
 		// aws-cli 的 CreateMultipartUpload 发的是不带 sdk- 前缀的
 		// `x-amz-checksum-algorithm`（实测 2.36.2）。漏掉这个回退，
 		// 会话就会被建成"没有校验和"，而客户端之后每片都带 ChecksumAlgorithm，
 		// 整个 multipart 上传在 UploadPart 阶段全部 400。
-		name = h.Get("x-amz-checksum-algorithm")
+		name = strings.TrimSpace(h.Get("x-amz-checksum-algorithm"))
+	} else if alt := strings.TrimSpace(h.Get("x-amz-checksum-algorithm")); alt != "" && !strings.EqualFold(alt, name) {
+		// 两个算法头同时出现且不一致：无论挑哪一个，另一个校验和都不会
+		// 被验证。客户端明确要求了两套不同的校验，静默选一边是错的。
+		return "", "", s3err.New(s3err.CodeInvalidArgument).
+			WithMessage("x-amz-sdk-checksum-algorithm 与 x-amz-checksum-algorithm 声明的算法不一致。")
 	}
 	if name != "" {
 		parsed, ok := checksum.ParseAlgorithm(name)
@@ -239,8 +244,16 @@ func parseChecksumHeaders(h http.Header) (alg checksum.Algorithm, declared strin
 			return "", "", s3err.New(s3err.CodeInvalidArgument).
 				WithMessage("不支持的校验和算法：" + name)
 		}
-		// 指定了算法就只认这一个：其他 x-amz-checksum-* 头一律忽略，
-		// 因为响应只能回传一个值，多算法并存会让"回传哪个"变成隐式规则。
+		// 算法头已确定算法，其他算法的值头一律拒绝：响应只能回传一个值，
+		// 多算法并存时"回传哪个"是隐式规则，被丢弃的那个校验和永远不会
+		// 被验证 —— 客户端却以为两套都校验过了。
+		for _, other := range checksum.AllAlgorithms {
+			if other == parsed || h.Get(other.Header()) == "" {
+				continue
+			}
+			return "", "", s3err.New(s3err.CodeInvalidArgument).
+				WithMessage("声明了 " + string(parsed) + " 校验和，但同时出现 " + other.Header() + "。")
+		}
 		return parsed, h.Get(parsed.Header()), nil
 	}
 

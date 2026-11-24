@@ -408,6 +408,52 @@ func TestPutObjectUnknownChecksumAlgorithm(t *testing.T) {
 	}
 }
 
+// TestPutObjectConflictingChecksumHeaders 验证算法头与值头指向不同算法时
+// 一律 400，而不是"挑一个用、另一个静默丢弃"。
+func TestPutObjectConflictingChecksumHeaders(t *testing.T) {
+	h := objectTestServer(t)
+	cases := []struct {
+		name   string
+		mutate func(r *http.Request)
+	}{
+		{
+			name: "算法头与值头不一致",
+			mutate: func(r *http.Request) {
+				r.Header.Set("x-amz-sdk-checksum-algorithm", "SHA256")
+				r.Header.Set("x-amz-checksum-crc32", "AAAAAA==")
+			},
+		},
+		{
+			name: "两个算法头互相矛盾",
+			mutate: func(r *http.Request) {
+				r.Header.Set("x-amz-sdk-checksum-algorithm", "SHA256")
+				r.Header.Set("x-amz-checksum-algorithm", "CRC32")
+			},
+		},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := putObject(t, h, fmt.Sprintf("/bkt/checksum-conflict-%d", i), "x", c.mutate)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("状态码 = %d，期望 400 (%s)", rec.Code, rec.Body.String())
+			}
+			if got := decodeError(t, rec).Code; got != "InvalidArgument" {
+				t.Errorf("错误码 = %q，期望 InvalidArgument", got)
+			}
+		})
+	}
+
+	// 两个算法头声明一致时必须放行：SDK 同时发两个同名语义的头并不罕见，
+	// 只要不矛盾就不是错误。
+	rec := putObject(t, h, "/bkt/checksum-agree", "x", func(r *http.Request) {
+		r.Header.Set("x-amz-sdk-checksum-algorithm", "SHA256")
+		r.Header.Set("x-amz-checksum-algorithm", "sha256")
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("一致的算法头状态码 = %d，期望 200 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
 func TestPutObjectNoSuchBucket(t *testing.T) {
 	h := objectTestServer(t)
 	rec := putObject(t, h, "/missing/key", "x", nil)

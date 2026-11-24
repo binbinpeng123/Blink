@@ -282,6 +282,8 @@ func TestBucketNameValidation(t *testing.T) {
 		"my.bucket.name",
 		"0abc",
 		"a1b",
+		"123",
+		"1.2.3",
 		strings.Repeat("a", 63),
 	}
 	for _, name := range valid {
@@ -303,7 +305,11 @@ func TestBucketNameValidation(t *testing.T) {
 		{"abc-", "连字符结尾"},
 		{"abc..def", "含连续点（与目录遍历语义混淆）"},
 		{"..", "纯目录遍历"},
-		{"192.168.1.1", "全数字与点，与主机名歧义"},
+		{"192.168.1.1", "点分四段 IPv4，与主机名歧义"},
+		{"0.0.0.0", "点分四段 IPv4，与主机名歧义"},
+		{"255.255.255.255", "点分四段 IPv4 边界值"},
+		{"xn--abc", "punycode 前缀为 IDNA 保留"},
+		{"xn--bucket", "punycode 前缀为 IDNA 保留"},
 		{"abc/def", "含斜杠"},
 		{"abc def", "含空格"},
 	}

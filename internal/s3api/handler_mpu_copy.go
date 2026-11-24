@@ -63,18 +63,8 @@ func (s *Server) handleUploadPartCopy(w http.ResponseWriter, r *http.Request, bu
 			Write(w, r, reqID)
 		return
 	}
-	for _, h := range []string{
-		"x-amz-server-side-encryption",
-		"x-amz-server-side-encryption-customer-algorithm",
-		"x-amz-server-side-encryption-aws-kms-key-id",
-		"x-amz-tagging",
-	} {
-		if r.Header.Get(h) != "" {
-			s3err.New(s3err.CodeNotImplemented).
-				WithMessage("分片复制暂不支持 "+h+"。").
-				Write(w, r, reqID)
-			return
-		}
+	if rejectUnsupportedCopyHeaders(w, r, reqID, "分片复制") {
+		return
 	}
 
 	obj, err := s.store.OpenObject(src.Bucket, src.Key)

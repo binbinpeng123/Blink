@@ -1132,9 +1132,6 @@ func (s *Store) ListParts(bucket, key, uploadID string, opt ListPartsOptions) (*
 	}
 
 	res := &ListPartsResult{Upload: *st.Info()}
-	if opt.MaxParts <= 0 {
-		return res, nil
-	}
 
 	entries, err := s.fs.ReadDir(s.multipartPartsDir(uploadID))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -1183,6 +1180,12 @@ func (s *Store) ListParts(bucket, key, uploadID string, opt ListPartsOptions) (*
 	}
 	if !res.IsTruncated {
 		res.NextPartNumberMarker = 0
+	} else if len(res.Parts) == 0 {
+		// max-parts=0 且还有分片：本页没有可回显的分片编号，用请求的
+		// marker 作为下一页起点，至少不倒退。客户端必须改用非零
+		// max-parts 才能推进 —— 返回 IsTruncated=false 才是错的，
+		// 那会把"没让你看"谎报成"没有更多分片"。
+		res.NextPartNumberMarker = opt.PartNumberMarker
 	}
 	return res, nil
 }
