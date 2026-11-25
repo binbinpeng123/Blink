@@ -27,39 +27,6 @@ type copySource struct {
 	Key    string
 }
 
-// unsupportedCopyHeaders 列出复制类请求（CopyObject、UploadPartCopy）中
-// 会改变对象元数据形状、但本版本尚未实现的请求头。
-//
-// 一条列表覆盖 SSE-S3、SSE-KMS、SSE-C 与标签四组：任何一组被静默忽略，
-// 客户端都会以为"对象已加密"或"标签已写入"，而盘上其实还是明文、无标签。
-// 两条复制路径共用同一份列表，避免只补一边造成契约漂移。
-var unsupportedCopyHeaders = []string{
-	"x-amz-server-side-encryption",
-	"x-amz-server-side-encryption-customer-algorithm",
-	"x-amz-server-side-encryption-customer-key",
-	"x-amz-server-side-encryption-customer-key-md5",
-	"x-amz-server-side-encryption-aws-kms-key-id",
-	"x-amz-server-side-encryption-context",
-	"x-amz-tagging",
-	"x-amz-tagging-directive",
-}
-
-// rejectUnsupportedCopyHeaders 在请求带有任一未实现的复制头时写 501 并返回 true。
-//
-// subject 用于错误消息前缀（"复制请求"/"分片复制"），让两个调用点的文案
-// 仍能区分是哪种操作被拒绝。
-func rejectUnsupportedCopyHeaders(w http.ResponseWriter, r *http.Request, reqID, subject string) bool {
-	for _, h := range unsupportedCopyHeaders {
-		if r.Header.Get(h) != "" {
-			s3err.New(s3err.CodeNotImplemented).
-				WithMessage(subject+"暂不支持 "+h+"。").
-				Write(w, r, reqID)
-			return true
-		}
-	}
-	return false
-}
-
 // parseCopySource 解析 `x-amz-copy-source` 头。
 //
 // 头的形状是 `/bucket/key`（也可以不带前导 `/`），key 按 URL 路径规则

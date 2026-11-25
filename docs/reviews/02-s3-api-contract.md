@@ -82,6 +82,28 @@
 | 未实现的子资源（上表显式列出的 `?acl`、`?tagging`、`?versioning` 等） | `501 NotImplemented` |
 | 上述之外的未知查询参数（如 `?x-id=GetObject`、`?foo=bar`） | 按 S3 惯例**忽略**，不影响响应 |
 
+## 未实现能力对应的请求头
+
+除子资源外，还有一批能力**只通过请求头表达**（ACL、标签、Object Lock、服务端加密、网站重定向、对象所有权）。它们不改变路由，只在写请求的头部出现。**只要请求携带这些头，就视为客户端要求了本版本未实现的能力，必须 `501 NotImplemented`，不得静默忽略。** 静默忽略的后果不是"少一个功能"，而是语义降级：带 SSE 的写入以为落盘是密文（实际明文）、带 `x-amz-acl` 的建桶以为桶是私有的（实际是服务端默认权限）——客户端收到的 `200` 与真实状态不符，且这类偏差无法从响应里察觉。
+
+| 请求 | 拒绝的请求头 | 响应 |
+| --- | --- | --- |
+| `PUT /{bucket}`（CreateBucket） | ACL 组、`x-amz-bucket-object-lock-enabled`、`x-amz-object-ownership`、SSE 全组（含默认加密 `x-amz-server-side-encryption`） | `501` |
+| `PUT /{bucket}/{key}`（PutObject）、`POST /{bucket}/{key}?uploads`（CreateMultipartUpload） | ACL 组、`x-amz-tagging`、Object Lock 组、SSE 全组、`x-amz-website-redirect-location` | `501` |
+| `PUT /{bucket}/{key}?partNumber=…`（UploadPart）、`POST /{bucket}/{key}?uploadId=…`（CompleteMultipartUpload） | SSE 全组（分片只能延续 Initiate 的加密设置，而本版本没有加密） | `501` |
+| CopyObject、UploadPartCopy | 上述对象写入组全部，另加 `x-amz-tagging-directive` 与复制源 SSE-C 组 | `501` |
+
+补充约定：
+
+- **ACL 组**：`x-amz-acl`、`x-amz-grant-read`、`x-amz-grant-write`、`x-amz-grant-read-acp`、`x-amz-grant-write-acp`、`x-amz-grant-full-control`。
+- **Object Lock 组**：`x-amz-object-lock-mode`、`x-amz-object-lock-retain-until-date`、`x-amz-object-lock-legal-hold`。
+- **SSE 全组**：`x-amz-server-side-encryption`、`x-amz-server-side-encryption-customer-algorithm`、`x-amz-server-side-encryption-customer-key`、`x-amz-server-side-encryption-customer-key-md5`、`x-amz-server-side-encryption-aws-kms-key-id`、`x-amz-server-side-encryption-context`、`x-amz-server-side-encryption-bucket-key-enabled`。
+- **复制源 SSE-C 组**：`x-amz-copy-source-server-side-encryption-customer-algorithm`、`-customer-key`、`-customer-key-md5`。源对象若真是 SSE-C 加密，少了这三个头也无法解密；本版本没有加密，同样按"未实现能力"拒绝。
+- 检查发生在**读取请求体之前**：拒绝时不得留下对象、桶或分片会话（Initiate 被拒后客户端继续 UploadPart 应得到 `404 NoSuchUpload`）。
+- `x-amz-storage-class` 单独处理（只接受 `STANDARD`，其余 `501`，见各 API 小节），不从属于上表。
+- `x-amz-expected-bucket-owner` 与 `x-amz-request-payer` 属于账户/计费语义，不承诺任何落盘属性，按 S3 兼容实现的惯例**忽略**；忽略不会造成"以为已生效"的降级。
+- 头名大小写不敏感（按 HTTP 语义匹配）。
+
 ## 统一错误体
 
 所有错误响应 `Content-Type: application/xml`：
@@ -143,6 +165,7 @@
 - 成功 `200`，`Location: /{bucket}`。
 - 重复创建同名桶 → `409 BucketAlreadyOwnedByYou`。
 - 桶名校验：长度 3–63，仅 `[a-z0-9.-]`，首尾必须为 `[a-z0-9]`，不含 `..`，不形如 IPv4，不以 `xn--` 开头。
+- 带 ACL 组、`x-amz-bucket-object-lock-enabled`、`x-amz-object-ownership` 或 SSE 头 → `501 NotImplemented`（见「未实现能力对应的请求头」），且**不得创建桶**。
 
 ### HeadBucket / DeleteBucket
 
@@ -167,6 +190,7 @@
 - 响应含 `ETag`、`Last-Modified`；若客户端通过 `x-amz-sdk-checksum-algorithm` 或 `x-amz-checksum-*` 声明算法，**必须回传对应 checksum**。只要回传了 checksum，**必须同时回传 `x-amz-checksum-type`**：单次 PUT 的类型恒为 `FULL_OBJECT`（整段直算），MPU 的 `COMPOSITE` 语义见后文校验和一节。只回校验值不回类型，客户端无法区分两者，也就无法复算。
 - 客户端未声明算法时**不**回传 checksum 头（不能替客户端决定要校验什么）。
 - **用户元数据大小上限**：`x-amz-meta-*` 的键（去掉前缀后）与值的 **UTF-8 字节数总和 ≤ 2048**，超限 → `400 MetadataTooLarge`（与 AWS 一致）。按字节而非字符计数——同样是 1024 个字符，ASCII 占 1 KB、中文占 3 KB，按字符计会让上限形同虚设；也不按 `len` 之外的口径做归一化（键已由 Go 规范化大小写，前缀不计入总和）。超限时**整条请求拒绝、不写入任何对象**，不静默截断：客户端以为元数据完整落盘、读回却少一半，比明确失败更难排查。
+- ACL 组、`x-amz-tagging`、Object Lock 组、SSE 全组、`x-amz-website-redirect-location` → `501 NotImplemented`（见「未实现能力对应的请求头」），且不写入对象。检查先于读请求体，`Expect: 100-continue` 的客户端在发送正文之前就能拿到拒绝。
 - 条件写（在存储层 key 锁内判定，检查与提交之间不插入其他写者）：
   - `If-None-Match: *` 且对象已存在 → `412 PreconditionFailed`。
   - `If-None-Match: "etag"`：当前对象 ETag **等于**给定值 → `412 PreconditionFailed`；不相等或对象不存在 → 放行。服务端按去掉 `W/` 与引号后的值做弱比较。
@@ -262,7 +286,8 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 自复制：源与目标相同且 `COPY` → `400 InvalidRequest`；`REPLACE` 允许，用于原地更新元数据。
 - 大小上限：源对象 > 5 GiB → `400 InvalidRequest`。
 - `x-amz-storage-class` 只接受 `STANDARD`（缺省同义），其余 → `501 NotImplemented`。
-- `x-amz-copy-source-range`、加密/标签相关头部 → `501 NotImplemented`。加密头覆盖 SSE-S3（`x-amz-server-side-encryption`）、SSE-KMS（`-aws-kms-key-id`、`-context`）与 SSE-C（`-customer-algorithm`、`-customer-key`、`-customer-key-md5`）全部形态；标签头覆盖 `x-amz-tagging` 与 `x-amz-tagging-directive`。`UploadPartCopy` 用同一份列表。
+- `x-amz-copy-source-range` **只在 CopyObject 上** → `501 NotImplemented`：分片复制需要独立协议，静默忽略会让客户端以为复制了一部分、实际复制了全部。`UploadPartCopy` 支持该头（见分片上传一节），两条路径的差异仅此一项。
+- 复制操作的 ACL/标签/Object Lock/SSE/网站重定向/复制源 SSE-C 头 → `501`，完整列表见「未实现能力对应的请求头」。`UploadPartCopy` 用同一份列表。
 - 响应：`200` + `<CopyObjectResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyObjectResult>`。
 - 单机模式是 **O(1) 元数据复制**（目标 meta 直接引用源块表，CAS 文件数不变）；集群模式为流式复制（源经 quorum 读、目标经 quorum 写），**不宣称零拷贝**。
 - 客户端注意：aws-cli 的 `s3 cp s3://… s3://…` 在对象超过 `s3.multipart_threshold`（默认 8 MiB）时改用 `UploadPartCopy`，本版本已支持。但 aws-cli 2.36.2 的默认 `--copy-props default` 会在复制前调用 `GetObjectTagging`（本版本 `501`），因此**大对象服务端复制需显式加 `--copy-props none`**；这与 UploadPartCopy 能力无关。
@@ -305,6 +330,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - `UploadId` 使用 `crypto/rand` 生成。
 - `CreateMultipartUpload` 必须持久化客户端声明的 checksum 算法，它决定后续分片与完成的校验行为。
 - `CreateMultipartUpload` 同时持久化 `Content-Type`、`x-amz-meta-*` 与标准 HTTP 元数据（`Cache-Control` 等）到会话状态，`Complete` 时原样写入对象元数据。`x-amz-meta-*` 受 2 KB 上限约束（超限 → `400 MetadataTooLarge`，且**不创建会话**——拒绝后客户端若继续 UploadPart 会得到 `404 NoSuchUpload`，这比"会话建了但元数据被砍"更早暴露问题）。分片请求（`UploadPart`）上的同名头**不参与**对象元数据：一次会话只有一个最终对象，属性只能在 Initiate 时声明一次。
+- Initiate 上的 ACL/标签/Object Lock/SSE/网站重定向头 → `501`，且不创建会话；UploadPart 与 Complete 上的 SSE 头 → `501`（见「未实现能力对应的请求头」）。Complete 被拒时**不消耗会话**，去掉该头后可用同一 `uploadId` 重试。
 - `UploadPart`：`partNumber` 范围 1–10000；除最后一个分片外，每片不小于 5 MiB。
 - `ListParts`（以及 `GetObjectAttributes` 的 `ObjectParts`）的分页语义：`max-parts` 非负整数，`part-number-marker` 非负整数，只返回编号大于 marker 的分片，按编号升序。`max-parts=0` 时本页必为空；此时若仍有分片，`IsTruncated` 必须为 `true`，`NextPartNumberMarker` 回显请求的 marker（客户端须改用非零 `max-parts` 才能推进）——把"没让你看"报成 `IsTruncated=false` 会让客户端以为会话里没有分片。
 - `UploadPartCopy`：与 `UploadPart` 同路由，以 `x-amz-copy-source` 非空为唯一判据分流。支持 `x-amz-copy-source-range: bytes=first-last`（两端必填，不支持开放/后缀/多区间）；缺省复制整个源对象。源条件与 CopyObject 同一套 `x-amz-copy-source-if-*`；源不存在 → `404 NoSuchKey`；区间越界 → `416 InvalidRange` 且带 `Content-Range: bytes */<源大小>`；单次复制 > 5 GiB → `400 InvalidRequest`。响应 `<CopyPartResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyPartResult>`，ETag 按目标分片内容重算，与随后 `ListParts` 一致。

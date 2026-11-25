@@ -19,6 +19,13 @@ import (
 // 一是让 `Expect: 100-continue` 的客户端不必上传完整个大对象才知道被拒，
 // 二是这些错误绝不依赖已写入的数据。
 func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) {
+	// ACL、标签、Object Lock、SSE、网站重定向只通过请求头表达，本版本
+	// 均未实现。必须在解帧与读请求体之前拒绝：这些头与正文无关，
+	// 客户端（Expect: 100-continue）不必上传完整个大对象才知道被拒。
+	if rejectUnsupportedHeaders(w, r, reqID, "上传请求", unsupportedObjectWriteHeaders) {
+		return
+	}
+
 	// aws-chunked 是 SigV4 的流式签名传输：请求体是"长度头 + 数据 + 尾"的
 	// 分块框架，而不是对象的原始字节。不解帧就落盘等于把框架一起存进去 ——
 	// 存的内容是错的，但校验和、ETag 全都"看起来正常"，是最难发现的一类损坏。

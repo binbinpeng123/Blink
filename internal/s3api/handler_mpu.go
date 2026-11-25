@@ -30,6 +30,12 @@ const (
 
 // handleCreateMultipartUpload 处理 POST /{bucket}/{key}?uploads。
 func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) {
+	// 与 PutObject 同一套未实现能力头：会话属性只能在 Initiate 声明一次，
+	// 在这里静默丢弃，后续任何分片都无法补救。
+	if rejectUnsupportedHeaders(w, r, reqID, "分片上传初始化", unsupportedObjectWriteHeaders) {
+		return
+	}
+
 	// 会话级的算法与类型在创建时确定，此后每个分片都必须按它计算 ——
 	// 中途换算法会让 Complete 无从合并校验和。
 	alg, _, algErr := parseChecksumHeaders(r.Header)
@@ -84,6 +90,12 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) {
 	q := r.URL.Query()
 	uploadID := q.Get("uploadId")
+
+	// 分片请求上只可能出现 SSE 头（延续 Initiate 的加密设置），本版本
+	// 没有加密，拒绝先于解帧与读请求体。
+	if rejectUnsupportedHeaders(w, r, reqID, "分片上传", unsupportedPartHeaders) {
+		return
+	}
 
 	// 与 PutObject 同样的理由：aws-chunked 的请求体是分块框架而非对象字节，
 	// 不解帧就落盘会存进错误的内容。解帧后 r.ContentLength 被修正为
@@ -164,6 +176,13 @@ func (s *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, bucket
 // handleCompleteMultipartUpload 处理 POST /{bucket}/{key}?uploadId=X。
 func (s *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) {
 	uploadID := r.URL.Query().Get("uploadId")
+
+	// Complete 上的 SSE 头用于「按客户端密钥完成加密对象」，本版本没有
+	// 加密。拒绝发生在读取请求体与消耗会话之前：去掉该头后客户端可用
+	// 同一 uploadId 重试。
+	if rejectUnsupportedHeaders(w, r, reqID, "完成分片上传", unsupportedPartHeaders) {
+		return
+	}
 
 	// Complete 与 PUT/COPY 的目标是同一个对象，写条件必须同一套语义。
 	// 条件由存储层在提交 meta 的 key 锁内判定，这里只做解析。
