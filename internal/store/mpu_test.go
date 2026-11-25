@@ -207,6 +207,86 @@ func TestUploadPartAdoptsChecksumAlgorithm(t *testing.T) {
 	}
 }
 
+// TestCompleteMultipartLateAdoptionMissingPartChecksum 守住"先传无校验和
+// 分片、后传带校验和分片"的组合。
+//
+// 算法被后置采用后，之前已上传的分片不可能补算出校验和；若客户端把
+// 它们列入 Complete，只能回 4xx 让客户端用同一算法重传。这条路径过去
+// 报 ErrCorrupt（HTTP 500），把客户端混用说成了存储损坏。
+func TestCompleteMultipartLateAdoptionMissingPartChecksum(t *testing.T) {
+	s := openMPUStore(t)
+	const key = "mixed.bin"
+	up := createUpload(t, s, key, "", "")
+
+	p1 := mpuBytes(minPartSize, 0x55)
+	p2 := mpuBytes(777, 0x66)
+	i1 := uploadPart(t, s, key, up.UploadID, 1, p1, UploadPartOptions{})
+	i2 := uploadPart(t, s, key, up.UploadID, 2, p2, UploadPartOptions{
+		ChecksumAlgorithm: checksum.AlgCRC64NVME,
+		Checksum:          sumOf(t, checksum.AlgCRC64NVME, p2),
+	})
+
+	_, err := s.CompleteMultipartUpload("bkt", key, up.UploadID,
+		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, CompleteOptions{})
+	if !errors.Is(err, ErrInvalidChecksum) {
+		t.Fatalf("混用校验和的 Complete 错误 = %v，期望 ErrInvalidChecksum（400）", err)
+	}
+	if errors.Is(err, ErrCorrupt) {
+		t.Fatal("客户端混用不得报成 ErrCorrupt（500）")
+	}
+
+	// 失败不消耗会话：用同一算法补传第 1 片后重试即可完成。
+	i1 = uploadPart(t, s, key, up.UploadID, 1, p1, UploadPartOptions{
+		ChecksumAlgorithm: checksum.AlgCRC64NVME,
+		Checksum:          sumOf(t, checksum.AlgCRC64NVME, p1),
+	})
+	want := append(append([]byte{}, p1...), p2...)
+	full := sumOf(t, checksum.AlgCRC64NVME, want)
+	info, err := s.CompleteMultipartUpload("bkt", key, up.UploadID,
+		[]CompletePart{{1, i1.ETag}, {2, i2.ETag}}, CompleteOptions{DeclaredChecksum: full})
+	if err != nil {
+		t.Fatalf("补传后 Complete 失败: %v", err)
+	}
+	if info.Checksum != full {
+		t.Fatalf("FULL_OBJECT 校验和 = %s，期望 %s", info.Checksum, full)
+	}
+	if !bytes.Equal(readObjectAll(t, s, key), want) {
+		t.Fatal("读回内容与上传内容不一致")
+	}
+}
+
+// TestCompleteMultipartLateAdoptionSubset 验证只列入带校验和的分片完成
+// 同一次上传是合法的：未列出的分片不进入对象，也就不需要校验和。
+//
+// 这条用例同时固定了"采用算法时不去扫描已上传分片"的选择——那样会
+// 误杀这个合法场景。
+func TestCompleteMultipartLateAdoptionSubset(t *testing.T) {
+	s := openMPUStore(t)
+	const key = "subset.bin"
+	up := createUpload(t, s, key, "", "")
+
+	p1 := mpuBytes(minPartSize, 0x77)
+	p2 := mpuBytes(321, 0x88)
+	_ = uploadPart(t, s, key, up.UploadID, 1, p1, UploadPartOptions{})
+	i2 := uploadPart(t, s, key, up.UploadID, 2, p2, UploadPartOptions{
+		ChecksumAlgorithm: checksum.AlgCRC64NVME,
+		Checksum:          sumOf(t, checksum.AlgCRC64NVME, p2),
+	})
+
+	info, err := s.CompleteMultipartUpload("bkt", key, up.UploadID,
+		[]CompletePart{{2, i2.ETag}},
+		CompleteOptions{DeclaredChecksum: sumOf(t, checksum.AlgCRC64NVME, p2)})
+	if err != nil {
+		t.Fatalf("只完成第 2 片失败: %v", err)
+	}
+	if info.Size != int64(len(p2)) {
+		t.Fatalf("对象大小 = %d，期望 %d", info.Size, len(p2))
+	}
+	if !bytes.Equal(readObjectAll(t, s, key), p2) {
+		t.Fatal("读回内容与第 2 片不一致")
+	}
+}
+
 func TestMultipartCompositeChecksum(t *testing.T) {
 	s := openMPUStore(t)
 	// CRC32C 未声明类型：AWS 与 02 文档都默认 COMPOSITE。
