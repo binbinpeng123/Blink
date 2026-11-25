@@ -42,8 +42,6 @@ type FileSystem interface {
 	// WriteFile 是"写临时文件 → fsync → rename"之外的快捷路径，
 	// 仅供不要求原子性的场景（如启动时清扫标记）。
 	WriteFile(path string, data []byte, perm fs.FileMode) error
-	// Truncate 用于预分配块文件。
-	Truncate(path string, size int64) error
 	// Chtimes 更新文件访问/修改时间。
 	//
 	// GC 在提交元数据前刷新所引用块的 mtime，作为"这个块刚被引用过"的
@@ -118,8 +116,6 @@ func (fsys osFS) SyncDir(path string) error {
 func (osFS) WriteFile(path string, data []byte, perm fs.FileMode) error {
 	return os.WriteFile(path, data, perm)
 }
-
-func (osFS) Truncate(path string, size int64) error { return os.Truncate(path, size) }
 
 func (osFS) Chtimes(path string, atime, mtime time.Time) error {
 	return os.Chtimes(path, atime, mtime)

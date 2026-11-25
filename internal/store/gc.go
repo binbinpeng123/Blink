@@ -614,9 +614,9 @@ func (s *Store) cleanTmpResidue(dir string, cutoff time.Time) {
 
 // cleanTmpRoot 清理 tmp/ 下超过保留期的文件。
 //
-// 与 cleanTmpResidue 不同，这里的文件名没有统一后缀（tmpFile 的前缀是
-// 调用方给的 tag），因此按"整目录只放临时文件"的约定整体按年龄清理。
-// 当前写入路径没有使用 tmp/，这里主要回收历史版本与异常路径的残留。
+// 与 cleanTmpResidue 不同，这里的文件名没有统一后缀，因此按
+// "整目录只放临时文件"的约定整体按年龄清理。当前写入路径没有使用 tmp/，
+// 这里主要回收历史版本与异常路径的残留。
 func (s *Store) cleanTmpRoot(cutoff time.Time) {
 	dir := joinPath(s.root, tmpDirName)
 	entries, err := s.fs.ReadDir(dir)

@@ -148,34 +148,6 @@ func (w *atomicWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// WriteAt 实现 io.WriterAt，供随机写入（预分配后回填）使用。
-func (w *atomicWriter) WriteAt(p []byte, off int64) (int, error) {
-	type writerAt interface {
-		WriteAt([]byte, int64) (int, error)
-	}
-	wa, ok := w.f.(writerAt)
-	if !ok {
-		return 0, errors.New("store: 底层文件不支持随机写")
-	}
-	return wa.WriteAt(p, off)
-}
-
-// Truncate 把临时文件预分配到指定长度。
-func (w *atomicWriter) Truncate(size int64) error {
-	type truncater interface{ Truncate(int64) error }
-	t, ok := w.f.(truncater)
-	if !ok {
-		return errors.New("store: 底层文件不支持截断")
-	}
-	// 预分配会改变"已写入字节数"的语义 —— 对固定长度块文件而言，
-	// 长度就是最终长度，因此这里同步更新 written。
-	err := t.Truncate(size)
-	if err == nil && size > w.written {
-		w.written = size
-	}
-	return err
-}
-
 // Size 返回已写入的字节数。
 func (w *atomicWriter) Size() int64 { return w.written }
 
