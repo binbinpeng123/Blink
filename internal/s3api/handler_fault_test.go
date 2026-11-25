@@ -55,18 +55,11 @@ func (f *enospcFS) SyncDir(path string) error { return f.inner.SyncDir(path) }
 func (f *enospcFS) WriteFile(path string, data []byte, perm fs.FileMode) error {
 	return f.inner.WriteFile(path, data, perm)
 }
-func (f *enospcFS) Truncate(path string, size int64) error {
-	return f.inner.Truncate(path, size)
-}
 func (f *enospcFS) Chtimes(path string, atime, mtime time.Time) error {
 	return f.inner.Chtimes(path, atime, mtime)
 }
 
 // enospcFile 在文件句柄上拦截写。
-//
-// 必须显式转发 WriteAt/Truncate/Seek：写入路径会用类型断言判断底层是否
-// 支持随机写与预分配，只嵌一个 ReadWriteCloser 会让断言失败，
-// 测试就会因为"不支持随机写"这种无关错误而变红。
 type enospcFile struct {
 	io.ReadWriteCloser
 	fsys *enospcFS
@@ -77,37 +70,6 @@ func (f *enospcFile) Write(p []byte) (int, error) {
 		return 0, syscall.ENOSPC
 	}
 	return f.ReadWriteCloser.Write(p)
-}
-
-func (f *enospcFile) WriteAt(p []byte, off int64) (int, error) {
-	wa, ok := f.ReadWriteCloser.(io.WriterAt)
-	if !ok {
-		return 0, syscall.EINVAL
-	}
-	if f.fsys.armed.Load() {
-		return 0, syscall.ENOSPC
-	}
-	return wa.WriteAt(p, off)
-}
-
-func (f *enospcFile) Truncate(size int64) error {
-	type truncater interface{ Truncate(int64) error }
-	tr, ok := f.ReadWriteCloser.(truncater)
-	if !ok {
-		return syscall.EINVAL
-	}
-	if f.fsys.armed.Load() {
-		return syscall.ENOSPC
-	}
-	return tr.Truncate(size)
-}
-
-func (f *enospcFile) Seek(offset int64, whence int) (int64, error) {
-	seeker, ok := f.ReadWriteCloser.(io.Seeker)
-	if !ok {
-		return 0, syscall.EINVAL
-	}
-	return seeker.Seek(offset, whence)
 }
 
 // TestDiskFullReturns507InsufficientStorage 验证磁盘满在 HTTP 层的完整契约：

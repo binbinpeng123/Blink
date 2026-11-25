@@ -129,17 +129,6 @@ func detailOf(err, sentinel error) string {
 	return detail
 }
 
-// noSuchBucketIfMissing 把"读取时桶目录不存在"统一归为 NoSuchBucket。
-//
-// 存在的理由：桶元数据缺失与桶目录缺失是两个不同的 errno，
-// 但对客户端而言都是"这个桶不存在"，不该出现两种答复。
-func noSuchBucketIfMissing(err error) error {
-	if errors.Is(err, fs.ErrNotExist) {
-		return store.ErrBucketNotFound
-	}
-	return err
-}
-
 // writeStoreErr 把存储层错误翻译后写给客户端，并记录一条服务端日志。
 //
 // 日志在 5xx 时用 Error 级别、4xx 用 Debug —— 4xx 是客户端用法问题，

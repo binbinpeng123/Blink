@@ -21,7 +21,6 @@ const (
 	opSync     = "sync"
 	opRename   = "rename"
 	opSyncDir  = "syncdir"
-	opTruncate = "truncate"
 )
 
 // errInjected 是注入的通用故障。
@@ -137,13 +136,6 @@ func (f *faultFS) WriteFile(path string, data []byte, perm fs.FileMode) error {
 	return f.inner.WriteFile(path, data, perm)
 }
 
-func (f *faultFS) Truncate(path string, size int64) error {
-	if err := f.step(opTruncate); err != nil {
-		return err
-	}
-	return f.inner.Truncate(path, size)
-}
-
 // Chtimes 直接转发，不参与故障注入：它只服务于 GC 的 mtime 刷新，
 // 失败不会破坏数据正确性（最多让块晚一轮被回收）。
 func (f *faultFS) Chtimes(path string, atime, mtime time.Time) error {
@@ -151,10 +143,6 @@ func (f *faultFS) Chtimes(path string, atime, mtime time.Time) error {
 }
 
 // faultFile 在文件句柄上拦截写与 fsync。
-//
-// 必须显式转发 WriteAt/Truncate/Seek：atomicWriter 用类型断言判断底层文件
-// 是否支持随机写与预分配，嵌入一个只有 Read/Write/Close 的接口会让断言失败，
-// 错误地报告"不支持随机写"。这正是包装层的经典坑。
 type faultFile struct {
 	io.ReadWriteCloser
 	fsys *faultFS
@@ -178,29 +166,6 @@ func (f *faultFile) Sync() error {
 	return nil
 }
 
-func (f *faultFile) WriteAt(p []byte, off int64) (int, error) {
-	wa, ok := f.ReadWriteCloser.(io.WriterAt)
-	if !ok {
-		return 0, errors.New("faultFS: 底层文件不支持随机写")
-	}
-	if err := f.fsys.step(opWrite); err != nil {
-		return 0, err
-	}
-	return wa.WriteAt(p, off)
-}
-
-func (f *faultFile) Truncate(size int64) error {
-	type truncater interface{ Truncate(int64) error }
-	tr, ok := f.ReadWriteCloser.(truncater)
-	if !ok {
-		return errors.New("faultFS: 底层文件不支持截断")
-	}
-	if err := f.fsys.step(opTruncate); err != nil {
-		return err
-	}
-	return tr.Truncate(size)
-}
-
 // SyscallConn 让包装层对"预读提示"透明。
 //
 // setReadahead 通过 syscall.Conn 取 fd。不转发的话，faultFS 上的读路径
@@ -214,6 +179,8 @@ func (f *faultFile) SyscallConn() (syscall.RawConn, error) {
 	return sc.SyscallConn()
 }
 
+// Seek 让包装层对读路径透明：Range 读用类型断言探测 io.Seeker，
+// 不转发会让测试静默走"不能定位"退路，覆盖不到真实路径。
 func (f *faultFile) Seek(offset int64, whence int) (int64, error) {
 	seeker, ok := f.ReadWriteCloser.(io.Seeker)
 	if !ok {
@@ -392,7 +359,7 @@ func TestDiskFullKeepsReadsAndDeletesWorking(t *testing.T) {
 			if err == nil {
 				t.Fatal("磁盘满时写入应失败")
 			}
-			// 错误必须能被识别成 ENOSPC：HTTP 层据此映射 503 SlowDown，
+			// 错误必须能被识别成 ENOSPC：HTTP 层据此映射 507 InsufficientStorage，
 			// 而不是泛化成 500。
 			if !errors.Is(err, syscall.ENOSPC) {
 				t.Fatalf("错误未保留 ENOSPC，实际: %v", err)

@@ -150,11 +150,3 @@ func safeJoin(root string, parts ...string) (string, bool) {
 	}
 	return p, true
 }
-
-// tmpFile 在临时目录下生成一个唯一文件名。
-//
-// 用 CAS 哈希作为前缀是刻意的：临时文件因此可被"清扫时按内容判断是否已被
-// 正式收录"—— 如若同一内容的 CAS 已存在，这个临时文件就是可安全删除的重复品。
-func (s *Store) tmpFile(tag string) string {
-	return joinPath(s.root, tmpDirName, tag+"-"+randHex(16))
-}
