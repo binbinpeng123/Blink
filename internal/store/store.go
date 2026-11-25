@@ -303,7 +303,48 @@ func Open(opt Options) (*Store, error) {
 	if err := s.cleanExpiredUploads(); err != nil {
 		s.cleanupErr = err
 	}
+	// 崩溃恢复第 4 步：自愈必须在对外服务前完成。缺失/损坏的 bucket.json
+	// 会让该桶从 ListBuckets 里消失，而 GC 标记阶段过去复用同一口径，
+	// 会把桶内对象引用的块当孤儿回收。
+	if err := s.healBucketMetas(); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// healBucketMetas 为缺失或损坏的 bucket.json 重建最小元数据。
+//
+// 只读 buckets/ 目录与各桶的 bucket.json，不遍历对象，启动代价与桶数量
+// 而非对象数量相关。目录名必须通过 S3 桶名校验：buckets/ 下出现的
+// 意外目录不应被"治好"成一个可访问的桶。
+func (s *Store) healBucketMetas() error {
+	entries, err := s.fs.ReadDir(joinPath(s.root, bucketsDirName))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fsErr("读取 buckets 目录", bucketsDirName, err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() || validateBucketName(e.Name()) != nil {
+			continue
+		}
+		_, err := s.loadBucketMeta(e.Name())
+		if err == nil {
+			continue
+		}
+		// 只重建"文件没了"与"内容读不懂"。权限/IO 错误重建成一份空元数据
+		// 会把可诊断的故障变成静默覆盖。
+		if !errors.Is(err, ErrBucketNotFound) && !errors.Is(err, ErrCorrupt) {
+			return err
+		}
+		meta := bucketMeta{Name: e.Name(), CreatedAt: s.now().UTC()}
+		if err := s.writeFileAtomic(s.bucketMetaPath(e.Name()), mustJSON(meta)); err != nil {
+			return fsErr("重建桶元数据", e.Name(), err)
+		}
+		s.cacheBucketMeta(e.Name(), &meta)
+	}
+	return nil
 }
 
 // Root 返回数据目录。
