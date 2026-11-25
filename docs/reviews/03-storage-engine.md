@@ -163,6 +163,8 @@
 
 校验放在所有消费方共用的入口，读取、复制、GC 与巡检都不会按"残缺块表"继续作业 —— 否则读路径会少写一段后正常返回，HTTP 层只表现为连接被截断。**边界**：`layout:"ec"` 的结构校验由集群入站（`validateReplicaMeta`）负责，单机读路径不重复校验（08 范围）；LIST 为吞吐只解码部分字段，不做结构校验（解析错误仍然报 `ErrCorrupt`）。
 
+**分片状态校验**：`PartState`（`multipart/<id>/parts/<n>.json`）与对象元数据同样不可信。`loadPartState` 在 JSON 解析后调用 `validatePartState`：版本号、编号范围、`Size`、ETag 为 MD5 hex、块哈希合法且偏移从 0 连续、块总长等于 `Size`、`Deduped` 在块数范围内。不通过即 `ErrCorrupt`，`ListParts` 与 `Complete` 都在源头失败。否则 `Complete` 会把自相矛盾的分片块表照单串接进对象元数据并返回 200，之后每次 GET 才由 `validateParts` 拒绝——错误被推迟到读路径。校验失败**不消耗会话**：状态文件修复后同一 uploadId 仍可完成。该函数同时服务集群入站（`PutPartState`）与 GC，三处口径一致。
+
 ## 崩溃恢复
 
 启动流程设计目标是**与已存对象数量弱相关**，不做全量数据扫描：

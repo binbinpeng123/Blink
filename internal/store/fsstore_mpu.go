@@ -844,6 +844,12 @@ func (s *Store) loadPartState(uploadID string, partNumber int) (*PartState, erro
 		return nil, fmt.Errorf("%w: 分片 %d 的状态文件声称为 %d",
 			ErrCorrupt, partNumber, ps.PartNumber)
 	}
+	// 与对象元数据的取舍相同：本地状态文件也不信任。块表长度/偏移/哈希
+	// 一旦被改坏，Complete 会照单全收并提交一份之后每次 GET 都报损坏的
+	// 对象——错误被推迟到读路径，而不是在源头响亮失败。
+	if err := validatePartState(&ps); err != nil {
+		return nil, fmt.Errorf("%w: 分片 %d 状态不自洽: %v", ErrCorrupt, partNumber, err)
+	}
 	return &ps, nil
 }
 
