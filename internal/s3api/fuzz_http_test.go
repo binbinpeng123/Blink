@@ -46,6 +46,7 @@ var fuzzHTTPAllowedStatuses = map[int]bool{
 	http.StatusPartialContent:               true, // 206 Range
 	http.StatusTemporaryRedirect:            true, // 307 仅来自 ServeMux 的路径规范化（保留方法）
 	http.StatusNotModified:                  true, // 304 条件请求
+	http.StatusSeeOther:                     true, // 303 POST Object success_action_redirect
 	http.StatusBadRequest:                   true, // 400
 	http.StatusForbidden:                    true, // 403
 	http.StatusNotFound:                     true, // 404
@@ -144,6 +145,13 @@ func FuzzServeHTTP(f *testing.F) {
 				"x-amz-decoded-content-length: 5\n",
 			"5\r\nhello\r\n0\r\n\r\n"},
 		{"深层键", http.MethodPut, "/bkt/a/b/c.txt", "", "", "deep"},
+		{"POST 表单直传", http.MethodPost, "/bkt", "",
+			"Content-Type: multipart/form-data; boundary=blinkfuzz\n",
+			"--blinkfuzz\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nfuzz-post.txt\r\n" +
+				"--blinkfuzz\r\nContent-Disposition: form-data; name=\"policy\"\r\n\r\n" +
+				"eyJleHBpcmF0aW9uIjoiMjA5OS0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbWyJlcSIsIiRrZXkiLCJmdXp6LXBvc3QudHh0Il1dfQ==\r\n" +
+				"--blinkfuzz\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f.bin\"\r\n" +
+				"Content-Type: application/octet-stream\r\n\r\npayload\r\n--blinkfuzz--\r\n"},
 		{"健康检查", http.MethodGet, "/healthz", "", "", ""},
 		{"版本端点", http.MethodGet, "/version", "", "", ""},
 		{"指标端点", http.MethodGet, "/metrics", "", "", ""},

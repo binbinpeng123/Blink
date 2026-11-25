@@ -54,7 +54,16 @@ type PutOptions struct {
 	// S3 要求单次 PUT 必须声明长度，负值一律拒绝：边读边写时"长度未知"
 	// 既没法提前拒绝超大请求，也没法判断请求体是否被截断 ——
 	// 而后者正是 ErrIncompleteBody 要守的那道关。
+	//
+	// UnknownSize 是唯一的例外：POST Object 走 multipart/form-data，
+	// 整体请求没有可用的 Content-Length（文件部分长度要读到才知），
+	// 调用方显式声明"长度未知"后才放行。此时长度校验由调用方的
+	// 读取器负责（超限立即报错），截断由 multipart 解析器以
+	// io.ErrUnexpectedEOF 暴露，二者都发生在 meta 落盘之前。
 	ExpectedSize int64
+	// UnknownSize 表示 ExpectedSize 未知（POST Object 表单上传）。
+	// 与 ExpectedSize < 0 配合使用；其余写路径不得置位。
+	UnknownSize bool
 	// LateChecksum 在请求体读完后才可用（HTTP trailer 里的校验和）。
 	// 第二个返回值为 false 表示客户端没有通过 trailer 声明。
 	//
@@ -165,7 +174,7 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 	if err := s.checkWriteAllowed(); err != nil {
 		return nil, err
 	}
-	if opt.ExpectedSize < 0 {
+	if opt.ExpectedSize < 0 && !opt.UnknownSize {
 		return nil, fmt.Errorf("%w: 缺少 Content-Length", ErrIncompleteBody)
 	}
 
@@ -204,7 +213,8 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 		res        *streamResult
 		inlineData []byte
 	)
-	if s.inlineObjectMax > 0 && opt.ExpectedSize > 0 && opt.ExpectedSize <= s.inlineObjectMax {
+	// 长度未知时无法预读判界，跳过内联快路径，直接流式写入。
+	if !opt.UnknownSize && s.inlineObjectMax > 0 && opt.ExpectedSize > 0 && opt.ExpectedSize <= s.inlineObjectMax {
 		prefix, rerr := io.ReadAll(io.LimitReader(body, opt.ExpectedSize+1))
 		if rerr != nil {
 			return nil, fsErr("读取请求体", key, rerr)
@@ -234,7 +244,8 @@ func (s *Store) PutObject(bucket, key string, body io.Reader, opt PutOptions) (*
 
 	// 长度校验必须在写 meta.json 之前：此刻失败只会留下孤儿块（可回收），
 	// 一旦 meta 落盘，客户端就会看到一个"长度不对但确实存在"的对象。
-	if total != opt.ExpectedSize {
+	// UnknownSize 时没有可比的声明值，读到的字节数就是对象长度。
+	if !opt.UnknownSize && total != opt.ExpectedSize {
 		return nil, fmt.Errorf("%w: 收到 %d 字节，Content-Length 声明 %d",
 			ErrIncompleteBody, total, opt.ExpectedSize)
 	}

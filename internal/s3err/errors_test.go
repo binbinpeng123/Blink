@@ -46,6 +46,9 @@ func TestTableMatchesContract(t *testing.T) {
 		CodeLengthRequired:               http.StatusLengthRequired,
 		CodeNoSuchCORSConfiguration:      http.StatusNotFound,
 		CodeAccessForbidden:              http.StatusForbidden,
+		CodeMalformedPOSTRequest:         http.StatusBadRequest,
+		CodeInvalidPolicyDocument:        http.StatusBadRequest,
+		CodeEntityTooLarge:               http.StatusBadRequest,
 	}
 
 	if len(table) != len(want) {

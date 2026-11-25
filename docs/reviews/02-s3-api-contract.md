@@ -63,6 +63,14 @@
 | 23 | `POST` | `/{bucket}?delete` | DeleteObjects（单次最多 1000 个） |
 | 24 | `GET` | `/{bucket}/{key}?attributes` | GetObjectAttributes（按需返回 ETag/Checksum/ObjectParts/ObjectSize/StorageClass） |
 
+### 表单上传（独立切片）
+
+| # | 方法 | 路径 | 说明 |
+| --- | --- | --- | --- |
+| 25 | `POST` | `/{bucket}`（`Content-Type: multipart/form-data`） | POST Object（浏览器/移动端表单直传，SigV4 POST policy） |
+
+**为什么需要 POST Object**：浏览器与移动端 SDK 通常无法在每次上传前调用后端换取预签名 URL，而是由后端签发一份**策略文档**（policy）连同签名一起下发给客户端，客户端用普通 HTML 表单即可直传。这条路径不经过前端代理，也不会把长期凭据发到客户端；在边缘推理场景里（端侧采集设备直接把样本/权重推上去）是成本最低的上传方式。它只写单个对象，与 PutObject 共享存储路径，因此拆为独立切片，不阻塞前者。
+
 ## 明确不支持的接口
 
 **必须显式返回 `501 NotImplemented`，不得落到泛化的 404 或 500。**
@@ -77,6 +85,7 @@
 | `GET /{bucket}?policyStatus` | `501 NotImplemented`（未实现的桶属性查询，**不得**回落为列举桶） |
 | 任意方法 `/{bucket}/{key}?versionId=...` | `501 NotImplemented`（本版本无多版本） |
 | 非 `GET /{bucket}?location` | `405 MethodNotAllowed` |
+| `POST /{bucket}` 且 `Content-Type` 不是 `multipart/form-data`（且不带 `?delete`） | `501 NotImplemented`（不猜测意图；`?delete` 仍走 DeleteObjects） |
 | `PUT`/`GET`/`DELETE /{bucket}/{key}?cors`（对象级 CORS，S3 无此语义） | `501 NotImplemented` |
 | Range 请求含多个区间（逗号分隔） | `501 NotImplemented` |
 | 未实现的子资源（上表显式列出的 `?acl`、`?tagging`、`?versioning` 等） | `501 NotImplemented` |
@@ -134,7 +143,10 @@
 | `InvalidRange` | 416 | Range 超出对象范围 |
 | `InvalidPartNumber` | 416 | 请求的 `partNumber` 在对象中不存在（或非分片对象请求 `partNumber > 1`） |
 | `NoSuchUpload` | 404 | 分片上传不存在或已中止 |
-| `EntityTooSmall` | 400 | 分片小于最小允许值 |
+| `EntityTooSmall` | 400 | 分片小于最小允许值；POST Object 表单内容低于 `content-length-range` 下限 |
+| `EntityTooLarge` | 400 | POST Object 表单内容超过 `content-length-range` 上限 |
+| `MalformedPOSTRequest` | 400 | POST Object 请求体不是合法的 `multipart/form-data`（含缺少 `file` 字段、`file` 不是最后一个字段、字段重复） |
+| `InvalidPolicyDocument` | 400 | POST policy 文档不是合法 JSON、缺少 `expiration`/`conditions`、或条件元素语法非法 |
 | `InvalidPart` | 400 | 分片不存在或 ETag 不匹配 |
 | `InvalidPartOrder` | 400 | 分片序号未升序 |
 | `BadDigest` | 400 | `Content-MD5` 或 checksum 不匹配 |
@@ -221,6 +233,75 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - ETag、`Content-MD5`、对象校验和全部按**解帧后**的内容计算。PutObject 与 UploadPart 走同一条解帧路径。
 
 **已用 aws-cli 2.36.2 实测核实**（HTTPS，2026-10-24）：`s3 cp` 与 `s3api put-object` 均发送 `STREAMING-UNSIGNED-PAYLOAD-TRAILER`，`X-Amz-Trailer: x-amz-checksum-crc32` 或 `x-amz-checksum-crc64nvme`；20 MiB 多分片上传的 3 个 UploadPart 全部走该路径（服务端日志 `signed:false`），下载后逐字节比对一致；显式 `--checksum-algorithm CRC32` 上传的 trailer 值与本地 `zlib.crc32` 一致。**签名分块模式仅有独立的签名向量单测，尚无真实客户端验证**。
+
+### POST Object `POST /{bucket}`（`multipart/form-data`）
+
+浏览器/移动端表单直传。请求不是 XML/JSON，而是 `multipart/form-data`：普通字段承载签名与元数据，最后一个名为 `file` 的 part 是对象内容。
+
+**路由与解析**
+
+- 桶级 `POST` 且 `Content-Type` 为 `multipart/form-data` → 本操作；带 `?delete` 仍走 DeleteObjects（`?delete` 优先）；其余桶级 POST → `501 NotImplemented`。
+- `Content-Type` 的 boundary 缺失或非法 → `400 MalformedPOSTRequest`。字段名按小写匹配（`File`、`policy` 等价）。
+- 同名普通字段出现多次 → `400 MalformedPOSTRequest`（无法判断哪一个是权威值）。单个字段值上限 64 KiB、普通字段总数上限 64，超限 → `400 MalformedPOSTRequest`。
+- `file` 必须是**最后一个** part；其后还有 part → `400 MalformedPOSTRequest`。缺少 `file` → `400 MalformedPOSTRequest`。文件内容长度无法预先得知（multipart 没有整体 `Content-Length` 契约），因此存储层以"未知长度"写入，不要求 `Content-Length`。
+
+**鉴权：SigV4 POST policy**
+
+表单必须携带 `x-amz-algorithm`（恒为 `AWS4-HMAC-SHA256`）、`x-amz-credential`、`x-amz-date`、`policy`（base64）、`x-amz-signature`。
+
+- 签名对象是 **base64 编码后的 policy 字符串本身**：`hex(HMAC-SHA256(signingKey(secret, dateStamp, region, "s3"), base64Policy))`。先解码再签名是最常见的实现错误，此处明确。
+- `x-amz-credential` 格式与 Authorization 头一致（`AKID/dateStamp/region/s3/aws4_request`），其 dateStamp 必须等于 `x-amz-date` 的日期部分；`region` 必须等于服务端区域；Access Key 必须存在。任一不符 → `400 AuthorizationHeaderMalformed`（格式类）或 `403`（`SignatureDoesNotMatch` / `InvalidAccessKeyId`），与头部签名同一套错误码与状态码。
+- POST policy 自带 `expiration`，**不叠加** 15 分钟时钟容差：`x-amz-date` 只用于派生签名密钥，请求是否有效由 policy 的 `expiration` 决定。因此离线签发、稍后上传的流程可用。
+- 未带任何签名字段 → `403 AccessDenied`（与缺少签名头的普通请求一致）。
+
+**Policy 文档**
+
+`policy` 是 base64 编码的 JSON，解码后 ≤ 20 KiB（与 AWS 一致），结构：
+
+```json
+{
+  "expiration": "2026-11-25T12:00:00Z",
+  "conditions": [
+    {"bucket": "models"},
+    ["starts-with", "$key", "weights/"],
+    ["eq", "$Content-Type", "application/octet-stream"],
+    ["content-length-range", 0, 1048576],
+    {"x-amz-meta-origin": "edge"}
+  ]
+}
+```
+
+- 非法 JSON、未知顶层字段、缺少 `expiration` 或 `conditions` → `400 InvalidPolicyDocument`。
+- `expiration` 为 RFC3339 时间；已过期 → `403 AccessDenied`，消息 `Invalid according to Policy: Policy expired.`。
+- 条件支持四种形式：`{"field": "value"}`（等价 `eq`）、`["eq", "$field", "value"]`、`["starts-with", "$field", "prefix"]`、`["content-length-range", min, max]`。其它形式或元素个数不符 → `400 InvalidPolicyDocument`。
+- 字段名以小写比较，可带 `$` 前缀也可不带；**值区分大小写**，按精确匹配（`starts-with` 按前缀）。字段不存在时按空串参与匹配。
+- `${filename}` 占位符在**表单值**与**条件值**两侧同时替换为 `file` part 的文件名后才比较，用于约束"文件名必须以某前缀开头"这类策略。
+- **覆盖规则**：除 `file`、`policy`、`x-amz-signature` 与 `x-ignore-*` 外，表单里出现的每个字段都必须被某条条件覆盖；未被覆盖 → `403 AccessDenied`，消息 `Invalid according to Policy: Extra input fields: <field>`（与 AWS 一致）。缺字段不算失败——条件只要求"若出现则匹配"。。
+- `key` 必须出现在表单中且被条件覆盖，否则同样按条件失败拒绝；空 `key` → `400 InvalidArgument`。
+- 表单出现 `bucket` 字段时必须等于 URL 中的 bucket，否则条件失败（表单与 URL 指向不同桶会让"签给 A 桶上传到 B 桶"成立）。
+- `content-length-range` 同时约束上下限：内容超过上限 → `400 EntityTooLarge`；低于下限 → `400 EntityTooSmall`。判定在流式写入过程中进行，超限时立即中止，不写入任何对象。
+
+**元数据与校验和**
+
+- 表单中的 `Content-Type`、`Cache-Control`、`Content-Disposition`、`Content-Encoding`、`Content-Language`、`Expires` 与 `x-amz-meta-*` 按与 PutObject 相同的规则落盘；`x-amz-meta-*` 同样受 2 KB 上限约束（超限 → `400 MetadataTooLarge`）。
+- 对象 `Content-Type` 依次取表单 `Content-Type`、`file` part 自带的 `Content-Type`、默认 `application/octet-stream`。
+- `x-amz-checksum-<alg>` 表单字段按 PutObject 的校验和语义校验并回传，同时回传 `x-amz-checksum-type: FULL_OBJECT`。
+- 不支持表单字段 `Content-MD5`（没有任何浏览器表单会生成它，支持它只会扩大攻击面）：出现即 `400 InvalidArgument`。
+
+**未实现能力字段**
+
+表单字段等价于请求头。下列字段出现 → `501 NotImplemented`，且**在读 file 内容之前**拒绝，不留下对象：`acl`、ACL 授权组（`x-amz-grant-*`）、`tagging`、Object Lock 组（`x-amz-object-lock-*`）、SSE 组（`x-amz-server-side-encryption*`）、`x-amz-website-redirect-location`、`redirect`、`x-amz-security-token`（本版本无 STS）、非 `STANDARD` 的 `x-amz-storage-class`。SigV2 字段 `AWSAccessKeyId`/`signature` 同样 `501`（不支持 SigV2 签名，静默按 SigV4 失败会让老客户端误以为是密钥问题）。
+
+**响应**
+
+- 默认 `204 No Content`，带 `ETag`（带引号）、`Last-Modified` 与相对 `Location: /{bucket}/{urlencoded key}`。
+- `success_action_status`：
+  - `200` → `200` 空体；
+  - `201` → `201`，体为 `<PostResponse><Location>…</Location><Bucket>…</Bucket><Key>…</Key><ETag>…</ETag></PostResponse>`，`Content-Type: application/xml; charset=utf-8`；
+  - `204`（默认）→ `204` 空体；
+  - 其它值 → `400 InvalidArgument`（不静默回落默认值，否则客户端按自己设定的状态码分支会走错）。
+- `success_action_redirect`：合法 `http`/`https` 绝对 URL 时返回 `303 See Other` + `Location`（附加查询参数 `bucket`、`key`、`etag`，`etag` 不带引号），**优先于** `success_action_status`；值非法 → `400 InvalidArgument`。不校验 URL 主机（这是调用方自己的页面），只拒绝非 http(s) scheme 与无法解析的值。
+- 失败时响应体与其它 API 一致（S3 XML 错误体），但浏览器表单拿不到正文，诊断依赖 `x-amz-request-id` 头。
 
 ### GetObject / HeadObject
 
