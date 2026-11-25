@@ -88,3 +88,49 @@ func chunkName(n int) string {
 		return "chunk_8KiB"
 	}
 }
+
+// hashBenchTotal 是一次迭代的逻辑字节数；缓冲取 64 MiB 重复 16 次，
+// 与 05 文档的 /1GiB 口径一致，又不必为基准单独分配 1 GiB 常驻内存。
+const (
+	hashBenchTotal = 1 << 30
+	hashBenchBuf   = 64 << 20
+)
+
+// benchSumThroughput 测量对象级校验和接口的吞吐。
+//
+// 刻意走 New 返回的 Sum 而不是直接拿 crc32/crc64 句柄：真实写入路径
+// 就是经这个接口逐块喂数据，接口分派属于校验开销的一部分。每轮新建
+// 一个 Sum（它不支持 Reset），与每个对象独立的真实调用形态一致。
+func benchSumThroughput(b *testing.B, alg Algorithm) {
+	buf := make([]byte, hashBenchBuf)
+	for i := range buf {
+		buf[i] = byte(i*31 + i>>8)
+	}
+
+	b.SetBytes(hashBenchTotal)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sum, ok := New(alg)
+		if !ok {
+			b.Fatalf("算法 %s 不可用", alg)
+		}
+		for off := 0; off < hashBenchTotal; off += len(buf) {
+			if _, err := sum.Write(buf); err != nil {
+				b.Fatalf("Write 失败: %v", err)
+			}
+		}
+		_ = sum.Encoded()
+	}
+}
+
+// BenchmarkCRC64NVME 量化默认对象级校验和的开销（aws-cli 默认算法）。
+func BenchmarkCRC64NVME(b *testing.B) {
+	b.Run("1GiB", func(b *testing.B) { benchSumThroughput(b, AlgCRC64NVME) })
+}
+
+// BenchmarkCRC32C 是 CRC64NVME 的对照组：同一份数据、同一个接口，
+// 只换算法，用来判断差异来自实现还是来自数据本身。
+func BenchmarkCRC32C(b *testing.B) {
+	b.Run("1GiB", func(b *testing.B) { benchSumThroughput(b, AlgCRC32C) })
+}

@@ -7,6 +7,8 @@ package bench
 import (
 	"bytes"
 	"io"
+	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/binbinpeng123/Blink/internal/store"
@@ -69,6 +71,56 @@ func benchmarkGetRangeSequential(b *testing.B, s *store.Store) {
 			b.Fatalf("WriteRangeTo(%d) 失败: %v", offset, err)
 		}
 		offset += rangeSize
+	}
+}
+
+// BenchmarkConcurrentGet 测量多并发整对象 GET 的聚合吞吐（05 文档的
+// 4/16/64 三档）。对象预写一次，每轮每个 worker 各读一遍完整对象。
+//
+// 与 BenchmarkConcurrentPut1MiB 同构：并发度固定、每轮 b.N 次迭代，
+// 好让"并发提升吞吐"能被直接量化。对象取 16 MiB —— 足够跨多个 4 MiB
+// 块以覆盖逐块循环，又不至于让 64 worker 的一轮读放大成 GB 级内存带宽
+// 争用。首轮之后数据在页缓存里，因此量到的是存储读路径而非磁盘冷读；
+// 冷缓存对照需要逐次清页缓存，不在本机基准能力范围内（见 09 文档）。
+func BenchmarkConcurrentGet(b *testing.B) {
+	const size = 16 << 20
+	s := openBenchStore(b)
+	if _, err := s.PutObject("bench", "concurrent-get.bin", bytes.NewReader(benchBody(size)), store.PutOptions{
+		ExpectedSize: size,
+	}); err != nil {
+		b.Fatalf("预写基准对象失败: %v", err)
+	}
+
+	for _, workers := range []int{4, 16, 64} {
+		b.Run(strconv.Itoa(workers), func(b *testing.B) {
+			b.SetBytes(int64(size) * int64(workers))
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				var wg sync.WaitGroup
+				errs := make(chan error, workers)
+				for w := 0; w < workers; w++ {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						r, err := s.OpenObject("bench", "concurrent-get.bin")
+						if err != nil {
+							errs <- err
+							return
+						}
+						if err := r.WriteRangeTo(io.Discard, 0, size); err != nil {
+							errs <- err
+						}
+					}()
+				}
+				wg.Wait()
+				close(errs)
+				for err := range errs {
+					b.Fatalf("并发 GET 失败: %v", err)
+				}
+			}
+		})
 	}
 }
 

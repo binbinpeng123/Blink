@@ -456,7 +456,11 @@ go test ./test/bench/ -run '^$' -bench 'BenchmarkHTTPGetObject' -benchtime=60x -
 go test ./internal/s3api/ -run 'TestStatusRecorderReadFrom|TestGetObjectStreamsThroughReaderFrom|TestGetObjectCountsResponseBytesOnce' -count=1
 go test ./test/bench/ -run '^$' -bench 'BenchmarkGetRangeSequential' -benchtime=200ms -count=2
 go test ./test/bench/ -run '^$' -bench 'BenchmarkConcurrentPut1MiB' -benchtime=200ms -count=2
+go test ./test/bench/ -run '^$' -bench 'BenchmarkConcurrentGet' -benchtime=1s -count=2
 go test ./test/bench/ -run '^$' -bench 'BenchmarkList100kObjects' -benchtime=1x -count=1
+
+go test ./internal/checksum/ -run '^$' -bench 'BenchmarkCRC64NVME|BenchmarkCRC32C' -benchtime=1s
+go test ./internal/sigv4/ -run '^$' -bench 'BenchmarkSigV4Verify' -benchtime=1s
 
 go test ./internal/store/ -run 'TestInline' -count=1
 go test ./internal/store/ -run '^$' -bench 'Benchmark(Put|Get|List)Small' -benchtime=200x -count=3

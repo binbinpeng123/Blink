@@ -330,7 +330,27 @@ BenchmarkSigV4Verify                       签名开销
 8 MiB 并入 16 MiB 档（16 MiB 同样跨 4 个 4 MiB 块）；128 MiB / 1 GiB 受
 "本机压测总写入 ≤ 512 MiB"约束未执行，不得写成已通过。上表中
 `BenchmarkGetRangeRandom/1GiB`、`BenchmarkDedupSecondCopy/1GiB`、
-`BenchmarkCompleteMultipart20GB` 目前仍是**计划项**，未实现为可执行基准。
+`BenchmarkCompleteMultipart20GB` 目前仍是**计划项**，未实现为可执行基准
+（三者都需要 1 GiB / 20 GiB 级写入预置，超出本机写入预算；实现时必须先解决
+低写入量的预置方式，否则不得声称已通过）。
+
+**2026-11-25 补齐**（Apple M4 / APFS，`-benchtime=3s`，只作本机回归基线）：
+
+| 基准 | 结果 | 说明 |
+| --- | --- | --- |
+| `BenchmarkConcurrentGet/4` | 20.8 GB/s，3.23 ms/轮 | 16 MiB 对象 × 4 worker 整对象读，页缓存热态 |
+| `BenchmarkConcurrentGet/16` | 12.2 GB/s，22.0 ms/轮 | 同上 × 16 worker |
+| `BenchmarkConcurrentGet/64` | 11.7 GB/s，91.8 ms/轮 | 同上 × 64 worker；64 并发不再带来吞吐增益，瓶颈转到内存带宽 |
+| `BenchmarkCRC64NVME/1GiB` | 1.76 GB/s | 走 `checksum.Sum` 接口，64 MiB 缓冲重复 16 次（内存内，无落盘） |
+| `BenchmarkCRC32C/1GiB` | 9.57 GB/s | 对照组，ARMv8 CRC 指令；差约 5.4×，即软件表 CRC64 的代价 |
+| `BenchmarkSigV4Verify/header` | 3.3 µs，62 allocs/op | 每个请求都走的前置开销 |
+| `BenchmarkSigV4Verify/presigned` | 4.3 µs，105 allocs/op | 查询串解析与过期检查的增量 |
+
+`BenchmarkConcurrentGet` 位于 `test/bench/read_bench_test.go`，只读不写（预写一次
+16 MiB 对象）；`BenchmarkCRC64NVME`/`BenchmarkCRC32C` 位于
+`internal/checksum/bench_test.go`，纯内存；`BenchmarkSigV4Verify` 位于
+`internal/sigv4/bench_test.go`，复用测试向量里的签名请求。三者默认都不随
+`go test ./...` 运行（无 `-bench` 时跳过）。
 
 `BenchmarkHTTPGetObject` 已于 2026-11-24 实现（`test/bench/http_read_bench_test.go`），
 补齐"存储读路径"与"HTTP 写出路径"之间的缺口：其余 GET 基准把响应写进
@@ -345,7 +365,7 @@ BenchmarkSigV4Verify                       签名开销
 115.7 objects/s。结论与本版本不做 D 的理由见 03 文档。该基准单次迭代写入
 10 MiB，满足本机压测写入约束；默认不随 `go test ./...` 运行（无 `-bench` 时跳过）。
 
-每个基准使用 `b.ReportAllocs()` 与 `b.SetBytes(n)` 输出吞吐，并额外用 `b.ReportMetric` 记录每操作写入字节数 —— 使创新 A 与 B 的验收（写入量不增长）能被基准直接断言，而不依赖人工观察。
+每个基准使用 `b.ReportAllocs()` 与 `b.SetBytes(n)` 输出吞吐。**每操作写入字节数**（`ReportMetric`）目前仍是**计划项**：它需要给 `store.FileSystem` 套一层计数包装，现有基准尚未接入，因此创新 A 与 B 的"写入量不增长"目前只能靠代码审查，不能靠基准直接断言。
 
 ## 验收门槛
 
