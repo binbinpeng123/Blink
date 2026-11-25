@@ -232,7 +232,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 - 解帧后从 `Content-Encoding` 中移除 `aws-chunked`，保留其它编码（如 `gzip`），避免元数据里残留一个已被消除的编码。
 - ETag、`Content-MD5`、对象校验和全部按**解帧后**的内容计算。PutObject 与 UploadPart 走同一条解帧路径。
 
-**已用 aws-cli 2.36.2 实测核实**（HTTPS，2026-10-24）：`s3 cp` 与 `s3api put-object` 均发送 `STREAMING-UNSIGNED-PAYLOAD-TRAILER`，`X-Amz-Trailer: x-amz-checksum-crc32` 或 `x-amz-checksum-crc64nvme`；20 MiB 多分片上传的 3 个 UploadPart 全部走该路径（服务端日志 `signed:false`），下载后逐字节比对一致；显式 `--checksum-algorithm CRC32` 上传的 trailer 值与本地 `zlib.crc32` 一致。**签名分块模式仅有独立的签名向量单测，尚无真实客户端验证**。
+**已用 aws-cli 2.36.2 实测核实**（HTTPS，2026-10-24）：`s3 cp` 与 `s3api put-object` 均发送 `STREAMING-UNSIGNED-PAYLOAD-TRAILER`，`X-Amz-Trailer: x-amz-checksum-crc32` 或 `x-amz-checksum-crc64nvme`；20 MiB 多分片上传的 3 个 UploadPart 全部走该路径（服务端日志 `signed:false`），下载后逐字节比对一致；显式 `--checksum-algorithm CRC32` 上传的 trailer 值与本地 `zlib.crc32` 一致。**签名分块模式**：已有独立实现的签名向量单测，以及 `internal/s3api/chunked_signed_test.go` 中在包内另写一套 SigV4/块签名链的端到端测试（`05` 文档）；**尚无真实客户端验证**。
 
 ### POST Object `POST /{bucket}`（`multipart/form-data`）
 

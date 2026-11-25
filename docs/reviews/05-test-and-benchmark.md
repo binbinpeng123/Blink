@@ -271,7 +271,15 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 - `s3 sync` 目录往返（含 2.9 MiB 随机二进制）`diff -r` 无差异。
 - `s3api put-object --checksum-algorithm CRC32` 回传的校验和与本地 `zlib.crc32` 一致，证明 trailer 校验和是在**解帧后**内容上计算的。
 - 服务端 debug 日志确认每个 PutObject/UploadPart 都进入解帧路径（`aws_chunked_decoded`，`signed:false`，trailer 为 `x-amz-checksum-crc32`/`crc64nvme`）。
-- **未覆盖**：签名分块（真实 aws-cli 不发送）、生产 CA、TLS 证书轮换。这些不得写成已通过。
+- **未覆盖**：生产 CA、TLS 证书轮换。这些不得写成已通过。签名分块的端到端覆盖见下节（真实 aws-cli 不发送该形态）。
+
+**签名分块端到端**（`internal/s3api/chunked_signed_test.go`，2026-11-25）：`sigv4` 包原有解帧与签名单测复用了产品代码的私有函数（`canonicalTrailer`、`stringToSign`），同错同对；本用例在 `s3api` 包内**独立实现** SigV4 头部签名与块签名链，走完整链路（鉴权中间件 → `decodeChunkedBody` → 存储）：
+
+- `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` 多块 PUT → 200，ETag 为内容 MD5，签名 GET 回读逐字节一致。
+- `...-PAYLOAD-TRAILER` + `x-amz-checksum-crc32`：回传校验和与内容一致；trailer 值伪造（签名链本身合法）→ 400 `BadDigest`。
+- 篡改任一块 `chunk-signature` → 403 `SignatureDoesNotMatch`，对象未落盘（GET 404）；篡改 `x-amz-trailer-signature` → 403。
+- 块链断裂（第二块仍以 seed 为 prev）→ 403；`x-amz-decoded-content-length` 与实际解帧长度不符 → 400 `InvalidArgument`。
+- 鉴权关闭（无 `ChunkSigner`）时签名分块请求 → 500 `InternalError`，绝不跳过验签继续落盘。
 
 **信任链与 TLS 策略**（`test/integration/tls_test.go`，2026-11-25）：测试现场用 ECDSA P-256 生成本地 CA 与服务器证书（SAN `DNS:localhost,IP:127.0.0.1`），客户端**只信任该 CA**，不再使用 `--no-verify-ssl`：
 
