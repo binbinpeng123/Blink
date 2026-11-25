@@ -183,18 +183,7 @@ func FuzzServeHTTP(f *testing.F) {
 			path = "/" + path
 		}
 
-		req := &http.Request{
-			Method:        method,
-			URL:           &url.URL{Path: path, RawQuery: rawQuery},
-			Header:        parseFuzzHeaderBlock(headerBlock),
-			Body:          io.NopCloser(strings.NewReader(body)),
-			ContentLength: int64(len(body)),
-			Host:          "blink.test",
-			RemoteAddr:    "127.0.0.1:1234",
-			Proto:         "HTTP/1.1",
-			ProtoMajor:    1,
-			ProtoMinor:    1,
-		}
+		req := newFuzzRequest(method, path, rawQuery, headerBlock, body)
 
 		// recoverPanic 中间件应当兜住 handler 内的 panic 并转成 500；
 		// 这里兜的是中间件自身（withRequestContext 等）的 panic —— 那说明
@@ -210,60 +199,84 @@ func FuzzServeHTTP(f *testing.F) {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 
-		if !fuzzHTTPAllowedStatuses[rec.Code] {
-			t.Fatalf("状态码 %d 不在契约集合内：method=%q path=%q query=%q headers=%q body=%q response=%q",
-				rec.Code, method, path, rawQuery, headerBlock, body, rec.Body.String())
-		}
-		if id := rec.Header().Get(headerRequestID); id == "" {
-			t.Fatalf("响应缺少 %s：method=%q path=%q code=%d",
-				headerRequestID, method, path, rec.Code)
-		}
-		if got := rec.Header().Get(headerServer); got != serverName {
-			t.Fatalf("Server 头 = %q，期望 %q：path=%q", got, serverName, path)
-		}
-
-		// 204/304 按 RFC 9110 不得携带正文。
-		if rec.Code == http.StatusNoContent || rec.Code == http.StatusNotModified {
-			if rec.Body.Len() != 0 {
-				t.Fatalf("状态 %d 携带了正文 %q：path=%q", rec.Code, rec.Body.String(), path)
-			}
-			return
-		}
-
-		if rec.Code < 400 || fuzzHTTPNonS3Paths[path] {
-			return
-		}
-		// HEAD 的响应体在 writeXML 里被跳过（与真实 HTTP 语义一致），
-		// 但 Content-Type 仍然会写，所以这里只跳过正文断言。
-		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/xml") {
-			t.Fatalf("错误响应的 Content-Type = %q：method=%q path=%q code=%d",
-				ct, method, path, rec.Code)
-		}
-		if method == http.MethodHead {
-			return
-		}
-
-		var errBody s3ErrorBody
-		if err := xml.Unmarshal(rec.Body.Bytes(), &errBody); err != nil {
-			t.Fatalf("错误体不是合法 XML：%v\ncode=%d path=%q body=%q",
-				err, rec.Code, path, rec.Body.String())
-		}
-		if errBody.Code == "" {
-			t.Fatalf("错误体缺少 <Code>：code=%d path=%q body=%q",
-				rec.Code, path, rec.Body.String())
-		}
-		// InternalError 意味着有 panic 被兜底、或存储未接入等内部故障。
-		// 随机请求不应触发内部故障；触发即缺陷。
-		if errBody.Code == string(s3err.CodeInternalError) {
-			t.Fatalf("随机请求触发 InternalError：method=%q path=%q query=%q headers=%q body=%q message=%q",
-				method, path, rawQuery, headerBlock, body, errBody.Message)
-		}
-		// 错误体里的 RequestId 必须与响应头一致：排障时两者会被交叉引用。
-		if errBody.RequestID != rec.Header().Get(headerRequestID) {
-			t.Fatalf("错误体 RequestId = %q 与响应头 %q 不一致：path=%q",
-				errBody.RequestID, rec.Header().Get(headerRequestID), path)
-		}
+		checkFuzzResponse(t, rec, method, path, rawQuery, headerBlock, body)
 	})
+}
+
+// newFuzzRequest 把 fuzz 输入装配成 origin-form 请求（不含 URL scheme/host）。
+func newFuzzRequest(method, path, rawQuery, headerBlock, body string) *http.Request {
+	return &http.Request{
+		Method:        method,
+		URL:           &url.URL{Path: path, RawQuery: rawQuery},
+		Header:        parseFuzzHeaderBlock(headerBlock),
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Host:          "blink.test",
+		RemoteAddr:    "127.0.0.1:1234",
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+	}
+}
+
+// checkFuzzResponse 断言 handler 级 fuzz 的公共契约，返回错误体里的 <Code>
+// （无错误体、HEAD 或非 S3 端点时返回空串）。
+func checkFuzzResponse(t *testing.T, rec *httptest.ResponseRecorder, method, path, rawQuery, headerBlock, body string) string {
+	t.Helper()
+	if !fuzzHTTPAllowedStatuses[rec.Code] {
+		t.Fatalf("状态码 %d 不在契约集合内：method=%q path=%q query=%q headers=%q body=%q response=%q",
+			rec.Code, method, path, rawQuery, headerBlock, body, rec.Body.String())
+	}
+	if id := rec.Header().Get(headerRequestID); id == "" {
+		t.Fatalf("响应缺少 %s：method=%q path=%q code=%d",
+			headerRequestID, method, path, rec.Code)
+	}
+	if got := rec.Header().Get(headerServer); got != serverName {
+		t.Fatalf("Server 头 = %q，期望 %q：path=%q", got, serverName, path)
+	}
+
+	// 204/304 按 RFC 9110 不得携带正文。
+	if rec.Code == http.StatusNoContent || rec.Code == http.StatusNotModified {
+		if rec.Body.Len() != 0 {
+			t.Fatalf("状态 %d 携带了正文 %q：path=%q", rec.Code, rec.Body.String(), path)
+		}
+		return ""
+	}
+
+	if rec.Code < 400 || fuzzHTTPNonS3Paths[path] {
+		return ""
+	}
+	// HEAD 的响应体在 writeXML 里被跳过（与真实 HTTP 语义一致），
+	// 但 Content-Type 仍然会写，所以这里只跳过正文断言。
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/xml") {
+		t.Fatalf("错误响应的 Content-Type = %q：method=%q path=%q code=%d",
+			ct, method, path, rec.Code)
+	}
+	if method == http.MethodHead {
+		return ""
+	}
+
+	var errBody s3ErrorBody
+	if err := xml.Unmarshal(rec.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("错误体不是合法 XML：%v\ncode=%d path=%q body=%q",
+			err, rec.Code, path, rec.Body.String())
+	}
+	if errBody.Code == "" {
+		t.Fatalf("错误体缺少 <Code>：code=%d path=%q body=%q",
+			rec.Code, path, rec.Body.String())
+	}
+	// InternalError 意味着有 panic 被兜底、或存储未接入等内部故障。
+	// 随机请求不应触发内部故障；触发即缺陷。
+	if errBody.Code == string(s3err.CodeInternalError) {
+		t.Fatalf("随机请求触发 InternalError：method=%q path=%q query=%q headers=%q body=%q message=%q",
+			method, path, rawQuery, headerBlock, body, errBody.Message)
+	}
+	// 错误体里的 RequestId 必须与响应头一致：排障时两者会被交叉引用。
+	if errBody.RequestID != rec.Header().Get(headerRequestID) {
+		t.Fatalf("错误体 RequestId = %q 与响应头 %q 不一致：path=%q",
+			errBody.RequestID, rec.Header().Get(headerRequestID), path)
+	}
+	return errBody.Code
 }
 
 // parseFuzzHeaderBlock 把 "Name: value" 行块解析成 http.Header。

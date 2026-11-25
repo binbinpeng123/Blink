@@ -40,6 +40,7 @@ ALL=(
   internal/s3api:FuzzSplitHeaderList
   internal/s3api:FuzzParseListParams
   internal/s3api:FuzzParsePartNumber
+  internal/s3api:FuzzParsePostPolicy
   internal/sigv4:FuzzCanonicalQueryString
   internal/sigv4:FuzzParseChunkHeader
   internal/sigv4:FuzzParseTrailerLine
