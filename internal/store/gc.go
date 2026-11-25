@@ -324,7 +324,7 @@ func (s *Store) SweepGarbage() (GCStats, error) {
 // "文件在遍历途中消失"是并发删除，跳过即可。
 func (s *Store) collectGarbageRefs(tmpCutoff time.Time) (map[string]struct{}, error) {
 	refs := make(map[string]struct{})
-	buckets, err := s.ListBuckets()
+	buckets, err := s.garbageBucketNames()
 	if err != nil {
 		return nil, err
 	}
@@ -337,6 +337,30 @@ func (s *Store) collectGarbageRefs(tmpCutoff time.Time) (map[string]struct{}, er
 		return nil, err
 	}
 	return refs, nil
+}
+
+// garbageBucketNames 直接枚举 buckets/ 下的合法桶目录，不看 bucket.json。
+//
+// ListBuckets 会跳过 bucket.json 缺失/损坏的桶（面向客户端的容错，见
+// 03 文档的桶目录自愈）；GC 若复用同一口径，这些桶的对象元数据不会进入
+// 引用集合，它们引用的块会在宽限期后被当孤儿删除。标记阶段只关心
+// "哪些目录可能存有对象"，桶元数据是否可读不影响这个判断。
+func (s *Store) garbageBucketNames() ([]string, error) {
+	entries, err := s.fs.ReadDir(joinPath(s.root, bucketsDirName))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fsErr("读取 buckets 目录", bucketsDirName, err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() && validateBucketName(e.Name()) == nil {
+			names = append(names, e.Name())
+		}
+	}
+	sortStrings(names)
+	return names, nil
 }
 
 // scanGarbageBucket 扫描一个桶的全部对象分片。

@@ -180,7 +180,8 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 - 分片上传正常路径、ETag 格式、分片过小、序号错乱、ETag 不匹配、中止后完成返回 404。
 - 认证：无签名、错误 Access Key、错误签名、免签名端点、Presigned GET/PUT。
 - CORS：`PUT`/`GET`/`DELETE ?cors` 往返、`OPTIONS` 预检在无 `Authorization` 下返回 200、跨源实际请求带 `Access-Control-Allow-Origin`。
-- 重启：对象保留、分片上传状态保留、格式版本拒绝启动。
+- 重启：对象保留、分片上传状态保留、格式版本拒绝启动、`bucket.json` 缺失或损坏时桶与对象仍可访问（`internal/store/bucket_heal_test.go`）。
+- 垃圾回收：`bucket.json` 运行期损坏、`ListBuckets` 已跳过该桶时，GC 仍按桶目录枚举对象元数据，该桶引用的块不被回收，真正的孤儿块照常回收（`TestSweepGarbageProtectsObjectsUnderCorruptBucketMeta`）。
 - 并发：同 key 并发写后内容与某一份完整输入逐字节相等；写入期间持续读取不出现撕裂。
 - 损坏：直接改动 CAS 中一个字节后读取应报错而非返回错误数据；元数据损坏与块表截断的处理。
 
