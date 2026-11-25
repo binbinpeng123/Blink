@@ -178,6 +178,7 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 - Range 全部形态、条件请求 304/412、多区间返回 501。
 - ListObjectsV2 分页（断言无重复无遗漏）、前缀、分隔符折叠、`start-after`、UTF-8 字节序、`encoding-type=url`。
 - 分片上传正常路径、ETag 格式、分片过小、序号错乱、ETag 不匹配、中止后完成返回 404。
+- MPU 校验和：会话后置采用算法后，列入 Complete 的无校验和分片 → `400 InvalidArgument` 而非 500；用同一算法补传该分片后可完成；只列带校验和分片完成同一次上传合法（`TestCompleteMultipartLateAdoptionMissingPartChecksum`、`TestCompleteMultipartLateAdoptionSubset`、`TestCompleteMultipartMixedChecksumParts`）。
 - `GetObjectAttributes` 的 `ObjectParts` 与 `ListParts` 同分页口径：`max-parts=0` 时本页为空、`IsTruncated=true`、`NextPartNumberMarker` 回显请求的 marker（`TestGetObjectAttributesMultipartParts`、`TestListPartsMaxPartsZero`）。
 - 认证：无签名、错误 Access Key、错误签名、免签名端点、Presigned GET/PUT。
 - CORS：`PUT`/`GET`/`DELETE ?cors` 往返、`OPTIONS` 预检在无 `Authorization` 下返回 200、跨源实际请求带 `Access-Control-Allow-Origin`。

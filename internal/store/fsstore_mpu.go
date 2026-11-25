@@ -1063,8 +1063,13 @@ func AssembleMultipart(st *UploadState, parts []CompletePart, load func(int) (*P
 
 		if st.ChecksumAlgorithm != "" {
 			if ps.Checksum == "" {
-				return nil, fmt.Errorf("%w: 分片 %d 缺少 %s 校验和",
-					ErrCorrupt, p.PartNumber, st.ChecksumAlgorithm)
+				// 会话算法可能是"后置采用"的：本片在采用之前上传，没有
+				// 校验和。这是客户端把带与不带校验和的分片混在了一次
+				// 上传里，不是存储损坏——回 4xx 让客户端用同一算法重传
+				// 该片（或 Abort 后整体重来），而不是伪装成 500。
+				return nil, fmt.Errorf("%w: 分片 %d 没有 %s 校验和（可能是在会话采用该算法之前上传）；"+
+					"请用 %s 重传该分片或 Abort 后重来",
+					ErrInvalidChecksum, p.PartNumber, st.ChecksumAlgorithm, st.ChecksumAlgorithm)
 			}
 			partsCS = append(partsCS, checksum.PartChecksum{
 				Encoded: ps.Checksum,

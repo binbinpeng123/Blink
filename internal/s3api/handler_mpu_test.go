@@ -372,6 +372,56 @@ func TestMultipartRoutingAndErrors(t *testing.T) {
 	}
 }
 
+// TestCompleteMultipartMixedChecksumParts 验证一次上传里"先传无校验和
+// 分片、后传带校验和分片"时，Complete 回 400 而不是 500。
+//
+// 算法在分片 2 才被后置采用，分片 1 已经不可能补算校验和；这是客户端
+// 的混用，不是存储损坏。响应必须告诉客户端重传，而不是让它去查盘。
+func TestCompleteMultipartMixedChecksumParts(t *testing.T) {
+	h := mpuTestServer(t)
+	const key = "mixed.bin"
+	uploadID := createUploadHTTP(t, h, key, nil)
+
+	p1 := mpuPayload(5<<20, 0x51)
+	p2 := mpuPayload(64, 0x52)
+	rec := mpuRequest(t, h, http.MethodPut, "/bkt/"+key+"?partNumber=1&uploadId="+uploadID,
+		bytes.NewReader(p1), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("UploadPart(1) = %d：%s", rec.Code, rec.Body.String())
+	}
+	etag1 := rec.Header().Get("ETag")
+
+	rec = mpuRequest(t, h, http.MethodPut, "/bkt/"+key+"?partNumber=2&uploadId="+uploadID,
+		bytes.NewReader(p2), func(r *http.Request) {
+			r.Header.Set("x-amz-checksum-crc64nvme", sumOfData(t, checksum.AlgCRC64NVME, p2))
+		})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("UploadPart(2) = %d：%s", rec.Code, rec.Body.String())
+	}
+	etag2 := rec.Header().Get("ETag")
+
+	completeXML := fmt.Sprintf(
+		`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part>`+
+			`<Part><PartNumber>2</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`,
+		etag1, etag2)
+	rec = mpuRequest(t, h, http.MethodPost, "/bkt/"+key+"?uploadId="+uploadID,
+		strings.NewReader(completeXML), nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("Complete = %d，期望 400（客户端混用校验和）：%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "<Code>InvalidArgument</Code>") {
+		t.Errorf("错误码不是 InvalidArgument：%s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "<Code>InternalError</Code>") {
+		t.Errorf("不得把客户端混用报成 InternalError：%s", rec.Body.String())
+	}
+
+	// 会话未被消耗：Abort 仍然有效，客户端可以整段重来。
+	if rec := mpuRequest(t, h, http.MethodDelete, "/bkt/"+key+"?uploadId="+uploadID, nil, nil); rec.Code != http.StatusNoContent {
+		t.Errorf("Abort = %d，期望 204：%s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestCompleteMultipartMalformed 覆盖 Complete 请求体解析失败的各条路径。
 func TestCompleteMultipartMalformed(t *testing.T) {
 	h := mpuTestServer(t)

@@ -440,6 +440,8 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 | 完成响应 | 客户端按 XML 解析（不读 `x-amz-checksum-*` 头） | 校验和必须写进 XML 体；头部副本可选但建议同时给 |
 | `complete` 的 ETag 元素 | **不带引号**（botocore 已剥离） | 比对前统一去引号 |
 
+- **混用校验和的分片**：会话算法后置采用后，之前上传且被列入 `CompleteMultipartUpload` 的分片没有校验和，无法补算。这属于客户端用法问题而非存储损坏：回 `400 InvalidArgument` 并提示用会话算法重传该分片或 Abort，**不得回 500**。只列入带校验和的分片完成同一次上传是合法的（未列出的分片不进入对象）。
+
 上述 `MpuObjectSize` 不在必需路径上：aws-cli 的 `s3 cp` 与 `s3api` 均未发送，服务端不依赖它做校验。
 
 ### 桶级 CORS `?cors` 与 OPTIONS 预检
