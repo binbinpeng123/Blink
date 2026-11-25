@@ -35,6 +35,11 @@ ALL=(
   internal/s3api:FuzzParseCopySource
   internal/s3api:FuzzParseContentMD5
   internal/s3api:FuzzParseDecodedContentLength
+  internal/s3api:FuzzDecodeCORSConfiguration
+  internal/s3api:FuzzCorsPatternMatches
+  internal/s3api:FuzzSplitHeaderList
+  internal/s3api:FuzzParseListParams
+  internal/s3api:FuzzParsePartNumber
   internal/sigv4:FuzzCanonicalQueryString
   internal/sigv4:FuzzParseChunkHeader
   internal/sigv4:FuzzParseTrailerLine
