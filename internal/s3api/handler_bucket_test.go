@@ -1,6 +1,7 @@
 package s3api
 
 import (
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -571,5 +573,243 @@ func TestUnsupportedSubresourcesDoNotHitDataPath(t *testing.T) {
 	rec = do(t, h, http.MethodPut, "/bkt/obj.txt?attributes")
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("PUT ?attributes = %d，期望 405（响应体：%s）", rec.Code, rec.Body.String())
+	}
+}
+
+// decodeBucketList 解析 ListBuckets 响应体。
+func decodeBucketList(t *testing.T, rec *httptest.ResponseRecorder) listAllMyBucketsResult {
+	t.Helper()
+	var out listAllMyBucketsResult
+	if err := xml.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("ListBuckets 响应不是合法 XML: %v (%s)", err, rec.Body.String())
+	}
+	return out
+}
+
+// listBuckets 发一次 ListBuckets 请求并解析结果。
+func listBuckets(t *testing.T, h http.Handler, q url.Values) (listAllMyBucketsResult, *httptest.ResponseRecorder) {
+	t.Helper()
+	target := "/"
+	if len(q) > 0 {
+		target += "?" + q.Encode()
+	}
+	rec := do(t, h, http.MethodGet, target)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ListBuckets(%v) 状态码 = %d，期望 200（响应体：%s）", q, rec.Code, rec.Body.String())
+	}
+	return decodeBucketList(t, rec), rec
+}
+
+// bucketNames 取结果里的桶名列表。
+func bucketNames(res listAllMyBucketsResult) []string {
+	out := make([]string, 0, len(res.Buckets.Bucket))
+	for _, b := range res.Buckets.Bucket {
+		out = append(out, b.Name)
+	}
+	return out
+}
+
+// TestListBucketsDefaults 验证无参请求保持旧版 S3 的全量语义：
+// 没有 continuation-token / prefix 元素，每条记录带区域。
+func TestListBucketsDefaults(t *testing.T) {
+	h := bucketTestServer(t)
+	for _, name := range []string{"pg-a-1", "pg-a-2", "pg-a-3", "pg-b-1"} {
+		if rec := do(t, h, http.MethodPut, "/"+name); rec.Code != http.StatusOK {
+			t.Fatalf("建桶 %s 失败: %d", name, rec.Code)
+		}
+	}
+
+	res, rec := listBuckets(t, h, nil)
+	if got := strings.Join(bucketNames(res), ","); got != "pg-a-1,pg-a-2,pg-a-3,pg-b-1" {
+		t.Fatalf("桶列表 = %s", got)
+	}
+	if res.ContinuationToken != "" || res.Prefix != "" {
+		t.Errorf("无参请求不应出现分页元素：token=%q prefix=%q", res.ContinuationToken, res.Prefix)
+	}
+	for _, b := range res.Buckets.Bucket {
+		if b.BucketRegion != "us-east-1" {
+			t.Errorf("桶 %s 的 BucketRegion = %q，期望 us-east-1", b.Name, b.BucketRegion)
+		}
+	}
+	// 未过滤时 Prefix 应整体省略，而不是输出空元素。
+	if strings.Contains(rec.Body.String(), "<Prefix>") {
+		t.Error("无参响应不应包含 <Prefix> 元素")
+	}
+}
+
+// TestListBucketsPagination 验证 max-buckets + continuation-token 翻页，
+// 以及 token 与前缀/区域的绑定。
+func TestListBucketsPagination(t *testing.T) {
+	h := bucketTestServer(t)
+	all := []string{"pg-a-1", "pg-a-2", "pg-a-3", "pg-b-1"}
+	for _, name := range all {
+		if rec := do(t, h, http.MethodPut, "/"+name); rec.Code != http.StatusOK {
+			t.Fatalf("建桶 %s 失败: %d", name, rec.Code)
+		}
+	}
+
+	// 每页 2 个，两页取完。
+	page1, _ := listBuckets(t, h, url.Values{"max-buckets": {"2"}})
+	if got := strings.Join(bucketNames(page1), ","); got != "pg-a-1,pg-a-2" {
+		t.Fatalf("第一页 = %s", got)
+	}
+	if page1.ContinuationToken == "" {
+		t.Fatal("第一页应返回 ContinuationToken")
+	}
+
+	page2, _ := listBuckets(t, h, url.Values{
+		"max-buckets":        {"2"},
+		"continuation-token": {page1.ContinuationToken},
+	})
+	if got := strings.Join(bucketNames(page2), ","); got != "pg-a-3,pg-b-1" {
+		t.Fatalf("第二页 = %s", got)
+	}
+	if page2.ContinuationToken != "" {
+		t.Errorf("最后一页不应再给续页 token，实际 %q", page2.ContinuationToken)
+	}
+
+	// 恰好取满且后面没有可见桶时，不应发 token。
+	exact, _ := listBuckets(t, h, url.Values{"max-buckets": {"4"}})
+	if exact.ContinuationToken != "" {
+		t.Errorf("取满全部时不应给 token，实际 %q", exact.ContinuationToken)
+	}
+
+	// prefix 过滤 + 翻页：pg-a- 有 3 个，每页 2 个。
+	p1, _ := listBuckets(t, h, url.Values{"prefix": {"pg-a-"}, "max-buckets": {"2"}})
+	if got := strings.Join(bucketNames(p1), ","); got != "pg-a-1,pg-a-2" {
+		t.Fatalf("prefix 第一页 = %s", got)
+	}
+	if p1.Prefix != "pg-a-" {
+		t.Errorf("响应 Prefix = %q，期望回显 pg-a-", p1.Prefix)
+	}
+	p2, _ := listBuckets(t, h, url.Values{
+		"prefix":             {"pg-a-"},
+		"max-buckets":        {"2"},
+		"continuation-token": {p1.ContinuationToken},
+	})
+	if got := strings.Join(bucketNames(p2), ","); got != "pg-a-3" {
+		t.Fatalf("prefix 第二页 = %s", got)
+	}
+	if p2.ContinuationToken != "" {
+		t.Errorf("prefix 最后一页不应再给 token，实际 %q", p2.ContinuationToken)
+	}
+
+	// token 绑定 prefix：换一个前缀去续页必须 400，否则返回的既不是 A 也不是 B。
+	rec := do(t, h, http.MethodGet, "/?"+url.Values{
+		"prefix":             {"pg-b-"},
+		"continuation-token": {p1.ContinuationToken},
+	}.Encode())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("prefix 不匹配的状态码 = %d，期望 400", rec.Code)
+	}
+	if body := decodeError(t, rec); body.Code != string(s3err.CodeInvalidArgument) {
+		t.Errorf("Code = %q，期望 InvalidArgument", body.Code)
+	}
+}
+
+// TestListBucketsMaxBucketsValidation 验证 max-buckets 的取值规则：
+// 非法或 <1 → 400；超过上限按 10000 截断（与 max-keys 一致）。
+func TestListBucketsMaxBucketsValidation(t *testing.T) {
+	h := bucketTestServer(t)
+	if rec := do(t, h, http.MethodPut, "/pg-x"); rec.Code != http.StatusOK {
+		t.Fatalf("建桶失败: %d", rec.Code)
+	}
+
+	for _, v := range []string{"0", "-1", "abc", "1.5", ""} {
+		rec := do(t, h, http.MethodGet, "/?max-buckets="+url.QueryEscape(v))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("max-buckets=%q 状态码 = %d，期望 400（响应体：%s）", v, rec.Code, rec.Body.String())
+			continue
+		}
+		if body := decodeError(t, rec); body.Code != string(s3err.CodeInvalidArgument) {
+			t.Errorf("max-buckets=%q Code = %q，期望 InvalidArgument", v, body.Code)
+		}
+	}
+
+	// 超过上限：截断而不是报错。只有 1 个桶，因此结果仍是那 1 个。
+	res, _ := listBuckets(t, h, url.Values{"max-buckets": {"10001"}})
+	if got := strings.Join(bucketNames(res), ","); got != "pg-x" {
+		t.Errorf("max-buckets=10001 结果 = %q，期望 pg-x", got)
+	}
+	if res.ContinuationToken != "" {
+		t.Errorf("max-buckets=10001 不应给 token，实际 %q", res.ContinuationToken)
+	}
+}
+
+// TestListBucketsRegionFilter 验证 bucket-region：
+// 本服务所在区域返回全部，其它区域返回空结果而不是忽略参数。
+func TestListBucketsRegionFilter(t *testing.T) {
+	h := bucketTestServer(t)
+	for _, name := range []string{"pg-r-1", "pg-r-2"} {
+		if rec := do(t, h, http.MethodPut, "/"+name); rec.Code != http.StatusOK {
+			t.Fatalf("建桶失败: %d", rec.Code)
+		}
+	}
+
+	same, _ := listBuckets(t, h, url.Values{"bucket-region": {"us-east-1"}})
+	if got := strings.Join(bucketNames(same), ","); got != "pg-r-1,pg-r-2" {
+		t.Errorf("同区域结果 = %q，期望 pg-r-1,pg-r-2", got)
+	}
+
+	other, _ := listBuckets(t, h, url.Values{"bucket-region": {"eu-west-1"}})
+	if len(other.Buckets.Bucket) != 0 {
+		t.Errorf("跨区域应返回空列表，实际 %+v", bucketNames(other))
+	}
+	if other.ContinuationToken != "" {
+		t.Errorf("空结果不应给 token，实际 %q", other.ContinuationToken)
+	}
+
+	// 区域也绑定进 token：拿"不按区域过滤"的 token 去查 eu-west-1 必须 400。
+	// 否则一次跨区域续页会悄悄返回本区域数据，客户端以为拿到了另一个区域。
+	res, _ := listBuckets(t, h, url.Values{"max-buckets": {"1"}})
+	if len(res.Buckets.Bucket) != 1 {
+		t.Fatalf("max-buckets=1 应返回 1 个桶，实际 %d", len(res.Buckets.Bucket))
+	}
+	rec := do(t, h, http.MethodGet, "/?"+url.Values{
+		"bucket-region":      {"eu-west-1"},
+		"continuation-token": {res.ContinuationToken},
+	}.Encode())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("区域不匹配的状态码 = %d，期望 400（响应体：%s）", rec.Code, rec.Body.String())
+	}
+}
+
+// TestListBucketsInvalidToken 验证无法解码的 token 返回 400 InvalidArgument。
+func TestListBucketsInvalidToken(t *testing.T) {
+	h := bucketTestServer(t)
+	for _, tok := range []string{"", "!!!", "bm90LWpzb24"} {
+		rec := do(t, h, http.MethodGet, "/?continuation-token="+url.QueryEscape(tok))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("token=%q 状态码 = %d，期望 400（响应体：%s）", tok, rec.Code, rec.Body.String())
+			continue
+		}
+		if body := decodeError(t, rec); body.Code != string(s3err.CodeInvalidArgument) {
+			t.Errorf("token=%q Code = %q，期望 InvalidArgument", tok, body.Code)
+		}
+	}
+}
+
+// TestBucketListTokenRoundTrip 是 token 编解码的纯函数测试：
+// 四种 base64 字母表都能解出同一份内容，非法输入统一报错。
+func TestBucketListTokenRoundTrip(t *testing.T) {
+	tok := encodeBucketListToken("pg-a-2", "pg-a-", "us-east-1")
+	after, prefix, region, err := decodeBucketListToken(tok)
+	if err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+	if after != "pg-a-2" || prefix != "pg-a-" || region != "us-east-1" {
+		t.Fatalf("往返结果 = (%q, %q, %q)", after, prefix, region)
+	}
+
+	// 标准 base64 带 padding 的变体也应被接受。
+	std := base64.StdEncoding.EncodeToString([]byte(`{"after":"x","prefix":"","region":""}`))
+	if after, _, _, err := decodeBucketListToken(std); err != nil || after != "x" {
+		t.Errorf("标准字母表解码失败: after=%q err=%v", after, err)
+	}
+
+	// 缺少续页位置的 token 不可用：它会静默变成"从头开始"，造成死循环。
+	empty := base64.RawURLEncoding.EncodeToString([]byte(`{"prefix":"a"}`))
+	if _, _, _, err := decodeBucketListToken(empty); err == nil {
+		t.Error("缺少 after 的 token 应报错")
 	}
 }
