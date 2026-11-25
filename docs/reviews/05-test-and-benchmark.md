@@ -52,6 +52,7 @@
 | `FuzzParseChunkHeader` | 长度非负；签名缺省或 64 位十六进制；块头可重写再解析 |
 | `FuzzParseTrailerLine` | 名字非空、已小写、字符集合法；`name:value` 可重写再解析 |
 | `FuzzParseAuthorization` | 成功结果 `accessKeyID`/`signature` 非空、`dateStamp` 8 位、`signedHeaders` 非空；重复解析逐字段相等 |
+| `FuzzParsePostPolicy` | 成功时过期时刻非零、每条条件 `op ∈ {eq, starts-with, content-length-range}`，字段名已去 `$`/空白并小写，`content-length-range` 满足 `0 ≤ min ≤ max`；重复解析结果相等 |
 | `FuzzValidateBucketName` | 与**独立重写**的 AWS 规则做差分对照；失败必须是 `ErrInvalidBucketName`；确定性 |
 | `FuzzParsePartFileName` | 编号落在 `1..10000`；重写为规范文件名后解析一致 |
 
@@ -132,8 +133,41 @@ go test -run=^$ -fuzz=^FuzzServeHTTP$ -fuzztime=20s ./internal/s3api
    而对象目录名是对原始字节的哈希；此后 LIST 读回元数据与目录名不一致，把桶判成
    数据损坏（整桶 500）。修复是在 `validateKey` 入口拒绝非法 UTF-8。
 
-**未覆盖**：鉴权开启后的签名路径（fuzz 关闭鉴权以覆盖业务分支；SigV4 由独立目标覆盖）、
-集群/EC 路径、TLS 与并发下的状态机。有界时长本身也不构成完备性证明。
+**未覆盖**：集群/EC 路径、TLS 与并发下的状态机。有界时长本身也不构成完备性证明。
+
+### 鉴权链路 fuzz
+
+`FuzzServeHTTP` 显式关闭鉴权，因此签名解析、凭据查找、错误响应这几段代码在随机输入下
+没有全链路保护；纯解析目标 `FuzzParseAuthorization` 也看不到"鉴权中间件 + 路由"的组合。
+`FuzzServeHTTPAuth`（`internal/s3api/fuzz_auth_test.go`）补这一段：
+
+- **有效签名模式**：对模糊输入构造的请求，用测试凭据现场 `sigv4.Presign` 签名后再送进
+  启用鉴权的 `Server.Handler()`。除 POST Object（签名材料在表单里）外，响应不得是任何
+  鉴权失败码——有效签名必须抵达业务逻辑。输入查询串里原有的 `X-Amz-Algorithm` 等
+  签名字段先剔除，避免与现场签发的参数重复；其余查询参数原样保留。
+- **篡改模式**：签名后按输入选择一种破坏（追加签名字节、删除签名参数、替换 Access Key、
+  签名后改路径、把 `X-Amz-Date` 改成很久以前、删除 `X-Amz-Algorithm`）。响应必须是
+  `400` 或 `403`，错误码属于鉴权失败集合（`AccessDenied` / `SignatureDoesNotMatch` /
+  `InvalidAccessKeyId` / `RequestTimeTooSkewed` / `AuthorizationHeaderMalformed` 等），
+  不得出现 5xx 或 `InternalError`。
+- **两种模式共同断言**：不 panic、状态码在契约集合内、`RequestId` 响应头与错误体一致、
+  错误体是合法 S3 XML、响应正文不出现 Secret Key（鉴权失败日志与错误消息都不得回显凭据）。
+
+```text
+go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
+```
+
+普通 `go test` 会跑种子语料：有效签名的桶/对象/分片/批量删除主链路，以及六种篡改。
+
+实测（同日，10 worker，20 s）：
+
+- `FuzzParsePostPolicy` 约 **156 万次**执行，无失败。
+- `FuzzServeHTTPAuth` 约 **7–8 万次**执行，无失败；速率明显低于其它目标，运行中多次出现持续
+  数秒的 `0 execs/sec`。用 `-parallel=1` 可复现同样的停顿、随后恢复满速，说明停顿来自
+  fuzzer 最小化新覆盖输入（每一步都完整跑一遍 handler + 临时存储），不是死锁或请求悬挂。
+- 首次运行暴露的是 **fuzz 装配代码自身的缺陷**：现场签发的 URL 经 `url.Parse` 往返时，
+  查询串里的原始 `#` 被截成 fragment，有效签名被误判为匿名请求。改为按第一个 `?`
+  切分路径与查询串（Presign 不改路径），并把该输入保留为种子；产品代码未改动。
 
 ### 集成测试重点
 
