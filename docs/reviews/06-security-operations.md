@@ -327,4 +327,4 @@ master worktree 与当前分支各跑 20 次 1 MiB `PutObject` 基准（同机�
 - **真实磁盘跨越水位未做 e2e**：受"本机压测总写入 ≤ 512 MiB"约束，没有通过真实填盘触发阻断/恢复；水位阻断、滞回、fail-open 由注入 `DiskSpace` 读数的单元测试覆盖（`internal/store/disk_test.go`、`internal/s3api/authz_test.go`、`internal/cluster/storage_full_test.go`）。
 - **真实 ENOSPC 的 507 未做 e2e**：同上，由 `store.ErrStorageFull` 注入路径的单测与集群链路测试覆盖。
 - **MinIO `mc` 客户端兼容性未测**：本切片只验证了 aws-cli v2。
-- **TLS 直连已补 e2e（2026-11-25）**：`test/integration/tls_test.go` 用现场生成的本地 CA 签发服务器证书，客户端**只信任该 CA**（不再使用 `--no-verify-ssl`），验证信任链、主机名、TLS ≥1.2 与证书/私钥不匹配时拒绝启动。生产 CA 与证书轮换仍未验证。
+- **TLS 直连已补 e2e（2026-11-25）**：`test/integration/tls_test.go` 用现场生成的本地 CA 签发服务器证书，客户端**只信任该 CA**（不再使用 `--no-verify-ssl`），验证信任链、主机名、TLS ≥1.2 与证书/私钥不匹配时拒绝启动；`scripts/tls-smoke.sh` 用 aws-cli 经 `AWS_CA_BUNDLE` 完成桶/对象读写与 Presigned 下载，并确认未信任 CA 时失败。生产 CA 与证书轮换仍未验证。
