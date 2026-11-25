@@ -277,6 +277,9 @@ func TestListPartsMaxPartsZero(t *testing.T) {
 	if lp.MaxParts != 0 {
 		t.Errorf("MaxParts = %d，期望回显 0", lp.MaxParts)
 	}
+	if lp.NextPartNumberMarker != 0 {
+		t.Errorf("NextPartNumberMarker = %d，期望回显请求的 marker 0", lp.NextPartNumberMarker)
+	}
 }
 
 // TestMultipartRoutingAndErrors 覆盖子资源分派的三条非法组合与常见错误。
