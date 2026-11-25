@@ -186,6 +186,7 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 - 垃圾回收：`bucket.json` 运行期损坏、`ListBuckets` 已跳过该桶时，GC 仍按桶目录枚举对象元数据，该桶引用的块不被回收，真正的孤儿块照常回收（`TestSweepGarbageProtectsObjectsUnderCorruptBucketMeta`）。
 - 并发：同 key 并发写后内容与某一份完整输入逐字节相等；写入期间持续读取不出现撕裂。
 - 损坏：直接改动 CAS 中一个字节后读取应报错而非返回错误数据；元数据损坏与块表截断的处理。JSON 合法但结构不自洽（块表截断/偏移空洞/长度非正、分片总长不符、未知布局）时，`OpenObject` 与 `CopyObject` 必须返回 `ErrCorrupt`（`TestOpenObjectRejectsStructurallyCorruptMeta`）。
+- MPU 分片状态损坏：就地篡改 `parts/<n>.json` 的五类不自洽（版本、`Size` 与块表合计不符、块偏移空洞、块哈希非法、ETag 非 MD5）后，`ListParts` 与 `Complete` 都必须返回 `ErrCorrupt`，且**不得提交对象**（随后 `OpenObject` 报 `ErrNoSuchKey`）；拒绝不消耗会话，状态修复后同一 uploadId 仍可完成（`TestCompleteMultipartRejectsCorruptPartState`）。
 
 ## 故障测试方法
 

@@ -287,6 +287,70 @@ func TestCompleteMultipartLateAdoptionSubset(t *testing.T) {
 	}
 }
 
+// TestCompleteMultipartRejectsCorruptPartState 验证本地分片状态在读入口
+// 做结构校验：块表长度/偏移/哈希、ETag、版本只要有一处不自洽，ListParts
+// 与 Complete 都必须响亮失败（ErrCorrupt）。
+//
+// 关键是不能"先提交再发现"：过去这些损坏会被照单写进对象元数据，Complete
+// 返回 200，之后每一次 GET 才报损坏——错误被推迟到读路径。
+func TestCompleteMultipartRejectsCorruptPartState(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*PartState)
+	}{
+		{"version", func(ps *PartState) { ps.Version++ }},
+		{"size-mismatch", func(ps *PartState) { ps.Size++ }},
+		{"block-offset-hole", func(ps *PartState) { ps.Blocks[0].Offset++ }},
+		{"bad-block-hash", func(ps *PartState) { ps.Blocks[0].Hash = "../escape" }},
+		{"bad-etag", func(ps *PartState) { ps.ETag = "not-an-md5" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// 每个子用例独立会话：没有修复时 Complete 会直接成功并消耗会话。
+			s := openMPUStore(t)
+			const key = "corrupt-part.bin"
+			up := createUpload(t, s, key, "", "")
+			info := uploadPart(t, s, key, up.UploadID, 1, mpuBytes(200, 0x91), UploadPartOptions{})
+			path := s.multipartPartPath(up.UploadID, 1)
+
+			base, err := s.loadPartState(up.UploadID, 1)
+			if err != nil {
+				t.Fatalf("读取分片状态失败: %v", err)
+			}
+			if len(base.Blocks) == 0 {
+				t.Fatal("测试前提不成立：分片状态没有块表")
+			}
+			ps := *base
+			ps.Blocks = append([]BlockDesc(nil), base.Blocks...)
+			tc.mutate(&ps)
+			if err := s.fs.WriteFile(path, mustJSON(ps), filePerm); err != nil {
+				t.Fatalf("写入分片状态失败: %v", err)
+			}
+
+			if _, err := s.ListParts("bkt", key, up.UploadID, ListPartsOptions{MaxParts: 10}); !errors.Is(err, ErrCorrupt) {
+				t.Errorf("ListParts 错误 = %v，期望 ErrCorrupt", err)
+			}
+			if _, err := s.CompleteMultipartUpload("bkt", key, up.UploadID,
+				[]CompletePart{{1, info.ETag}}, CompleteOptions{}); !errors.Is(err, ErrCorrupt) {
+				t.Errorf("Complete 错误 = %v，期望 ErrCorrupt", err)
+			}
+			// 拒绝必须意味着"没有提交"：不能留下一个每次 GET 都报损坏的对象。
+			if _, err := s.OpenObject("bkt", key); !errors.Is(err, ErrNoSuchKey) {
+				t.Errorf("OpenObject 错误 = %v，期望 ErrNoSuchKey（拒绝时不得提交对象）", err)
+			}
+
+			// 拒绝不消耗会话：状态文件修复后，同一 uploadId 仍可完成。
+			if err := s.fs.WriteFile(path, mustJSON(base), filePerm); err != nil {
+				t.Fatalf("恢复分片状态失败: %v", err)
+			}
+			if _, err := s.CompleteMultipartUpload("bkt", key, up.UploadID,
+				[]CompletePart{{1, info.ETag}}, CompleteOptions{}); err != nil {
+				t.Fatalf("恢复状态后 Complete 失败: %v", err)
+			}
+		})
+	}
+}
+
 func TestMultipartCompositeChecksum(t *testing.T) {
 	s := openMPUStore(t)
 	// CRC32C 未声明类型：AWS 与 02 文档都默认 COMPOSITE。
