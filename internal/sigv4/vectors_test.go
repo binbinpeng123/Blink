@@ -294,11 +294,11 @@ const emptyBodySHA256 = vecEmptySHA256
 //
 // 注意 Host 取自 URL —— net/http 在服务端把 Host 放在 r.Host 而非头里，
 // 规范化时必须走 r.Host，这里模拟同样的形态。
-func mustRequest(t *testing.T, method, rawURL string) *http.Request {
-	t.Helper()
+func mustRequest(tb testing.TB, method, rawURL string) *http.Request {
+	tb.Helper()
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		t.Fatalf("URL 解析失败 %q: %v", rawURL, err)
+		tb.Fatalf("URL 解析失败 %q: %v", rawURL, err)
 	}
 	return &http.Request{
 		Method: method,

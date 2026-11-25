@@ -21,10 +21,10 @@ func mustParseAmz(t *testing.T, s string) time.Time {
 }
 
 // signedReq 构造一个经签名（头部签名）的请求，返回请求本身与所用时间。
-func signedReq(t *testing.T, method, rawURL string) (*http.Request, string) {
-	t.Helper()
+func signedReq(tb testing.TB, method, rawURL string) (*http.Request, string) {
+	tb.Helper()
 	const amzDate = "20261023T120000Z"
-	r := mustRequest(t, method, rawURL)
+	r := mustRequest(tb, method, rawURL)
 	r.Header.Set(headerAmzDate, amzDate)
 	r.Header.Set(headerContentSHA256, vecEmptySHA256)
 
