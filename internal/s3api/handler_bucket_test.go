@@ -190,6 +190,38 @@ func TestDeleteBucketNotFoundOverHTTP(t *testing.T) {
 	}
 }
 
+// TestInvalidBucketNameOverHTTP 守住"非法桶名不落盘、不改判故障性质"的边界。
+//
+// %00 解码后是 NUL：它会被拼进存储层的文件路径，open 返回 EINVAL。若这个
+// OS 错误被当作未知错误上抛，客户端看到的是 500 InternalError —— 明明是
+// 请求写错了，却被诊断为服务端故障。所有桶级入口都必须映射成 400
+// InvalidBucketName。
+func TestInvalidBucketNameOverHTTP(t *testing.T) {
+	h := bucketTestServer(t)
+	for _, tc := range []struct{ name, method, target string }{
+		{"DeleteBucket", http.MethodDelete, "/bad%00bucket"},
+		{"GetBucketCORS", http.MethodGet, "/bad%00bucket?cors"},
+		{"HeadBucket", http.MethodHead, "/bad%00bucket"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, tc.method, tc.target)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("状态码 = %d，期望 400：%s", rec.Code, rec.Body.String())
+			}
+			if tc.method == http.MethodHead {
+				// HEAD 无响应体，只能按状态码与响应头判断。
+				if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/xml") {
+					t.Errorf("Content-Type = %q，期望 XML", ct)
+				}
+				return
+			}
+			if got := decodeError(t, rec).Code; got != string(s3err.CodeInvalidBucketName) {
+				t.Errorf("Code = %q，期望 InvalidBucketName", got)
+			}
+		})
+	}
+}
+
 // TestS3ErrorBodyHasRequestID 验证错误体里的 RequestId 与响应头一致。
 //
 // 这一致性是排障的前提：用户拿着错误体里的 ID 来找运维，

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // Options 是打开存储的配置。
@@ -386,6 +387,13 @@ func validateKey(key string) error {
 		return ErrInvalidKey
 	}
 	if len(key) > maxKeyBytes {
+		return ErrInvalidKey
+	}
+	// 非法 UTF-8 必须在入口拒绝：key 既进 JSON 元数据，又参与对象目录名的
+	// 哈希。JSON 编码会把非法字节替换成 U+FFFD，读回时 key 与目录名不再
+	// 互相印证，LIST 会把整个桶判成数据损坏（500）—— 一次非法写入污染
+	// 整个桶的列举，代价远高于在写入口返回 400。
+	if !utf8.ValidString(key) {
 		return ErrInvalidKey
 	}
 	return nil
