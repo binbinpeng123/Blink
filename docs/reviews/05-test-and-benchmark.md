@@ -87,7 +87,52 @@ scripts/fuzz.sh 20 FuzzParseRange FuzzParseChunkHeader
   那个巨大输入（20 s 里有 9 s 是 `0 execs/sec`），种子已移出 fuzz 语料，超限行为改由
   确定性的 `TestBucketCORSValidationBodyLimit` 覆盖（同时验证"超限请求不破坏已有配置"）。
 
-**未覆盖**：handler 级端到端 fuzz（构造完整 HTTP 请求、含中间件链与鉴权）、
+### HTTP handler 级 fuzz
+
+纯解析函数的 fuzz 覆盖不到"中间件链 + 路由 + handler + 存储"的组合错误：某个头只在
+路由之后才被读取、某条错误分支忘了写 XML、某个分支在部分写出响应后 panic——这些只有
+把完整请求送进 `Server.Handler()` 才会暴露。
+
+`FuzzServeHTTP`（`internal/s3api/fuzz_http_test.go`）构造完整 `http.Request`（方法、
+路径、原始查询串、请求头块、请求体）送进全链路，连接真实的临时 store（`BlockSize` 与
+内联阈值同为 64 KiB，请求体走内联、不产生 CAS 块文件），并显式关闭鉴权，以便 fuzz 探索
+业务路由而不是反复落到 403。
+
+不变量：
+
+- **不 panic**：`recoverPanic` 只应在"没人在代码里 panic"时保持沉默。任何被兜底成
+  `500 InternalError` 的输入都视为缺陷（响应体里出现 `InternalError` 即失败）。
+- **状态码在契约集合内**：`200/204/206/304/307/400/403/404/405/409/411/412/413/416/501/503/507`。
+  `307` 只可能来自 `ServeMux` 的路径清理（`//a`、`/..` 之类的规范化重定向），不属于
+  S3 语义；它保留请求方法，是 Go 标准库当前的规范化重定向码。
+- **错误体是合法 XML**：状态码 ≥ 400 且非 HEAD 时，`Content-Type` 必须是
+  `application/xml`，响应体必须能解码成 `<Error>` 且 `<Code>` 非空。这是
+  "统一错误体"契约的机器可验证形式——缺了它，客户端拿到的是 `net/http` 的纯文本兜底。
+- **无体状态码不携带正文**：`204`、`304` 的响应体必须为空。
+
+规模护栏：请求体 ≤ 1 KiB、路径与查询串 ≤ 512 B、头块 ≤ 1 KiB，超出直接跳过。目的是
+不让一个巨大随机输入把整段时长耗在最小化与磁盘写入上（与 `FuzzDecodeCORSConfiguration`
+移除 64 KiB 种子的教训相同）。
+
+```text
+go test -run=^$ -fuzz=^FuzzServeHTTP$ -fuzztime=20s ./internal/s3api
+```
+
+普通 `go test` 只跑种子语料，覆盖根路径列举、桶与对象 CRUD、`?delete`、`?uploads`、
+复制、`?cors` 预检与 `?acl`/`?versionId` 拒绝等代表请求。
+
+首次有界运行（90 s，约 220 万次执行）即发现三处缺陷，均已修复并转成确定性回归：
+
+1. **状态码集合漏了 307**：`GET /..` 被 `ServeMux` 规范化重定向。这是契约缺口，
+   不是 handler 缺陷——`307` 已进允许集合，并补了路径清理的种子。
+2. **NUL 桶名返回 500**：桶级入口（`DeleteBucket`、`?cors`）在缓存未命中时直接拿桶名
+   拼路径，`open` 的 `EINVAL` 被当作未知错误。修复是在 `loadBucketMeta` 缓存未命中
+   处校验桶名；HTTP 级与存储级回归测试各一组。
+3. **非法 UTF-8 对象 key 污染整个桶**：key 进 JSON 元数据时非法字节被替换成 U+FFFD，
+   而对象目录名是对原始字节的哈希；此后 LIST 读回元数据与目录名不一致，把桶判成
+   数据损坏（整桶 500）。修复是在 `validateKey` 入口拒绝非法 UTF-8。
+
+**未覆盖**：鉴权开启后的签名路径（fuzz 关闭鉴权以覆盖业务分支；SigV4 由独立目标覆盖）、
 集群/EC 路径、TLS 与并发下的状态机。有界时长本身也不构成完备性证明。
 
 ### 集成测试重点

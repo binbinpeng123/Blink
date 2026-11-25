@@ -375,6 +375,55 @@ func TestCreateBucketInvalidName(t *testing.T) {
 	}
 }
 
+// TestInvalidUTF8KeyRejected 验证非法 UTF-8 key 在写入口被拒。
+//
+// 若不拒绝：JSON 元数据会把非法字节替换成 U+FFFD，而对象目录名是对原始
+// 字节做的哈希，读回时两者无法互相印证 —— LIST 会把这个桶判成数据损坏。
+// 一次非法写入污染整个桶的列举，所以必须在入口返回 ErrInvalidKey。
+func TestInvalidUTF8KeyRejected(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateBucket("utf8"); err != nil {
+		t.Fatal(err)
+	}
+
+	bad := "bad\xffkey"
+	if _, err := s.PutObject("utf8", bad, strings.NewReader("x"), PutOptions{}); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("非法 UTF-8 key = %v，期望 ErrInvalidKey", err)
+	}
+	// 桶仍然可列举：被拒绝的写入没有留下任何目录。
+	res, err := s.ListObjects("utf8", ListOptions{MaxKeys: 10})
+	if err != nil {
+		t.Fatalf("列举被非法写入污染：%v", err)
+	}
+	if len(res.Objects) != 0 {
+		t.Fatalf("非法 key 留下了 %d 个对象", len(res.Objects))
+	}
+}
+
+// TestInvalidBucketNameNeverReachesFilesystem 覆盖"只查桶元数据、没有提前
+// 校验名字"的桶级入口。
+//
+// 桶名来自 URL 路径，客户端可以让它含 NUL 或控制字符；直接拼进文件路径后
+// open 返回 EINVAL，若作为未知错误上抛，s3api 只能映射成 500 InternalError。
+// 非法名字必须在进入文件系统之前就被拒绝。
+func TestInvalidBucketNameNeverReachesFilesystem(t *testing.T) {
+	s := newTestStore(t)
+	const bad = "bad\x00bucket"
+	for _, tc := range []struct {
+		name string
+		op   func() error
+	}{
+		{"DeleteBucket", func() error { return s.DeleteBucket(bad) }},
+		{"GetBucketCORS", func() error { _, err := s.GetBucketCORS(bad); return err }},
+		{"PutBucketCORS", func() error { return s.PutBucketCORS(bad, &CORSConfiguration{}) }},
+		{"DeleteBucketCORS", func() error { return s.DeleteBucketCORS(bad) }},
+	} {
+		if err := tc.op(); !errors.Is(err, ErrInvalidBucketName) {
+			t.Errorf("%s(%q) = %v，期望 ErrInvalidBucketName", tc.name, bad, err)
+		}
+	}
+}
+
 func TestDeleteBucket(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateBucket("gone"); err != nil {

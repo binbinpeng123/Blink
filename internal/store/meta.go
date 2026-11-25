@@ -105,10 +105,18 @@ func (s *Store) initDiskMeta() error {
 // （单节点单实例是 01 文档的部署前提），不存在"别的进程改了但缓存不知道"。
 // 因此命中缓存的答案与读盘永远一致。
 //
+// 缓存未命中时先校验桶名：Cache 里只可能有不含控制字符的合法名字（写入点
+// 都在 validateBucketName 之后），所以合法名字不受影响；而非法名字若直接
+// 拼进路径去 open，会得到 EINVAL 这类 OS 错误，最终以 500 InternalError
+// 暴露给客户端 —— 客户端拼错了 URL，不该被当成服务端故障。
+//
 // 返回的 *bucketMeta 与缓存共享，调用方只读。
 func (s *Store) loadBucketMeta(bucket string) (*bucketMeta, error) {
 	if m := s.cachedBucketMeta(bucket); m != nil {
 		return m, nil
+	}
+	if err := validateBucketName(bucket); err != nil {
+		return nil, err
 	}
 	data, err := readFile(s.fs, s.bucketMetaPath(bucket))
 	if errors.Is(err, fs.ErrNotExist) {
