@@ -182,7 +182,15 @@
 
 ### ListBuckets `GET /`
 
-- 返回 `<ListAllMyBucketsResult>`，含固定 `Owner`（`ID: "blink"`）与按名称字典序排列的 `Buckets/Bucket{Name, CreationDate}`。
+- 返回 `<ListAllMyBucketsResult>`，含固定 `Owner`（`ID: "blink"`）与按名称字典序排列的 `Buckets/Bucket{Name, CreationDate, BucketRegion}`。每条记录都带 `BucketRegion`（AWS 2024-11 起）：多区域客户端靠它决定后续请求打向哪个端点。
+- 分页参数（AWS 2024-11 契约，本版本实现）：
+  - `prefix`：只返回名字以它开头的桶；响应回显 `<Prefix>`，未指定时省略。
+  - `bucket-region`：只返回该区域的桶。本服务只服务一个区域，指定其它区域返回**空结果**而不是忽略参数；未指定或等于服务端区域时不按区域过滤。
+  - `max-buckets`：本页最多条数，默认与上限均为 `10000`。非整数或 `< 1` → `400 InvalidArgument`；`> 10000` 按上限**截断**（与 `max-keys` 一致，客户端写超大值本意是"尽量多"）。与 `max-keys` 不同，`0` 不是合法值。
+  - `continuation-token`：上一页响应中 `<ContinuationToken>` 的值。token 绑定 `prefix` 与 `bucket-region`，不一致 → `400 InvalidArgument`；不可解码或缺少续页位置 → `400 InvalidArgument`。
+- 响应中的 `<ContinuationToken>` 是**下一页**的位置，仅在结果被截断且后面确实还有可见桶时出现；**不得**回显请求里的 token —— 客户端把"响应给了 token"当作"还有下一页"，最后一页回显会使其无限翻页。
+- 分页边界在**可见性过滤之后**：凭证看不到的桶不占额度、也不出现在续页位置里，否则客户端会为永远拿不到的桶反复翻页。
+- 桶在列举与读取 `CreationDate` 之间被删除时跳过该条，不让整个列举失败。
 
 ### PutObject `PUT /{bucket}/{key}`
 

@@ -216,18 +216,8 @@ func encodeListToken(c store.ListCursor, prefix, delimiter string) string {
 // token 是我们自己签发的，但客户端、代理、复制粘贴都可能把它转成另一种
 // 变体；只要 JSON 能解出来、语义一致，就没有拒绝的理由。
 func decodeListToken(s string) (*store.ListCursor, string, string, error) {
-	var raw []byte
-	decoded := false
-	for _, enc := range []*base64.Encoding{
-		base64.RawURLEncoding, base64.URLEncoding,
-		base64.RawStdEncoding, base64.StdEncoding,
-	} {
-		if b, err := enc.DecodeString(s); err == nil {
-			raw, decoded = b, true
-			break
-		}
-	}
-	if !decoded {
+	raw, err := decodeBase64Token(s)
+	if err != nil {
 		return nil, "", "", errors.New("continuation-token 不是合法 base64")
 	}
 	var t listToken
@@ -238,6 +228,22 @@ func decodeListToken(s string) (*store.ListCursor, string, string, error) {
 		return nil, "", "", errors.New("continuation-token 缺少续页位置")
 	}
 	return &store.ListCursor{After: t.After, IsPrefix: t.IsPrefix}, t.Prefix, t.Delimiter, nil
+}
+
+// decodeBase64Token 解码客户端回传的不透明 token。
+//
+// 两种字母表 × 带/不带 padding 全部尝试：token 由本服务签发，但客户端、
+// 代理与复制粘贴都可能改变它的编码变体。四种都不成功才算非法。
+func decodeBase64Token(s string) ([]byte, error) {
+	for _, enc := range []*base64.Encoding{
+		base64.RawURLEncoding, base64.URLEncoding,
+		base64.RawStdEncoding, base64.StdEncoding,
+	} {
+		if b, err := enc.DecodeString(s); err == nil {
+			return b, nil
+		}
+	}
+	return nil, errors.New("token 不是合法 base64")
 }
 
 // s3URLEncode 按 S3 的 encoding-type=url 规则编码。

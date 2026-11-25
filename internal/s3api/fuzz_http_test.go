@@ -111,6 +111,7 @@ func FuzzServeHTTP(f *testing.F) {
 		body    string
 	}{
 		{"列出桶", http.MethodGet, "/", "", "", ""},
+		{"列出桶分页", http.MethodGet, "/", "max-buckets=2&prefix=bk&bucket-region=us-east-1", "", ""},
 		{"列出对象", http.MethodGet, "/bkt", "list-type=2&delimiter=%2F", "", ""},
 		{"建桶", http.MethodPut, "/bkt2", "", "", ""},
 		{"删桶", http.MethodDelete, "/bkt3", "", "", ""},
