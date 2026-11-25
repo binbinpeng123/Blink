@@ -178,6 +178,7 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 - Range 全部形态、条件请求 304/412、多区间返回 501。
 - ListObjectsV2 分页（断言无重复无遗漏）、前缀、分隔符折叠、`start-after`、UTF-8 字节序、`encoding-type=url`。
 - 分片上传正常路径、ETag 格式、分片过小、序号错乱、ETag 不匹配、中止后完成返回 404。
+- `GetObjectAttributes` 的 `ObjectParts` 与 `ListParts` 同分页口径：`max-parts=0` 时本页为空、`IsTruncated=true`、`NextPartNumberMarker` 回显请求的 marker（`TestGetObjectAttributesMultipartParts`、`TestListPartsMaxPartsZero`）。
 - 认证：无签名、错误 Access Key、错误签名、免签名端点、Presigned GET/PUT。
 - CORS：`PUT`/`GET`/`DELETE ?cors` 往返、`OPTIONS` 预检在无 `Authorization` 下返回 200、跨源实际请求带 `Access-Control-Allow-Origin`。
 - 重启：对象保留、分片上传状态保留、格式版本拒绝启动、`bucket.json` 缺失或损坏时桶与对象仍可访问（`internal/store/bucket_heal_test.go`）。

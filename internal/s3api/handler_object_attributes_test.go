@@ -266,4 +266,24 @@ func TestGetObjectAttributesMultipartParts(t *testing.T) {
 	if out.ObjectParts == nil || out.ObjectParts.MaxParts != maxMaxParts {
 		t.Errorf("max-parts 上限未生效: %+v", out.ObjectParts)
 	}
+
+	// max-parts=0：本页为空但仍有分片，必须回显请求的 marker 作下一页起点，
+	// 与 ListParts 一致；省略会让客户端误以为没有更多分片。
+	rec = getAttributes(t, h, "/bkt/"+key+"?attributes&max-parts=0", "ObjectParts")
+	out = decodeAttributes(t, rec)
+	parts = out.ObjectParts
+	if parts == nil || !parts.IsTruncated || parts.PartsCount != 0 ||
+		parts.TotalPartsCount != 2 || parts.NextPartNumberMarker == nil ||
+		*parts.NextPartNumberMarker != 0 {
+		t.Errorf("max-parts=0 的 ObjectParts = %+v，期望空页、截断、下一个 marker 回显 0", parts)
+	}
+	rec = getAttributes(t, h,
+		"/bkt/"+key+"?attributes&max-parts=0&part-number-marker=1", "ObjectParts")
+	out = decodeAttributes(t, rec)
+	parts = out.ObjectParts
+	if parts == nil || !parts.IsTruncated || parts.PartsCount != 0 ||
+		parts.TotalPartsCount != 2 || parts.NextPartNumberMarker == nil ||
+		*parts.NextPartNumberMarker != 1 {
+		t.Errorf("max-parts=0&marker=1 的 ObjectParts = %+v，期望下一个 marker 回显 1", parts)
+	}
 }

@@ -216,8 +216,14 @@ func objectPartsOf(parts []store.ObjectPart, alg checksum.Algorithm, maxParts, m
 		}
 		out.Parts = append(out.Parts, part)
 	}
-	if out.IsTruncated && len(out.Parts) > 0 {
-		next := out.Parts[len(out.Parts)-1].PartNumber
+	if out.IsTruncated {
+		// 与 ListParts 同口径：max-parts=0 时本页没有分片可回显，用请求
+		// 的 marker 作为下一页起点。省略该元素会让客户端把"没让你看"
+		// 当成"没有更多分片"。
+		next := marker
+		if n := len(out.Parts); n > 0 {
+			next = out.Parts[n-1].PartNumber
+		}
 		out.NextPartNumberMarker = &next
 	}
 	out.PartsCount = len(out.Parts)
