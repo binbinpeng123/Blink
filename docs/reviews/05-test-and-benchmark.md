@@ -184,7 +184,7 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 - 重启：对象保留、分片上传状态保留、格式版本拒绝启动、`bucket.json` 缺失或损坏时桶与对象仍可访问（`internal/store/bucket_heal_test.go`）。
 - 垃圾回收：`bucket.json` 运行期损坏、`ListBuckets` 已跳过该桶时，GC 仍按桶目录枚举对象元数据，该桶引用的块不被回收，真正的孤儿块照常回收（`TestSweepGarbageProtectsObjectsUnderCorruptBucketMeta`）。
 - 并发：同 key 并发写后内容与某一份完整输入逐字节相等；写入期间持续读取不出现撕裂。
-- 损坏：直接改动 CAS 中一个字节后读取应报错而非返回错误数据；元数据损坏与块表截断的处理。
+- 损坏：直接改动 CAS 中一个字节后读取应报错而非返回错误数据；元数据损坏与块表截断的处理。JSON 合法但结构不自洽（块表截断/偏移空洞/长度非正、分片总长不符、未知布局）时，`OpenObject` 与 `CopyObject` 必须返回 `ErrCorrupt`（`TestOpenObjectRejectsStructurallyCorruptMeta`）。
 
 ## 故障测试方法
 

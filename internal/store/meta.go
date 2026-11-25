@@ -389,7 +389,56 @@ func (s *Store) readObjectMetaAt(path string) (*objectMeta, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("%w: 对象元数据 %s 不是合法 JSON: %v", ErrCorrupt, path, err)
 	}
+	// 解析通过不代表结构自洽：块表被截断时 JSON 仍然合法，读路径却会按
+	// 留下的块少写一段后"正常"返回，HTTP 层只表现为连接被截断。在入口
+	// 拦住它，把静默短读变成可诊断的 ErrCorrupt（GC/巡检同样受益）。
+	if err := validateLocalMeta(&m); err != nil {
+		return nil, fmt.Errorf("%w: 对象元数据 %s 结构不自洽: %v", ErrCorrupt, path, err)
+	}
 	return &m, nil
+}
+
+// validateLocalMeta 校验本地盘上元数据与内容正确性相关的结构。
+//
+// 不要求 node_id、obj_version、ETag 等字段：它们影响集群冲突裁决与响应头，
+// 不影响"块表指向哪里、读出多少字节"。GC 与巡检也走这个入口，缺字段不应
+// 让整轮回收 fail-closed。
+func validateLocalMeta(m *objectMeta) error {
+	if m.Size < 0 {
+		return fmt.Errorf("%w: 对象大小 %d 为负", ErrCorrupt, m.Size)
+	}
+	// 墓碑只有版本，没有内容；误带内容说明元数据被拼接或写坏。
+	if m.Deleted {
+		if m.Size != 0 || len(m.Blocks) != 0 || len(m.Parts) != 0 {
+			return fmt.Errorf("%w: 删除墓碑不应携带内容（size=%d，blocks=%d，parts=%d）",
+				ErrCorrupt, m.Size, len(m.Blocks), len(m.Parts))
+		}
+		return nil
+	}
+	if m.Layout == LayoutInline {
+		if err := validateInlineMeta(m); err != nil {
+			return err
+		}
+	}
+	switch m.Layout {
+	case "", LayoutReplica, LayoutInline:
+		if err := validateBlockTable(m); err != nil {
+			// 块哈希格式错误在局部是 ErrInvalidBlock（面向调用方参数的分类），
+			// 但落盘元数据里出现它只可能是损坏。
+			return fmt.Errorf("%w: %v", ErrCorrupt, err)
+		}
+		if err := validateParts(m); err != nil {
+			return err
+		}
+		return validateECMeta(m)
+	case LayoutEC:
+		// EC 元数据只由集群写路径落盘，入站时已由 validateReplicaMeta
+		// 完整校验；单机读路径不产生也不消费 EC 对象。这里不重复校验，
+		// 避免把 08 的职责耦合进单机读路径（边界见 03 文档）。
+		return nil
+	default:
+		return fmt.Errorf("%w: 未知数据布局 %q", ErrCorrupt, m.Layout)
+	}
 }
 
 // mustJSON 序列化元数据。

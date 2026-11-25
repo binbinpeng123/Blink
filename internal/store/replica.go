@@ -311,7 +311,23 @@ func validateReplicaMeta(key string, m *ObjectMeta) error {
 	if m.ContentType == "" {
 		return fmt.Errorf("%w: 缺少 content_type", ErrCorrupt)
 	}
+	if err := validateBlockTable(m); err != nil {
+		return err
+	}
+	if err := validateParts(m); err != nil {
+		return err
+	}
+	if err := validateECMeta(m); err != nil {
+		return err
+	}
+	return nil
+}
 
+// validateBlockTable 校验块表的偏移连续、长度为正且总长等于对象大小。
+//
+// 单机读路径与副本入站共用：任何一处放过不自洽的块表，读取端都只能
+// 按错误的边界拼出内容（或少写一段后正常返回）。
+func validateBlockTable(m *ObjectMeta) error {
 	var next int64
 	var total int64
 	for _, b := range m.Blocks {
@@ -332,12 +348,6 @@ func validateReplicaMeta(key string, m *ObjectMeta) error {
 	}
 	if m.Size > 0 && len(m.Blocks) == 0 {
 		return fmt.Errorf("%w: 非空对象没有块表", ErrCorrupt)
-	}
-	if err := validateParts(m); err != nil {
-		return err
-	}
-	if err := validateECMeta(m); err != nil {
-		return err
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -329,6 +330,13 @@ func TestCopyObjectRejectsOversizeSource(t *testing.T) {
 		ETag:       "d41d8cd98f00b204e9800998ecf8427e",
 		Modified:   s.now(),
 		ObjVersion: 1,
+		// 块表只需结构自洽：本地读路径会先校验元数据，再轮到大小上限；
+		// 块本身不需要存在，CopyObject 在触碰块之前就该拒绝。
+		Blocks: []BlockDesc{{
+			Hash:   strings.Repeat("0", 64),
+			Offset: 0,
+			Length: MaxCopyObjectSize + 1,
+		}},
 	})
 
 	if _, err := s.CopyObject("bkt", "dst", "bkt", "huge", CopyOptions{}); !errors.Is(err, ErrInvalidRequest) {
