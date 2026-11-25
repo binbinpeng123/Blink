@@ -117,6 +117,7 @@
 | `InvalidPartOrder` | 400 | 分片序号未升序 |
 | `BadDigest` | 400 | `Content-MD5` 或 checksum 不匹配 |
 | `InvalidDigest` | 400 | `Content-MD5` 格式非法 |
+| `MetadataTooLarge` | 400 | 用户元数据（`x-amz-meta-*`）键值 UTF-8 字节总和超过 2 KB |
 | `MalformedXML` | 400 | 请求体 XML 非法 |
 | `MethodNotAllowed` | 405 | 方法不适用于该资源 |
 | `PreconditionFailed` | 412 | 条件请求未满足 |
@@ -165,6 +166,7 @@
 - 必需 `Content-Length`，缺失 → `411 Length Required`。空 key 不会进入本操作：路由层把 `PUT /{bucket}/` 解释为 CreateBucket（与 S3 一致），因此"key 为空"的 PutObject 请求在 HTTP 上不存在。
 - 响应含 `ETag`、`Last-Modified`；若客户端通过 `x-amz-sdk-checksum-algorithm` 或 `x-amz-checksum-*` 声明算法，**必须回传对应 checksum**。只要回传了 checksum，**必须同时回传 `x-amz-checksum-type`**：单次 PUT 的类型恒为 `FULL_OBJECT`（整段直算），MPU 的 `COMPOSITE` 语义见后文校验和一节。只回校验值不回类型，客户端无法区分两者，也就无法复算。
 - 客户端未声明算法时**不**回传 checksum 头（不能替客户端决定要校验什么）。
+- **用户元数据大小上限**：`x-amz-meta-*` 的键（去掉前缀后）与值的 **UTF-8 字节数总和 ≤ 2048**，超限 → `400 MetadataTooLarge`（与 AWS 一致）。按字节而非字符计数——同样是 1024 个字符，ASCII 占 1 KB、中文占 3 KB，按字符计会让上限形同虚设；也不按 `len` 之外的口径做归一化（键已由 Go 规范化大小写，前缀不计入总和）。超限时**整条请求拒绝、不写入任何对象**，不静默截断：客户端以为元数据完整落盘、读回却少一半，比明确失败更难排查。
 - 条件写（在存储层 key 锁内判定，检查与提交之间不插入其他写者）：
   - `If-None-Match: *` 且对象已存在 → `412 PreconditionFailed`。
   - `If-None-Match: "etag"`：当前对象 ETag **等于**给定值 → `412 PreconditionFailed`；不相等或对象不存在 → 放行。服务端按去掉 `W/` 与引号后的值做弱比较。
@@ -254,7 +256,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 
 - 源路径格式：`/{srcBucket}/{srcKey}` 或 `{srcBucket}/{srcKey}`，按 URL 路径规则解码；先按**未解码**的路径切分桶与 key，`%2F` 不会被误判为分隔符。
 - 带 `?versionId` → `501 NotImplemented`（无版本控制，不静默忽略）。
-- 元数据指令：`x-amz-metadata-directive` 为空或 `COPY` 时保留源 `Content-Type`、`x-amz-meta-*` 与标准 HTTP 元数据（`Cache-Control` 等）；`REPLACE` 时以请求头为准，**请求里没带的标准 HTTP 元数据会被清空**（而不是沿用源对象），缺省 `Content-Type` 落 `application/octet-stream`；其他值 → `400 InvalidArgument`。
+- 元数据指令：`x-amz-metadata-directive` 为空或 `COPY` 时保留源 `Content-Type`、`x-amz-meta-*` 与标准 HTTP 元数据（`Cache-Control` 等）；`REPLACE` 时以请求头为准，**请求里没带的标准 HTTP 元数据会被清空**（而不是沿用源对象），缺省 `Content-Type` 落 `application/octet-stream`；其他值 → `400 InvalidArgument`。`REPLACE` 时请求带上的用户元数据同样受 2 KB 上限约束（超限 → `400 MetadataTooLarge`）；`COPY` 时请求里的 `x-amz-meta-*` 本就**不参与**目标元数据，因此不参与校验——为一份将被丢弃的头报错，会让"复制时顺手带了个无用头"变成无法完成的复制。
 - 源条件：`x-amz-copy-source-if-match` / `if-none-match` / `if-modified-since` / `if-unmodified-since`，不满足 → `412 PreconditionFailed`；源不存在时优先 `404 NoSuchKey`。
 - 目标条件：与 PutObject 同一套规则 —— `If-None-Match`（`*` 或单个 ETag）与 `If-Match`（单个 ETag 或 `*`），在存储层目标 key 锁内判定；不满足 → `412 PreconditionFailed`，非法多值 → `400 InvalidArgument`。目标上的墓碑与已过期对象同样视为不存在。
 - 自复制：源与目标相同且 `COPY` → `400 InvalidRequest`；`REPLACE` 允许，用于原地更新元数据。
@@ -302,7 +304,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 
 - `UploadId` 使用 `crypto/rand` 生成。
 - `CreateMultipartUpload` 必须持久化客户端声明的 checksum 算法，它决定后续分片与完成的校验行为。
-- `CreateMultipartUpload` 同时持久化 `Content-Type`、`x-amz-meta-*` 与标准 HTTP 元数据（`Cache-Control` 等）到会话状态，`Complete` 时原样写入对象元数据。分片请求（`UploadPart`）上的同名头**不参与**对象元数据：一次会话只有一个最终对象，属性只能在 Initiate 时声明一次。
+- `CreateMultipartUpload` 同时持久化 `Content-Type`、`x-amz-meta-*` 与标准 HTTP 元数据（`Cache-Control` 等）到会话状态，`Complete` 时原样写入对象元数据。`x-amz-meta-*` 受 2 KB 上限约束（超限 → `400 MetadataTooLarge`，且**不创建会话**——拒绝后客户端若继续 UploadPart 会得到 `404 NoSuchUpload`，这比"会话建了但元数据被砍"更早暴露问题）。分片请求（`UploadPart`）上的同名头**不参与**对象元数据：一次会话只有一个最终对象，属性只能在 Initiate 时声明一次。
 - `UploadPart`：`partNumber` 范围 1–10000；除最后一个分片外，每片不小于 5 MiB。
 - `ListParts`（以及 `GetObjectAttributes` 的 `ObjectParts`）的分页语义：`max-parts` 非负整数，`part-number-marker` 非负整数，只返回编号大于 marker 的分片，按编号升序。`max-parts=0` 时本页必为空；此时若仍有分片，`IsTruncated` 必须为 `true`，`NextPartNumberMarker` 回显请求的 marker（客户端须改用非零 `max-parts` 才能推进）——把"没让你看"报成 `IsTruncated=false` 会让客户端以为会话里没有分片。
 - `UploadPartCopy`：与 `UploadPart` 同路由，以 `x-amz-copy-source` 非空为唯一判据分流。支持 `x-amz-copy-source-range: bytes=first-last`（两端必填，不支持开放/后缀/多区间）；缺省复制整个源对象。源条件与 CopyObject 同一套 `x-amz-copy-source-if-*`；源不存在 → `404 NoSuchKey`；区间越界 → `416 InvalidRange` 且带 `Content-Range: bytes */<源大小>`；单次复制 > 5 GiB → `400 InvalidRequest`。响应 `<CopyPartResult><LastModified>…</LastModified><ETag>"…"</ETag></CopyPartResult>`，ETag 按目标分片内容重算，与随后 `ListParts` 一致。
@@ -368,7 +370,7 @@ HTTPS 传输下 aws-cli/botocore 不会把对象字节直接作为请求体，�
 | `ETag`（分片上传） | `"<md5(分片MD5拼接)>-<分片数>"` |
 | `Last-Modified` | UTC，秒级精度，RFC 1123 格式 |
 | `Content-Type` | 客户端提供，否则默认 `application/octet-stream` |
-| 用户元数据 | `x-amz-meta-*`，键大小写不敏感（Go 的 `http.Header` 会规范成 `X-Amz-Meta-Owner`），**响应必须以全小写头名回传**。实测 botocore 按原始大小写匹配 `x-amz-meta-` 前缀，规范化后的大写头会被解析成 `Metadata.Owner` 而非 AWS 约定的 `Metadata.owner`，`--query Metadata.owner` 直接得到 `None`；真实 S3 返回的也是小写头名 |
+| 用户元数据 | `x-amz-meta-*`，键大小写不敏感（Go 的 `http.Header` 会规范成 `X-Amz-Meta-Owner`），**响应必须以全小写头名回传**。实测 botocore 按原始大小写匹配 `x-amz-meta-` 前缀，规范化后的大写头会被解析成 `Metadata.Owner` 而非 AWS 约定的 `Metadata.owner`，`--query Metadata.owner` 直接得到 `None`；真实 S3 返回的也是小写头名。键（去前缀）与值的 UTF-8 字节总和上限 2 KB，超限 `400 MetadataTooLarge`（见 PutObject 契约） |
 | `x-amz-storage-class` | 回传 `STANDARD` |
 | `Cache-Control` | 客户端提供则原样持久化并在 GET/HEAD 回传；不解释其语义 |
 | `Content-Disposition` | 同上。浏览器直接打开对象时的下载/展示行为依赖它（如 `attachment; filename="model.bin"`） |
