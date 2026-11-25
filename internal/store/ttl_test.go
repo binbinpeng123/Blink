@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -442,5 +443,46 @@ func TestMultipartCompleteIfNoneMatchIgnoresExpired(t *testing.T) {
 	if _, err := s.CompleteMultipartUpload("tmp", "k", up.UploadID,
 		[]CompletePart{{PartNumber: 1, ETag: info.ETag}}, CompleteOptions{IfNoneMatchAny: true}); err != nil {
 		t.Fatalf("过期对象不应触发 412: %v", err)
+	}
+}
+
+// TestSweepExpiredSyncsParentDir 验证清扫复用删除路径的目录同步语义：
+// 同步失败计入 FailedObjects 并保留错误，而不是静默当作删除成功。
+func TestSweepExpiredSyncsParentDir(t *testing.T) {
+	clock := &testClock{now: time.Unix(1_700_000_000, 0).UTC()}
+	fsys := newFaultFS(OSFS())
+	s, err := Open(Options{
+		Root:      filepath.Join(t.TempDir(), "data"),
+		FS:        fsys,
+		Now:       clock.Now,
+		BucketTTL: map[string]time.Duration{"tmp": time.Hour},
+	})
+	if err != nil {
+		t.Fatalf("Open 失败: %v", err)
+	}
+	mustCreateBucket(t, s, "tmp")
+	putString(t, s, "tmp", "a.txt", "a")
+	clock.Advance(2 * time.Hour)
+
+	fsys.fail(opSyncDir, errInjected)
+	stats, err := s.SweepExpired(context.Background())
+	if err != nil {
+		t.Fatalf("SweepExpired 失败: %v", err)
+	}
+	if stats.FailedObjects != 1 || stats.DeletedObjects != 0 {
+		t.Errorf("failed/deleted = %d/%d，期望 1/0", stats.FailedObjects, stats.DeletedObjects)
+	}
+	if len(stats.Failures) != 1 || !strings.Contains(stats.Failures[0].Err, "同步目录") {
+		t.Errorf("Failures = %+v，期望一条包含「同步目录」的失败", stats.Failures)
+	}
+
+	// 故障解除后重跑：对象目录已经不在，本轮既无候选也不报错。
+	fsys.disarm()
+	stats, err = s.SweepExpired(context.Background())
+	if err != nil {
+		t.Fatalf("第二轮 SweepExpired 失败: %v", err)
+	}
+	if stats.FailedObjects != 0 || stats.DeletedObjects != 0 {
+		t.Errorf("第二轮 failed/deleted = %d/%d，期望 0/0", stats.FailedObjects, stats.DeletedObjects)
 	}
 }

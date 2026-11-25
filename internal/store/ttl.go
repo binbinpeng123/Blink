@@ -208,8 +208,8 @@ func (s *Store) sweepExpiredObject(bucket, key string) (bool, error) {
 	// 先失效缓存再删盘：即使 RemoveAll 失败，后续读取也必须回到盘上
 	// 确认，而不是继续返回一份内存里的旧元数据。
 	s.metaCache.delete(metaCacheKey{bucket: bucket, key: key})
-	if err := s.fs.RemoveAll(s.objectDir(bucket, key)); err != nil {
-		return false, fsErr("清扫过期对象", key, err)
+	if err := s.removeObjectDir(bucket, key, "清扫过期对象"); err != nil {
+		return false, err
 	}
 	return true, nil
 }

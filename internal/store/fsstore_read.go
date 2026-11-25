@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"path/filepath"
 	"sort"
 
 	"github.com/binbinpeng123/Blink/internal/checksum"
@@ -257,9 +258,25 @@ func (s *Store) DeleteObject(bucket, key string) error {
 	// 确认，而不是继续返回一份内存里的旧元数据。
 	s.metaCache.delete(metaCacheKey{bucket: bucket, key: key})
 
+	return s.removeObjectDir(bucket, key, "删除对象")
+}
+
+// removeObjectDir 删除对象目录，并 fsync 父目录让删除在崩溃后仍然生效。
+//
+// 目录项本身也是需要落盘的数据：只做 RemoveAll 的话，断电后对象目录可能
+// 重新出现，一个已经返回成功的删除就"复活"了。这与 GC、CORS、DeleteBucket
+// 删除后同步目录的既有约定一致。
+//
+// 调用方必须已持有 key 锁并已失效 metaCache。父目录缺失不算错误：只有
+// "这个哈希前缀下从未有过对象"时才会出现，此时删除本来就无事可做。
+func (s *Store) removeObjectDir(bucket, key, op string) error {
+	dir := s.objectDir(bucket, key)
 	// RemoveAll 对不存在的路径返回 nil，正好就是"幂等删除"需要的语义。
-	if err := s.fs.RemoveAll(s.objectDir(bucket, key)); err != nil {
-		return fsErr("删除对象", key, err)
+	if err := s.fs.RemoveAll(dir); err != nil {
+		return fsErr(op, key, err)
+	}
+	if err := s.fs.SyncDir(filepath.Dir(dir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fsErr(op+"后同步目录", key, err)
 	}
 	return nil
 }
