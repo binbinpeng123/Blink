@@ -271,7 +271,13 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 - `s3 sync` 目录往返（含 2.9 MiB 随机二进制）`diff -r` 无差异。
 - `s3api put-object --checksum-algorithm CRC32` 回传的校验和与本地 `zlib.crc32` 一致，证明 trailer 校验和是在**解帧后**内容上计算的。
 - 服务端 debug 日志确认每个 PutObject/UploadPart 都进入解帧路径（`aws_chunked_decoded`，`signed:false`，trailer 为 `x-amz-checksum-crc32`/`crc64nvme`）。
-- **未覆盖**：签名分块（真实 aws-cli 不发送）、客户端证书信任链、生产 CA、TLS 证书轮换。这些不得写成已通过。
+- **未覆盖**：签名分块（真实 aws-cli 不发送）、生产 CA、TLS 证书轮换。这些不得写成已通过。
+
+**信任链与 TLS 策略**（`test/integration/tls_test.go`，2026-11-25）：测试现场用 ECDSA P-256 生成本地 CA 与服务器证书（SAN `DNS:localhost,IP:127.0.0.1`），客户端**只信任该 CA**，不再使用 `--no-verify-ssl`：
+
+- 信任 CA 的客户端完成 `/healthz`、桶/对象往返与 Presigned URL 下载；断言协商版本 ≥ TLS 1.2、对端证书与 fixture 一致。
+- 不信任 CA → `x509.UnknownAuthorityError`；主机名不匹配 → `x509.HostnameError`；客户端降到 TLS 1.1 → 握手失败；明文访问 TLS 端口 → `400` 或断开。
+- 证书与私钥不匹配 → 二进制拒绝启动（错误含「加载 TLS 证书失败」）。
 
 ## 记录指标
 

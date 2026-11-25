@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -102,6 +103,8 @@ type serverOptions struct {
 	args []string
 	// env 追加/覆盖环境变量；BLINK_ACCESS_KEY 与 BLINK_SECRET_KEY 默认注入。
 	env map[string]string
+	// tls 非空时以 HTTPS 启动，客户端信任该 fixture 的 CA。
+	tls *tlsFixture
 }
 
 type testServer struct {
@@ -110,6 +113,9 @@ type testServer struct {
 	baseURL string
 	dataDir string
 	logPath string
+
+	// tlsCfg 是客户端信任测试 CA 的 TLS 配置；明文模式为 nil。
+	tlsCfg *tls.Config
 
 	cmd     *exec.Cmd
 	done    chan struct{}
@@ -148,6 +154,13 @@ func startServer(t *testing.T, opt serverOptions) *testServer {
 	logPath := filepath.Join(t.TempDir(), "server.log")
 
 	args := append(defaultServerArgs(addr, dataDir), opt.args...)
+	baseURL := "http://" + addr
+	var clientTLS *tls.Config
+	if opt.tls != nil {
+		args = append(args, "--tls-cert", opt.tls.certFile, "--tls-key", opt.tls.keyFile)
+		baseURL = "https://" + addr
+		clientTLS = &tls.Config{RootCAs: opt.tls.roots}
+	}
 	cmd := exec.Command(blinkBinary, args...)
 	cmd.Env = cleanEnv(map[string]string{
 		"BLINK_ACCESS_KEY": testAccessKey,
@@ -169,9 +182,10 @@ func startServer(t *testing.T, opt serverOptions) *testServer {
 	srv := &testServer{
 		t:       t,
 		addr:    addr,
-		baseURL: "http://" + addr,
+		baseURL: baseURL,
 		dataDir: dataDir,
 		logPath: logPath,
+		tlsCfg:  clientTLS,
 		cmd:     cmd,
 		done:    make(chan struct{}),
 	}
@@ -189,7 +203,7 @@ func startServer(t *testing.T, opt serverOptions) *testServer {
 // waitReady 轮询 /healthz，直到进程可服务；进程提前退出则直接失败并打印日志尾部。
 func (s *testServer) waitReady() {
 	s.t.Helper()
-	client := &http.Client{Timeout: 500 * time.Millisecond}
+	client := &http.Client{Timeout: 500 * time.Millisecond, Transport: s.transport()}
 	deadline := time.Now().Add(20 * time.Second)
 
 	for time.Now().Before(deadline) {
@@ -237,6 +251,15 @@ func (s *testServer) kill() {
 		_ = s.cmd.Process.Kill()
 		<-s.done
 	})
+}
+
+// transport 返回符合服务端模式的传输层：HTTPS 时信任测试 CA。
+func (s *testServer) transport() http.RoundTripper {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if s.tlsCfg != nil {
+		tr.TLSClientConfig = s.tlsCfg.Clone()
+	}
+	return tr
 }
 
 func (s *testServer) exited() bool {
@@ -372,7 +395,7 @@ func newClient(t *testing.T, srv *testServer) *s3Client {
 		host: u.Host,
 		ak:   testAccessKey,
 		sk:   testSecretKey,
-		hc:   &http.Client{Timeout: 60 * time.Second},
+		hc:   &http.Client{Timeout: 60 * time.Second, Transport: srv.transport()},
 	}
 }
 
