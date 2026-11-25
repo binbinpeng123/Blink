@@ -133,7 +133,7 @@ go test -run=^$ -fuzz=^FuzzServeHTTP$ -fuzztime=20s ./internal/s3api
    而对象目录名是对原始字节的哈希；此后 LIST 读回元数据与目录名不一致，把桶判成
    数据损坏（整桶 500）。修复是在 `validateKey` 入口拒绝非法 UTF-8。
 
-**未覆盖**：集群/EC 路径、TLS 与并发下的状态机。有界时长本身也不构成完备性证明。
+**未覆盖**：集群/EC 路径与 TLS。并发下的状态机不做 fuzz，改由确定性并发用例覆盖（见「并发冲突」）。有界时长本身也不构成完备性证明。
 
 ### 鉴权链路 fuzz
 
@@ -207,6 +207,11 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 - 32 个 goroutine 并发写同一 key，断言最终内容与其中一份完整输入逐字节相等。
 - 写入新版本期间持续 GET，断言每次拿到的是完整旧版本或完整新版本。
 - 并发 LIST 与 PUT，断言 LIST 结果始终自洽。
+- 分片会话状态机（`internal/store/mpu_concurrency_test.go`），断言"会话要么完整存在、要么彻底消失，对象要么不存在、要么内容完整"：
+  - 16 个写者并发覆盖同一分片编号：全部成功，每个返回的 ETag 属于某份完整输入；ListParts 只看到一个分片且大小/ETag 匹配；Complete 后内容与该输入逐字节相等。
+  - Complete 与 Abort 同抢一个会话（20 轮）：恰好一个成功；Complete 赢则对象完整、会话消失且 Abort 得 `NoSuchUpload`；Abort 赢则对象不存在、Complete 得 `NoSuchUpload`。
+  - UploadPart 与 Abort 同抢（20 轮）：Abort 必成功，UploadPart 要么成功要么 `NoSuchUpload`；结束后会话与对象都不存在。
+  - 8 个分片并发上传期间持续 ListParts：每页编号严格升序、大小为正、ETag 为 32 位十六进制；结束后恰好 8 个分片。
 
 ## 集群测试（v0.2.0）
 
