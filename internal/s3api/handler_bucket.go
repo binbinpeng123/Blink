@@ -19,6 +19,12 @@ type createBucketXML struct {
 
 // handleCreateBucket 处理 PUT /{bucket}。
 func (s *Server) handleCreateBucket(w http.ResponseWriter, r *http.Request, bucket, reqID string) {
+	// ACL、Object Lock 启用、对象所有权与默认加密都只能通过请求头声明，
+	// 本版本均未实现：静默忽略会让客户端以为桶已按私有/合规策略创建。
+	if rejectUnsupportedHeaders(w, r, reqID, "建桶请求", unsupportedBucketWriteHeaders) {
+		return
+	}
+
 	// 请求体可有可无。空体（Content-Length: 0）是合法的：
 	// 部分客户端不发送 LocationConstraint，视为 us-east-1。
 	if r.ContentLength > 0 {

@@ -95,6 +95,7 @@ scripts/fuzz.sh 20 FuzzParseRange FuzzParseChunkHeader
 - Bucket 生命周期与幂等性；桶名校验端到端。
 - 对象往返、零字节对象（ETag 必须为 `d41d8cd9...`）、大对象分块、用户元数据、`Content-Type` 默认值、`Content-MD5` 不匹配、`If-None-Match` 前置条件。
 - 用户元数据 2 KB 上限：`PutObject`、`CreateMultipartUpload`、`REPLACE` 的 `CopyObject` 超限 → `400 MetadataTooLarge` 且不留下对象/会话；恰好 2048 字节的边界值原样往返。
+- 未实现能力请求头：CreateBucket/PutObject/CreateMultipartUpload 上的 ACL、标签、Object Lock、SSE、网站重定向头 → `501 NotImplemented`，且不留下桶/对象/会话；UploadPart/Complete 的 SSE 头 → `501` 且不消耗会话；`x-amz-expected-bucket-owner` 等无落盘语义的头仍被忽略（不过度拒绝）。
 - Range 全部形态、条件请求 304/412、多区间返回 501。
 - ListObjectsV2 分页（断言无重复无遗漏）、前缀、分隔符折叠、`start-after`、UTF-8 字节序、`encoding-type=url`。
 - 分片上传正常路径、ETag 格式、分片过小、序号错乱、ETag 不匹配、中止后完成返回 404。
