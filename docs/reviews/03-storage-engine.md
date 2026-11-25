@@ -116,6 +116,18 @@
 
 `--fsync-policy` 可配置为 `always`（默认，每步 fsync）或 `meta`（仅元数据 fsync，吞吐更高、掉电窗口更大）。这是可靠性与吞吐的显式权衡，默认取可靠性。
 
+## 删除路径
+
+```text
+1. 失效 metaCache 中的该 key
+2. RemoveAll objects/<xx>/<sha256>
+3. fsync 父目录 objects/<xx>
+```
+
+**关键保证**：目录项也是需要落盘的元数据。只做 `RemoveAll` 时，断电后对象目录可能重新出现，已返回 204 的删除会"复活"；因此第 3 步与 GC、CORS、DeleteBucket 删除后同步目录的约定一致。同步失败时删除返回错误（客户端重试幂等），而不是假装已持久化。TTL 清扫复用同一助手（`Store.removeObjectDir`），失败计入 `FailedObjects` 与 `Failures`。
+
+对象从未存在时其哈希前缀目录可能根本不存在；此时同步返回 `ENOENT` 被忽略，删除仍然成功（幂等）。
+
 ## 读路径
 
 - 大对象 GET 走 `sendfile` 零拷贝：定位偏移、声明 `Content-Length`、直接搬运数据，避免用户态缓冲区拷贝。

@@ -351,6 +351,31 @@ func TestFaultInjectionNeverLeavesPartialObject(t *testing.T) {
 	}
 }
 
+// TestDeleteObjectSyncsParentDir 验证删除会同步父目录：目录项落盘失败时
+// 必须返回错误，让客户端重试，而不是假装删除已经持久化。
+func TestDeleteObjectSyncsParentDir(t *testing.T) {
+	s, fsys := newFaultStore(t)
+	mustPutBytes(t, s, "victim", mpuBytes(200, 0x31))
+
+	fsys.fail(opSyncDir, errInjected)
+	err := s.DeleteObject("bkt", "victim")
+	if err == nil {
+		t.Fatal("目录同步失败时 DeleteObject 应返回错误")
+	}
+	if !errors.Is(err, errInjected) {
+		t.Errorf("注入的错误未被保留: %v", err)
+	}
+
+	// 故障解除后重试：删除是幂等的，重试必须成功且对象不可见。
+	fsys.disarm()
+	if err := s.DeleteObject("bkt", "victim"); err != nil {
+		t.Fatalf("故障解除后重试删除失败: %v", err)
+	}
+	if _, exists := readIfExists(t, s, "victim"); exists {
+		t.Error("删除后对象仍可见")
+	}
+}
+
 // TestDiskFullKeepsReadsAndDeletesWorking 对应 05 文档的磁盘满三层次：
 // 写入失败且错误可识别、已有数据仍可读可删、腾出空间后自动恢复写入。
 func TestDiskFullKeepsReadsAndDeletesWorking(t *testing.T) {

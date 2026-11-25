@@ -190,6 +190,10 @@ func TestDeleteObject(t *testing.T) {
 	if err := s.DeleteObject("bkt", "gone"); err != nil {
 		t.Errorf("重复删除错误 = %v，期望 nil", err)
 	}
+	// 从未存在过的 key：其哈希前缀目录可能根本不存在，删除仍须成功。
+	if err := s.DeleteObject("bkt", "never-existed"); err != nil {
+		t.Errorf("删除从未存在的对象错误 = %v，期望 nil", err)
+	}
 }
 
 // 删除对象后 CAS 块必须原样保留：它们可能被其他 key 去重引用，
