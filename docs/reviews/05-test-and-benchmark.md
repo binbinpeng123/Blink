@@ -43,6 +43,11 @@
 | `FuzzParseCopySource` | `Bucket`/`Key` 非空；重新百分号编码拼接后解析结果相同（覆盖"先切分后解码"语义） |
 | `FuzzParseContentMD5` | 成功值为 16 字节 base64 对应的 32 位小写十六进制 |
 | `FuzzParseDecodedContentLength` | 成功值等于去空白后的十进制字面值，且非负 |
+| `FuzzDecodeCORSConfiguration` | 成功时 1–100 条规则、每条 ≥1 Origin 与 ≥1 Method、Method 为大写白名单成员、Origin/Header 至多一个 `*`、`MaxAgeSeconds` 非负；重复解析相等；**可回写**——编码成响应 XML 后再解码得同一配置 |
+| `FuzzCorsPatternMatches` | `*` 匹配一切；无通配符时等价全等（或 `EqualFold`）；有通配符时匹配 ⇔ 长度足够且首尾对齐（非折叠时双向） |
+| `FuzzSplitHeaderList` | 结果项非空且无首尾空白；空列表只来自"全分隔符/空白"；拼接后再拆分幂等 |
+| `FuzzParseListParams` | `max-keys ∈ [0,1000]` 且缺省 1000；`encoding-type` 只能是空或 `url`；token 与游标一一对应、游标位置非空且与本次 `prefix`/`delimiter` 绑定；重复解析一致 |
+| `FuzzParsePartNumber` | 成功值在 `1..10000` 且与十进制字面值相等；`FormatInt` 重写后解析可逆 |
 | `FuzzCanonicalQueryString` | 规范化幂等；键值对按原始编码字节序非降，键中无 `=` |
 | `FuzzParseChunkHeader` | 长度非负；签名缺省或 64 位十六进制；块头可重写再解析 |
 | `FuzzParseTrailerLine` | 名字非空、已小写、字符集合法；`name:value` 可重写再解析 |
@@ -61,17 +66,26 @@ scripts/fuzz.sh 20 FuzzParseRange FuzzParseChunkHeader
 脚本只解析内存字符串，**不启动服务、不写数据目录、不联网**。某目标失败时 Go
 会自动把输入写入 `testdata/fuzz/<目标>/<哈希>`，此后 `go test` 会把它当回归用例执行。
 
-**实测（2026-11-24，Apple M4 / macOS 24.6.0 / Go 1.27.2，`scripts/fuzz.sh 10`，
-10 个 worker）**：14 个目标全部 PASS，合计约 **1 081 万次执行**；执行次数最高的为
-`FuzzParseChunkHeader`（149 万）、`FuzzParseAuthorization`（142 万）、`FuzzParsePartFileName`（131 万）。
+**实测（2026-11-25，Apple M4 / macOS 24.6.0 / Go 1.27.2，`scripts/fuzz.sh 10`，
+10 个 worker）**：19 个目标全部 PASS，合计约 **1 259 万次执行**；执行次数最高的为
+`FuzzParseChunkHeader`（139 万）、`FuzzParsePartFileName`（130 万）、`FuzzParseAuthorization`（130 万）。
 
 - 唯一被证伪的断言：`FuzzParseCopySource` 在 20 s 运行时约 2.5 s 找到 `%2F/0`
   （`{Bucket:"/", Key:"0"}`）。复核结论是**测试不变量过严而非产品缺陷**：`parseCopySource`
   先按第一个 `/` 切分再解码是设计正确的；解码出的非法桶名由下游 `store.CopyObject`
   入口的 `validateBucketName` 在拼接路径前拒绝（400），不存在路径穿越。断言已删除并加注释，
   该输入保留为回归种子（`internal/s3api/testdata/fuzz/FuzzParseCopySource/92f6a12f1a449e4d`）。
+- `FuzzSplitHeaderList` 在 20 s 运行时 0.4 s 找到 `",　"`（逗号 + 全角空格）。
+  复核结论同样是**测试不变量过严**：`splitHeaderList` 用 `strings.TrimSpace` 判定空白，
+  它覆盖全部 Unicode 空白，因此这串确实只含分隔符；而断言里的 `strings.Trim` 只认
+  ASCII 空白，把全角空格当成了"实际内容"。断言已改为 `strings.TrimFunc` + `unicode.IsSpace`，
+  该输入保留为回归种子（`internal/s3api/testdata/fuzz/FuzzSplitHeaderList/d6c12b8553560571`）。
 - `FuzzValidateBucketName` 在第 3 秒后出现 `0 execs/sec` 停顿（Go fuzzer 在最小化超长输入），
   11 s 内只完成约 3.8 万次执行，**探索深度明显低于其它目标**；这是记录事实，不视为通过证据的等价物。
+- `FuzzDecodeCORSConfiguration` 10 s 内约 8.6 万次执行，同样低于同类目标：每次成功都要做
+  XML 解码 + 一次重编码往返，单次成本高。它最初的 64 KiB 超限种子会让 fuzzer 反复最小化
+  那个巨大输入（20 s 里有 9 s 是 `0 execs/sec`），种子已移出 fuzz 语料，超限行为改由
+  确定性的 `TestBucketCORSValidationBodyLimit` 覆盖（同时验证"超限请求不破坏已有配置"）。
 
 **未覆盖**：handler 级端到端 fuzz（构造完整 HTTP 请求、含中间件链与鉴权）、
 集群/EC 路径、TLS 与并发下的状态机。有界时长本身也不构成完备性证明。

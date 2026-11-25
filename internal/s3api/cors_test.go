@@ -169,6 +169,31 @@ func TestBucketCORSValidationRuleLimit(t *testing.T) {
 	}
 }
 
+// TestBucketCORSValidationBodyLimit 验证配置文档的 64 KiB 上限。
+//
+// 关键在于"多读 1 字节再判定"：若简单地把请求体截断到 64 KiB 再解析，
+// 一个超大文档的前半段可能恰好是合法文档，结果就是配置被静默截短 ——
+// 用户以为写入了完整规则，实际只生效了一部分。
+func TestBucketCORSValidationBodyLimit(t *testing.T) {
+	h := corsTestServer(t)
+	putCORS(t, h)
+
+	oversize := strings.Repeat("x", maxCORSConfigBytes+1)
+	req := httptest.NewRequest(http.MethodPut, "/bkt?cors", strings.NewReader(oversize))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("超过 64 KiB 时状态码 = %d，期望 400", rec.Code)
+	}
+	if body := decodeError(t, rec); body.Code != string(s3err.CodeMalformedXML) {
+		t.Errorf("错误码 = %q，期望 MalformedXML", body.Code)
+	}
+	// 原有配置必须保持不变。
+	if rec := do(t, h, http.MethodGet, "/bkt?cors"); rec.Code != http.StatusOK {
+		t.Errorf("超限请求清掉了已有配置，GET 状态码 = %d", rec.Code)
+	}
+}
+
 // TestBucketCORSScopeAndMethod 验证 ?cors 只接受桶级 PUT/GET/DELETE。
 func TestBucketCORSScopeAndMethod(t *testing.T) {
 	h := corsTestServer(t)
