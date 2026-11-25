@@ -39,9 +39,17 @@ func (s *Server) handleCreateMultipartUpload(w http.ResponseWriter, r *http.Requ
 	}
 	checksumType := strings.TrimSpace(r.Header.Get("x-amz-checksum-type"))
 
+	// 元数据超限必须在建会话之前拒绝：先建会话再报错，客户端拿着 uploadId
+	// 去 UploadPart 会在更晚的步骤收到 NoSuchUpload，错误现场与原因脱节。
+	userMeta := userMetadata(r.Header)
+	if me := checkUserMetadataSize(userMeta); me != nil {
+		me.Write(w, r, reqID)
+		return
+	}
+
 	up, err := s.store.CreateMultipartUpload(bucket, key, store.CreateMultipartOptions{
 		ContentType:       r.Header.Get("Content-Type"),
-		UserMeta:          userMetadata(r.Header),
+		UserMeta:          userMeta,
 		HTTPMeta:          objectHTTPMeta(r.Header),
 		ChecksumAlgorithm: alg,
 		ChecksumType:      checksumType,

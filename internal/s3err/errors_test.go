@@ -28,6 +28,7 @@ func TestTableMatchesContract(t *testing.T) {
 		CodeInvalidPartOrder:             http.StatusBadRequest,
 		CodeBadDigest:                    http.StatusBadRequest,
 		CodeInvalidDigest:                http.StatusBadRequest,
+		CodeMetadataTooLarge:             http.StatusBadRequest,
 		CodeMalformedXML:                 http.StatusBadRequest,
 		CodeMethodNotAllowed:             http.StatusMethodNotAllowed,
 		CodePreconditionFailed:           http.StatusPreconditionFailed,

@@ -31,6 +31,7 @@ const (
 	CodeInvalidPartOrder             Code = "InvalidPartOrder"
 	CodeBadDigest                    Code = "BadDigest"
 	CodeInvalidDigest                Code = "InvalidDigest"
+	CodeMetadataTooLarge             Code = "MetadataTooLarge"
 	CodeMalformedXML                 Code = "MalformedXML"
 	CodeMethodNotAllowed             Code = "MethodNotAllowed"
 	CodePreconditionFailed           Code = "PreconditionFailed"
@@ -121,6 +122,7 @@ var table = map[Code]*Error{
 	CodeInvalidPartOrder:             {Code: CodeInvalidPartOrder, Message: "The list of parts was not in ascending order.", HTTPStatus: http.StatusBadRequest},
 	CodeBadDigest:                    {Code: CodeBadDigest, Message: "The Content-MD5 or checksum you specified did not match what we received.", HTTPStatus: http.StatusBadRequest},
 	CodeInvalidDigest:                {Code: CodeInvalidDigest, Message: "The Content-MD5 you specified is not valid.", HTTPStatus: http.StatusBadRequest},
+	CodeMetadataTooLarge:             {Code: CodeMetadataTooLarge, Message: "Your metadata headers exceed the maximum allowed metadata size.", HTTPStatus: http.StatusBadRequest},
 	CodeMalformedXML:                 {Code: CodeMalformedXML, Message: "The XML you provided was not well-formed or did not validate against our published schema.", HTTPStatus: http.StatusBadRequest},
 	CodeMethodNotAllowed:             {Code: CodeMethodNotAllowed, Message: "The specified method is not allowed against this resource.", HTTPStatus: http.StatusMethodNotAllowed},
 	CodePreconditionFailed:           {Code: CodePreconditionFailed, Message: "At least one of the preconditions you specified did not hold.", HTTPStatus: http.StatusPreconditionFailed},

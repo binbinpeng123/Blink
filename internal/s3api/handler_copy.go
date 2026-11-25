@@ -206,6 +206,18 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
+	// 只有 REPLACE 才会用请求里的用户元数据，因此只对它校验大小：
+	// COPY 指令下这些头会被整体丢弃，为它们报 MetadataTooLarge
+	// 等于让一次本来能成功的复制失败。
+	var userMeta map[string]string
+	if replace {
+		userMeta = userMetadata(r.Header)
+		if me := checkUserMetadataSize(userMeta); me != nil {
+			me.Write(w, r, reqID)
+			return
+		}
+	}
+
 	// 目标对象上的条件写：与普通 PUT 同一套规则（If-None-Match 的 * 或
 	// 具体 ETag，以及 If-Match），复用同一个解析函数，避免两条写路径对
 	// 同一个头给出不同答复。
@@ -236,7 +248,7 @@ func (s *Server) handleCopyObject(w http.ResponseWriter, r *http.Request, bucket
 	info, err := s.store.CopyObject(bucket, key, src.Bucket, src.Key, store.CopyOptions{
 		ReplaceMetadata: replace,
 		ContentType:     r.Header.Get("Content-Type"),
-		UserMeta:        userMetadata(r.Header),
+		UserMeta:        userMeta,
 		HTTPMeta:        objectHTTPMeta(r.Header),
 		IfNoneMatchAny:  cond.ifNoneMatchAny,
 		IfNoneMatchETag: cond.ifNoneMatchETag,

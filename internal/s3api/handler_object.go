@@ -51,6 +51,14 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 		return
 	}
 
+	// 用户元数据大小在读请求体之前判定：超限与正文无关，
+	// 让客户端在 Expect: 100-continue 阶段就能拿到 400。
+	userMeta := userMetadata(r.Header)
+	if me := checkUserMetadataSize(userMeta); me != nil {
+		me.Write(w, r, reqID)
+		return
+	}
+
 	// 条件写：If-None-Match 与 If-Match（具体 ETag 或 *）。
 	// 不合法的形式不静默忽略 —— 客户端明确要求了"仅当当前值不等于 X 才写"，
 	// 忽略它就变成了无条件覆盖，是数据丢失而不是"少个特性"。
@@ -89,7 +97,7 @@ func (s *Server) handlePutObject(w http.ResponseWriter, r *http.Request, bucket,
 
 	info, err := s.store.PutObject(bucket, key, r.Body, store.PutOptions{
 		ContentType:       r.Header.Get("Content-Type"),
-		UserMeta:          userMetadata(r.Header),
+		UserMeta:          userMeta,
 		HTTPMeta:          objectHTTPMeta(r.Header),
 		ChecksumAlgorithm: alg,
 		Checksum:          declared,
@@ -318,6 +326,30 @@ func userMetadata(h http.Header) map[string]string {
 		out[k[len(prefix):]] = vals[0]
 	}
 	return out
+}
+
+// maxUserMetadataBytes 是用户元数据（键去掉前缀后 + 值）的 UTF-8 字节总和上限。
+//
+// 与 AWS S3 一致（2 KB）。按字节而不是按字符计数：同样 1024 个字符，
+// ASCII 只占 1 KB、中文占 3 KB，按字符算会让上限对多字节内容形同虚设。
+// 前缀 x-amz-meta- 不计入总和——它由服务端约定的头名引入，
+// 客户端真正存储的是去掉前缀的键值。
+const maxUserMetadataBytes = 2048
+
+// checkUserMetadataSize 校验用户元数据总大小，超限返回 MetadataTooLarge。
+//
+// 仅用于**会写入对象**的路径（PutObject、REPLACE 的 CopyObject、
+// CreateMultipartUpload）：COPY 指令下请求里的 x-amz-meta-* 会被丢弃，
+// 为一份不会落盘的头报错只会让复制莫名其妙地失败。
+func checkUserMetadataSize(meta map[string]string) *s3err.Error {
+	total := 0
+	for k, v := range meta {
+		total += len(k) + len(v)
+		if total > maxUserMetadataBytes {
+			return s3err.New(s3err.CodeMetadataTooLarge)
+		}
+	}
+	return nil
 }
 
 // objectHTTPMeta 提取 S3 的「标准 HTTP 元数据」。
