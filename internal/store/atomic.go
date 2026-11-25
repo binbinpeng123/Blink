@@ -190,11 +190,11 @@ func (w *atomicWriter) Abort() error {
 	return w.store.fs.Remove(w.tmp)
 }
 
-// cleanTmp 清空临时目录。
+// cleanTmp 清空历史临时目录。
 //
-// 启动时调用：任何残留的临时文件都属于"上一次运行中途失败"，
-// 其内容要么已通过 rename 正式收录（那它就是重复品），
-// 要么从未提交（那就该丢弃）。两种情况都可以安全删除。
+// 当前写入路径不落 tmp/：临时文件必须与目标同目录，rename 才保持原子。
+// 保留清空是为了回收早期版本遗留的残留文件 —— 它们要么已通过 rename
+// 正式收录（即重复品），要么从未提交，两种情况都可以安全删除。
 func (s *Store) cleanTmp() error {
 	tmpDir := joinPath(s.root, tmpDirName)
 	if err := s.fs.RemoveAll(tmpDir); err != nil {
