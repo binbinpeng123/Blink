@@ -12,7 +12,7 @@
 | 单元测试 | 元数据、路径、布局、校验和、错误处理、签名算法 | `go test ./...`，无网络、无磁盘依赖 |
 | 模糊测试 | 所有解析客户端输入的纯函数（见"模糊测试"小节） | 种子随 `go test ./...`；有界探索用 `scripts/fuzz.sh` |
 | 集成测试 | S3 API、文件系统、重启恢复 | `go test -tags integration ./test/integration/` |
-| 互操作测试 | AWS CLI 真实二进制；纯标准库手写客户端 | `scripts/aws-cli-smoke.sh` 与 `test/interop/` |
+| 互操作测试 | AWS CLI 真实二进制；纯标准库手写客户端 | `scripts/aws-cli-smoke.sh`、`scripts/tls-smoke.sh` 与 `test/interop/` |
 | 故障测试 | 进程中断、磁盘满、对象损坏、并发冲突 | `faultFS` 注入 + 子进程 `SIGKILL` |
 | 集群测试（v0.2.0） | 跨节点读写、quorum、tombstone、修复队列、跨节点 MPU | `scripts/cluster-smoke.sh 3`（本机 3 进程） |
 | 纠删码测试（v0.2.0） | GF 运算、柯西矩阵求逆、任意 ≤m 片重建 | `internal/ec` 单测 + `cluster-smoke.sh 6 --ec` |
@@ -278,6 +278,14 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 - 信任 CA 的客户端完成 `/healthz`、桶/对象往返与 Presigned URL 下载；断言协商版本 ≥ TLS 1.2、对端证书与 fixture 一致。
 - 不信任 CA → `x509.UnknownAuthorityError`；主机名不匹配 → `x509.HostnameError`；客户端降到 TLS 1.1 → 握手失败；明文访问 TLS 端口 → `400` 或断开。
 - 证书与私钥不匹配 → 二进制拒绝启动（错误含「加载 TLS 证书失败」）。
+
+**生态客户端信任链**（`scripts/tls-smoke.sh`，2026-11-25）：脚本现场生成同一组本地 CA 与服务器证书，aws-cli 2.36.2 通过 `AWS_CA_BUNDLE` 校验信任链，**不使用 `--no-verify-ssl`**：
+
+- `create-bucket`/`head-bucket`、1 KiB 对象 PUT/HEAD/GET（`cmp` 一致）、Presigned URL 经 `curl --cacert` 下载（`cmp` 一致）全部通过。
+- 不设置 `AWS_CA_BUNDLE` 的 aws-cli 与默认信任库的 `curl` 均失败，证明信任链确实被校验而非跳过。
+- `curl --tls-max 1.1` 握手失败，生态客户端侧再次验证 TLS ≥ 1.2。
+- debug 日志确认 aws-cli 的 PutObject 进入 `aws_chunked_decoded`（`signed:false`，trailer `x-amz-checksum-crc64nvme`），即 TLS 与真实客户端的 aws-chunked 路径同时走通。
+- **仍未覆盖**：生产 CA、证书轮换、mTLS（06 明确不做）。
 
 ## 记录指标
 
