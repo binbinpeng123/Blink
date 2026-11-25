@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -407,6 +408,56 @@ func TestPutObjectRejectsNegativeLength(t *testing.T) {
 		t.Fatalf("err = %v，期望 ErrIncompleteBody", err)
 	}
 }
+
+// TestPutObjectUnknownSize 覆盖 POST Object 的写入形态：调用方无法预知长度，
+// 长度以实际读到的字节数为准，且不进入"按声明长度预读"的内联快路径。
+func TestPutObjectUnknownSize(t *testing.T) {
+	s := newSmallBlockStore(t, 64, 16)
+	body := []byte("unknown-length-body")
+	info, err := s.PutObject("bkt", "k", bytes.NewReader(body), PutOptions{
+		ExpectedSize: -1,
+		UnknownSize:  true,
+	})
+	if err != nil {
+		t.Fatalf("未知长度写入失败: %v", err)
+	}
+	if info.Size != int64(len(body)) {
+		t.Fatalf("Size = %d，期望 %d", info.Size, len(body))
+	}
+	r, err := s.OpenObject("bkt", "k")
+	if err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := r.WriteRangeTo(&buf, 0, r.Info().Size); err != nil {
+		t.Fatalf("读取内容失败: %v", err)
+	}
+	if !bytes.Equal(buf.Bytes(), body) {
+		t.Fatalf("内容 = %q，期望 %q", buf.Bytes(), body)
+	}
+}
+
+// TestPutObjectUnknownSizeReaderError 说明长度未知时"截断"由读取器的错误
+// 暴露；读取器返回的错误必须原样上抛，且不留下对象。
+func TestPutObjectUnknownSizeReaderError(t *testing.T) {
+	s := newSmallBlockStore(t, 64, 16)
+	sentinel := errors.New("读取中断")
+	body := io.MultiReader(bytes.NewReader([]byte("partial")), errReader{sentinel})
+	_, err := s.PutObject("bkt", "k", body, PutOptions{
+		ExpectedSize: -1,
+		UnknownSize:  true,
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v，期望包装 %v", err, sentinel)
+	}
+	if _, err := s.loadObjectMeta("bkt", "k"); !errors.Is(err, ErrNoSuchKey) {
+		t.Errorf("读取失败的对象不该可见: %v", err)
+	}
+}
+
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestPutObjectValidation(t *testing.T) {
 	s := newSmallBlockStore(t, 64, 16)

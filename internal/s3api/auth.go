@@ -40,6 +40,8 @@ type authResult struct {
 	AccessKeyID   string
 	ContentSHA256 string
 	Presigned     bool
+	// PostPolicy 标识本次请求走的是 POST Object 的表单 policy 签名。
+	PostPolicy bool
 	// Policy 是本次请求的授权策略；签名通过但策略表缺失时为 nil，
 	// 此时 authorizeRequest 会拒绝（见 Policy.Allow 的 nil 语义）。
 	Policy *authz.Policy
@@ -93,12 +95,41 @@ func withAuth(opt AuthOptions, next http.Handler) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if opt.Disabled || unauthenticatedPaths[r.URL.Path] {
+		if unauthenticatedPaths[r.URL.Path] {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		res, serr := sigv4.Verify(r, verifyOpt)
+		// POST Object 的签名材料就是表单字段本身，必须先解析才能验签。
+		// 解析结果放进上下文交给 handler，避免请求体（含 file part）被读两遍。
+		var form *postObjectForm
+		if isPostObjectRequest(r) {
+			f, fserr := readPostObjectForm(r)
+			if fserr != nil {
+				loggerFrom(r.Context(), nil).Warn("post_form_failed",
+					slog.String("code", string(fserr.Code)),
+					slog.String("message", fserr.Message),
+					slog.String("access_key", redactKeyID(accessKeyOf(r))),
+				)
+				fserr.Write(w, r, requestIDFrom(r.Context()))
+				return
+			}
+			form = f
+			r = r.WithContext(context.WithValue(r.Context(), postObjectFormCtxKey, form))
+		}
+
+		if opt.Disabled {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		var res *sigv4.Result
+		var serr *s3err.Error
+		if form != nil {
+			res, serr = sigv4.VerifyPostPolicy(form.authFields(), verifyOpt)
+		} else {
+			res, serr = sigv4.Verify(r, verifyOpt)
+		}
 		if serr != nil {
 			// 鉴权失败必须记日志：它是唯一能区分"客户端配错"与"有人在爆破"的信号。
 			// 注意不记录请求体、Authorization 头原文或任何密钥片段。
@@ -136,6 +167,7 @@ func withAuth(opt AuthOptions, next http.Handler) http.Handler {
 		loggerFrom(r.Context(), nil).Debug("auth_ok",
 			slog.String("access_key", redactKeyID(res.AccessKeyID)),
 			slog.Bool("presigned", res.Presigned),
+			slog.Bool("post_policy", res.PostPolicy),
 			slog.Bool("payload_signed", res.PayloadSigned()),
 		)
 
@@ -143,6 +175,7 @@ func withAuth(opt AuthOptions, next http.Handler) http.Handler {
 			AccessKeyID:   res.AccessKeyID,
 			ContentSHA256: res.ContentSHA256,
 			Presigned:     res.Presigned,
+			PostPolicy:    res.PostPolicy,
 			ChunkSigner:   res.ChunkSigner,
 			Policy:        policy,
 		})
@@ -162,6 +195,10 @@ func accessKeyOf(r *http.Request) string {
 			return ak
 		}
 		return ""
+	}
+	if form := postObjectFormFrom(r); form != nil {
+		ak, _, _ := strings.Cut(form.fields["x-amz-credential"], "/")
+		return ak
 	}
 	if cred, ok := rawQueryValue(r.URL.RawQuery, "X-Amz-Credential"); ok {
 		ak, _, _ := strings.Cut(cred, "/")

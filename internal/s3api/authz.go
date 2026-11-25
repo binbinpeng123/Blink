@@ -17,8 +17,8 @@ var errAccessDenied = errors.New("s3api: 无权限")
 
 // classifyAction 把请求归类为授权动作。
 //
-// 返回 false 表示这条请求不触达任何数据（例如没有 ?delete 的桶级 POST），
-// 随后会被 501 兜底。分类只看方法与子资源，不解析请求体。
+// 返回 false 表示这条请求不触达任何数据（例如没有 ?delete 也没有表单的
+// 桶级 POST），随后会被 501 兜底。分类只看方法与子资源，不解析请求体。
 func classifyAction(r *http.Request, bucket, key string) (authz.Action, bool) {
 	// 根路径是 ListBuckets：不按单一动作过滤，由结果可见性过滤。
 	if bucket == "" {
@@ -35,6 +35,12 @@ func classifyAction(r *http.Request, bucket, key string) (authz.Action, bool) {
 	// POST /{bucket}?delete：请求级按 delete 检查桶，handler 内逐 key 再查。
 	if q.Has("delete") {
 		return authz.ActionDelete, true
+	}
+
+	// POST Object（表单直传）写的是表单里的 key，入口处无法逐 key 判定，
+	// 先要求桶级 write；key 级的约束由 policy 条件承担。
+	if isPostObjectRequest(r) {
+		return authz.ActionWrite, true
 	}
 
 	if q.Has("uploads") {

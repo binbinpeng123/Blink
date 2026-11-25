@@ -24,6 +24,8 @@ type Result struct {
 	ContentSHA256 string
 	// Presigned 标识本次请求走的是查询参数签名。
 	Presigned bool
+	// PostPolicy 标识本次请求走的是 POST Object 的表单 policy 签名。
+	PostPolicy bool
 	// RequestTime 是客户端在请求中声明的时间。
 	RequestTime time.Time
 	// ExpiresAt 仅对 Presigned 有效，为链接失效时刻。

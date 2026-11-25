@@ -45,6 +45,7 @@
 | **集群条件写是尽力而为** | 写前 `probeMetas` 读 R 份元数据判定 `If-None-Match` / `If-Match`，probe 与 meta 提交之间无跨节点锁 | 两个协调者对同一 key 的并发条件写可能都成功，不提供线性化保证。`PutObject`、`CopyObject` 目标与 `CompleteMultipartUpload` 都适用该例外，语义一致 |
 | **DeleteObjects 单次最多 1000 个对象** | 与 S3 契约一致，防止单请求占用过多 worker 与内存 | 超过 1000 或 XML 非法 → `400 MalformedXML`；更大批量需客户端分批 |
 | **Range 不支持多区间** | 简化实现，S3 客户端极少使用 | 多区间请求返回 `501` |
+| **POST Object 表单直传仅经自建客户端验证** | 表单签名由 `sigv4.SignPostPolicy` 生成；集成测试用真实二进制、真实 `multipart/form-data` 与 SigV4 POST policy 端到端验证 | 已覆盖 204/201/303、policy 过期、未覆盖字段、`content-length-range`、未实现能力字段 `501`。**真实浏览器表单与 aws-sdk-js 浏览器端未实测，不得声称互操作已验证**。不支持表单 `Content-MD5`（`400`）、SigV2（`501`）与 STS 临时凭据（`501`）；`success_action_redirect` 只校验 http(s) scheme，不校验主机 |
 | **内核预读提示默认关闭，实测无收益** | 逐块顺序读的价值已由内核 readahead 启发式覆盖；`fadvise(WILLNEED)`/`F_RDADVISE` 在冷缓存顺序下载下反而更慢（5.21 ms → 5.47 ms，见 09 文档） | `--readahead` / `BLINK_READAHEAD` 可开启，但**不得宣称任何性能收益**；仅 Linux（amd64/arm64 等，32 位 ARM 为空实现）与 macOS 生效，其它平台为空操作。收益需在 eMMC/SD/机械盘上重新验证 |
 | **分片下载（`partNumber=N`）只对分片上传对象生效** | 边界来自 Complete 时写入 `meta.json` 的 `parts`；`PutObject`/`CopyObject` 不产生该字段 | 非分片对象 `partNumber=1` 返回 `200` 整对象，`partNumber>1` → `416 InvalidPartNumber`；复制后的对象不保留源分片边界 |
 | **启动时不做 CAS 全盘完整性扫描** | 保证启动代价与对象数量弱相关 | 已损坏但未被访问的块不会在启动时被发现；后台巡检会在下一个周期（默认 24h）发现它，长期不访问的数据因此最长有一个周期的发现延迟 |

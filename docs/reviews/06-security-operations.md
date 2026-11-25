@@ -91,6 +91,23 @@ Blink 目前的鉴权只有一组来自 `--access-key` / `--secret-key`（或 `B
 - 拒绝统一 `403 AccessDenied`，日志 `s3_authz_denied`，**不区分**"桶不存在""key 不存在""无权限"。
 - 环境变量凭据不进入策略表，视为 `allowAll`；文件凭据的每个 Access Key 都有显式策略。若签名通过但策略表查不到对应 AK（例如 Provider 被外部替换），按拒绝处理，绝不默认放行。
 
+### 1a. POST Object 的鉴权归属（表单直传）
+
+`POST /{bucket}`（`multipart/form-data`）没有 `Authorization` 头，凭据与签名都在表单字段里。校验被拆成三层，各层只做自己那一件事：
+
+| 层 | 位置 | 职责 |
+| --- | --- | --- |
+| 验签 | `internal/sigv4`（`VerifyPostPolicy`） | 检查 `x-amz-algorithm`/`x-amz-credential`/`x-amz-date`/`x-amz-signature` 形态，查 Access Key，比对 `HMAC-SHA256(signingKey, base64Policy)`，校验 credential 中的区域与日期。**不判定 policy 内容**，只证明"这份 policy 是持钥方签发的" |
+| policy 条件 | `internal/s3api`（POST 表单解析 + policy 求值） | 解析 base64 policy，检查 `expiration`、逐条匹配 `conditions`、强制"表单字段必须被条件覆盖"、`${filename}` 替换、`content-length-range` |
+| 授权 | `internal/s3api`（`classifyAction`） | 桶级 multipart POST 归类为 `write`，沿既有的 policy 表判定 AK 是否可写该桶；被拒时与其它写请求一样 `403 AccessDenied` 并记 `s3_authz_denied` |
+
+分层的原因：policy 内容是客户端可写的 JSON，把它交给通用签名代码会让 `internal/sigv4` 同时承担"HTTP 头签名"和"表单策略语言"两种不相关的语义；反过来，让 s3api 自己算签名则会把 HMAC 派生逻辑复制出第二份。两层各自有独立单测与固定向量。
+
+- policy 的 `expiration` 是唯一的时限来源，**不叠加**头部签名的 15 分钟时钟容差——否则离线签发、稍后上传的正常流程会被误杀。
+- 任何字段未覆盖、过期、或 `bucket` 字段与 URL 不一致都按**条件失败**拒绝，不回显 policy 内容（错误消息只带失败的条件本身，不泄露策略全文）。
+- 表单里的 `x-amz-security-token` 一律 `501`：本版本没有 STS，接受它等于默认"临时凭据"语义已生效。
+- 审计日志中 `presigned` 为 `false`（POST 既不是头部签名也不是预签名 URL），签名方式记录在 `s3_auth_ok` 的 Debug 日志里。
+
 ### 2. 审计日志
 
 在鉴权成功之后、业务 handler 之前输出单行 JSON `s3_audit`：

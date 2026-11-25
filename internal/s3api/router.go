@@ -284,7 +284,6 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 			}
 		case http.MethodPost:
 			// POST /{bucket}?delete 是 DeleteObjects（批量删除）。
-			// 没有 ?delete 的桶级 POST 不是 S3 的合法操作，落到兜底 501。
 			if r.URL.Query().Has("delete") {
 				if !s.requireStore(w, r, reqID) {
 					return
@@ -292,6 +291,16 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) {
 				s.handleDeleteObjects(w, r, bucket, reqID)
 				return
 			}
+			// POST /{bucket} + multipart/form-data 是 POST Object（表单直传）。
+			// 表单在鉴权中间件里已解析，这里只做分派。
+			if isPostObjectRequest(r) {
+				if !s.requireStore(w, r, reqID) {
+					return
+				}
+				s.handlePostObject(w, r, bucket, reqID)
+				return
+			}
+			// 其余桶级 POST 不是 S3 的合法操作，落到兜底 501。
 		}
 	case key != "":
 		// 对象级操作。

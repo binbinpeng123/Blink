@@ -49,6 +49,9 @@ const (
 	CodeLengthRequired               Code = "LengthRequired"
 	CodeNoSuchCORSConfiguration      Code = "NoSuchCORSConfiguration"
 	CodeAccessForbidden              Code = "AccessForbidden"
+	CodeMalformedPOSTRequest         Code = "MalformedPOSTRequest"
+	CodeInvalidPolicyDocument        Code = "InvalidPolicyDocument"
+	CodeEntityTooLarge               Code = "EntityTooLarge"
 )
 
 // Error 是一条可返回给客户端的 S3 错误。
@@ -140,6 +143,9 @@ var table = map[Code]*Error{
 	CodeLengthRequired:               {Code: CodeLengthRequired, Message: "You must provide a Content-Length header.", HTTPStatus: http.StatusLengthRequired},
 	CodeNoSuchCORSConfiguration:      {Code: CodeNoSuchCORSConfiguration, Message: "The CORS configuration does not exist.", HTTPStatus: http.StatusNotFound},
 	CodeAccessForbidden:              {Code: CodeAccessForbidden, Message: "CORSResponse: This CORS request is not allowed.", HTTPStatus: http.StatusForbidden},
+	CodeMalformedPOSTRequest:         {Code: CodeMalformedPOSTRequest, Message: "The body of your POST request is not well-formed multipart/form-data.", HTTPStatus: http.StatusBadRequest},
+	CodeInvalidPolicyDocument:        {Code: CodeInvalidPolicyDocument, Message: "The content of the form does not meet the conditions specified in the policy document.", HTTPStatus: http.StatusBadRequest},
+	CodeEntityTooLarge:               {Code: CodeEntityTooLarge, Message: "Your proposed upload exceeds the maximum allowed size.", HTTPStatus: http.StatusBadRequest},
 }
 
 // Get 返回错误码对应的规范错误；未知错误码回落到 InternalError，避免把
