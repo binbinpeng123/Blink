@@ -319,8 +319,9 @@ BenchmarkPutSmallObject10k                 创新 D 对照组
 BenchmarkList100kObjects                   创新 D 对照组
 BenchmarkConcurrentPut/{4,16,64}（当前实现：BenchmarkConcurrentPut1MiB，64 worker）
 BenchmarkConcurrentGet/{4,16,64}
-BenchmarkDedupSecondCopy/1GiB              创新 A 验收
-BenchmarkCompleteMultipart20GB             创新 B 验收
+BenchmarkPutWriteBytes/{1KiB,64KiB,1MiB,16MiB}  每操作写入字节数（写放大）
+BenchmarkDedupSecondCopyWriteBytes/16MiB   创新 A 验收（1 GiB 版待写入预算）
+BenchmarkMPUCompleteWriteBytes             创新 B 验收（20 GiB 版待写入预算）
 BenchmarkCRC64NVME/1GiB                    校验开销量化
 BenchmarkCRC32C/1GiB                       对照组
 BenchmarkSigV4Verify                       签名开销
@@ -329,10 +330,10 @@ BenchmarkSigV4Verify                       签名开销
 **实际执行范围（2026-11-07）**：写入档位为 1 KiB / 64 KiB / 1 MiB / 16 MiB。
 8 MiB 并入 16 MiB 档（16 MiB 同样跨 4 个 4 MiB 块）；128 MiB / 1 GiB 受
 "本机压测总写入 ≤ 512 MiB"约束未执行，不得写成已通过。上表中
-`BenchmarkGetRangeRandom/1GiB`、`BenchmarkDedupSecondCopy/1GiB`、
-`BenchmarkCompleteMultipart20GB` 目前仍是**计划项**，未实现为可执行基准
-（三者都需要 1 GiB / 20 GiB 级写入预置，超出本机写入预算；实现时必须先解决
-低写入量的预置方式，否则不得声称已通过）。
+`BenchmarkGetRangeRandom/1GiB` 目前仍是**计划项**，未实现为可执行基准
+（需要 1 GiB 级写入预置，超出本机写入预算；实现时必须先解决低写入量的
+预置方式，否则不得声称已通过）。创新 A/B 的验收基准已实现，但规模按写入
+预算下调为 16 MiB 与 6 MiB（见下），1 GiB / 20 GiB 版本仍属计划项。
 
 **2026-11-25 补齐**（Apple M4 / APFS，`-benchtime=3s`，只作本机回归基线）：
 
@@ -352,6 +353,24 @@ BenchmarkSigV4Verify                       签名开销
 `internal/sigv4/bench_test.go`，复用测试向量里的签名请求。三者默认都不随
 `go test ./...` 运行（无 `-bench` 时跳过）。
 
+**2026-11-25 写入字节数**（Apple M4 / APFS，`-benchtime=1x`，只作本机回归基线）：
+
+| 基准 | write-B/op | 说明 |
+| --- | --- | --- |
+| `BenchmarkPutWriteBytes/1KiB` | 1,386 | 对象 1,024 B + 约 360 B 对象元数据 |
+| `BenchmarkPutWriteBytes/64KiB` | 65,902 | 64 KiB + 约 366 B 元数据 |
+| `BenchmarkPutWriteBytes/1MiB` | 1,048,945 | 1 MiB + 约 369 B 元数据 |
+| `BenchmarkPutWriteBytes/16MiB` | 16,777,977 | 4 × 4 MiB 块 + 约 761 B 元数据 |
+| `BenchmarkDedupSecondCopyWriteBytes` | 753 | 同内容第二份只写元数据，4 个数据块全部命中 CAS |
+| `BenchmarkMPUCompleteWriteBytes` | 693 | 6 MiB 分片上传后 Complete 只写元数据，不搬运分片 |
+
+实现位于 `test/bench/countfs_test.go`（给 `store.FileSystem` 套计数包装，
+只统计 `OpenFile`/`WriteFile`，读路径与 fsync 行为不变）与
+`test/bench/write_bytes_bench_test.go`。写入字节数与迭代次数无关，**必须**
+用 `-benchtime=1x` 运行（默认按吞吐自动加迭代，16 MiB 档一轮即可写出数
+GiB，违反本机写入预算）；上表合计写入约 55 MiB。数据块每块首 8 字节写
+入序号，避免 CAS 去重使量到的写放大偏小。
+
 `BenchmarkHTTPGetObject` 已于 2026-11-24 实现（`test/bench/http_read_bench_test.go`），
 补齐"存储读路径"与"HTTP 写出路径"之间的缺口：其余 GET 基准把响应写进
 `io.Discard`（它自带 `ReaderFrom`），量不到中间件是否挡住了零拷贝。该基准走
@@ -365,7 +384,7 @@ BenchmarkSigV4Verify                       签名开销
 115.7 objects/s。结论与本版本不做 D 的理由见 03 文档。该基准单次迭代写入
 10 MiB，满足本机压测写入约束；默认不随 `go test ./...` 运行（无 `-bench` 时跳过）。
 
-每个基准使用 `b.ReportAllocs()` 与 `b.SetBytes(n)` 输出吞吐。**每操作写入字节数**（`ReportMetric`）目前仍是**计划项**：它需要给 `store.FileSystem` 套一层计数包装，现有基准尚未接入，因此创新 A 与 B 的"写入量不增长"目前只能靠代码审查，不能靠基准直接断言。
+每个基准使用 `b.ReportAllocs()` 与 `b.SetBytes(n)` 输出吞吐。**每操作写入字节数**（`ReportMetric`）已接入：`BenchmarkPutWriteBytes`、`BenchmarkDedupSecondCopyWriteBytes`、`BenchmarkMPUCompleteWriteBytes` 通过计数 `FileSystem` 直接输出 `write-B/op`。据此，创新 A（去重第二份 753 B/op）与创新 B（MPU Complete 693 B/op，不随分片总大小增长）的"写入量不增长"已可被基准断言，不再只靠代码审查。1 GiB / 20 GiB 规模的原始验收项仍受本机写入预算限制，未执行。
 
 ## 验收门槛
 

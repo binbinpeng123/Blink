@@ -457,6 +457,7 @@ go test ./internal/s3api/ -run 'TestStatusRecorderReadFrom|TestGetObjectStreamsT
 go test ./test/bench/ -run '^$' -bench 'BenchmarkGetRangeSequential' -benchtime=200ms -count=2
 go test ./test/bench/ -run '^$' -bench 'BenchmarkConcurrentPut1MiB' -benchtime=200ms -count=2
 go test ./test/bench/ -run '^$' -bench 'BenchmarkConcurrentGet' -benchtime=1s -count=2
+go test ./test/bench/ -run '^$' -bench 'WriteBytes' -benchtime=1x -count=1
 go test ./test/bench/ -run '^$' -bench 'BenchmarkList100kObjects' -benchtime=1x -count=1
 
 go test ./internal/checksum/ -run '^$' -bench 'BenchmarkCRC64NVME|BenchmarkCRC32C' -benchtime=1s
@@ -467,6 +468,8 @@ go test ./internal/store/ -run '^$' -bench 'Benchmark(Put|Get|List)Small' -bench
 ```
 
 LIST 基准会预置 10 万对象（约 176 MB 写入），单独运行并计入本机写入总量。
+`WriteBytes` 基准必须固定 `-benchtime=1x`：写入字节数与迭代次数无关，默认
+跑法会按吞吐自动加迭代，单轮 16 MiB 档即可写出数 GiB。
 
 `-bench 'BenchmarkGetRangeSequential'` 是前缀匹配，会同时跑默认（预读关闭）与
 `BenchmarkGetRangeSequentialWithReadahead` 两个基准。后者只用来把"默认关闭"
