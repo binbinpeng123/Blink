@@ -18,7 +18,7 @@ import (
 //	      meta.json               key、size、etag、content-type、mtime、
 //	                              user meta、块描述列表（内嵌，非独立文件）
 //	  cas/<hash 前 2 位>/<hash>  内容寻址块存储（只读、只增）
-//	  tmp/                       写入暂存，启动时清扫
+//	  tmp/                       历史临时目录：当前写入不使用，启动时清空
 //	  multipart/<uploadId>/      分片上传状态（切片 7）
 //
 // 对象目录下**只有 meta.json**：块描述内嵌在它里面，因此"对象可见"

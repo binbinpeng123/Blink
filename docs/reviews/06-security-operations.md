@@ -187,7 +187,7 @@ Blink 目前的鉴权只有一组来自 `--access-key` / `--secret-key`（或 `B
 | 证书来源 | 运维负责；本版本不做 ACME 自动签发与轮换。建议由 K8s Secret/证书管理器挂载并以滚动重启生效 |
 | 内部端口 | 9100 为明文 HTTP + HMAC 共享密钥；只能部署在内网/同 namespace，跨不可信网络必须加隧道或反代（既有 known-limitation） |
 | 备份 | 数据目录自包含（`bucket.json`、`meta.json`、CAS 块、`disk.json`）。一致性备份要求**先停止写入**（SIGTERM 优雅关闭）或对数据目录做文件系统快照；不支持在线增量备份工具 |
-| 恢复 | 停止进程 → 用备份替换整个数据目录 → 启动；启动清扫会处理 `tmp/` 孤儿。恢复后建议跑一次显式校验读或 `ScrubObject` 抽样 |
+| 恢复 | 停止进程 → 用备份替换整个数据目录 → 启动；启动会清空历史 `tmp/` 目录，`.tmp-*` 孤儿由 GC 按年龄回收。恢复后建议跑一次显式校验读或 `ScrubObject` 抽样 |
 | 升级 | 先备份/快照，再替换二进制重启；数据格式向后兼容由 07 文档声明。回滚要求新版本未写入旧版本不认识的新字段；本切片的凭据文件与 stores 水位参数均为纯增量 |
 | 日志保留 | 只写 stderr，单行 JSON；轮转与保留由 systemd/journald、容器 runtime 或日志采集器负责，本版本不内置轮转 |
 | 告警（建议，不内置规则） | `507` 速率 > 0、`blink_disk_write_blocked == 1`、`blink_disk_used_ratio > 0.9`、`blink_auth_failures_total` 持续增长、`/readyz` 不可达 |

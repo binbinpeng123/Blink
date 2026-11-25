@@ -192,7 +192,7 @@ go test -run=^$ -fuzz=^FuzzServeHTTPAuth$ -fuzztime=20s ./internal/s3api
 
 ### 进程中断
 
-1. **故障注入（主力手段）**：`internal/store/fs.go` 定义 `FileSystem` 接口，测试实现包装真实文件系统的 `faultFS`，在第 N 次 `Sync` 或 `Rename` 注入错误。这是唯一能精确、可复现地覆盖"写到一半"所有中间态的方法，因此作为主力。
+1. **故障注入（主力手段）**：`internal/store/fs.go` 定义 `FileSystem` 接口，测试实现包装真实文件系统的 `faultFS`，在 `OpenFile`、`Write`、`Sync`、`Rename`、`SyncDir` 的第 N 次调用注入错误。这是唯一能精确、可复现地覆盖"写到一半"所有中间态的方法，因此作为主力。
 2. **真实杀进程**：集成测试以子进程模式启动服务，父进程在随机延迟后发送 `SIGKILL`；恢复后断言结果只可能是"对象不存在"或"内容逐字节相等"。
 3. **掉电模拟**：macOS 无法可靠模拟，**本阶段不做**，改由故障注入覆盖"fsync 后 rename 前"这一最关键窗口。此限制必须记录，不得声称已测试掉电。
 
