@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 )
 
 // 本文件是单机存储对集群层暴露的"副本引擎"API。
@@ -329,7 +330,6 @@ func validateReplicaMeta(key string, m *ObjectMeta) error {
 // 按错误的边界拼出内容（或少写一段后正常返回）。
 func validateBlockTable(m *ObjectMeta) error {
 	var next int64
-	var total int64
 	for _, b := range m.Blocks {
 		if err := validateBlockHash(b.Hash); err != nil {
 			return err
@@ -340,11 +340,16 @@ func validateBlockTable(m *ObjectMeta) error {
 		if b.Offset != next {
 			return fmt.Errorf("%w: 块 %s 偏移 %d，期望 %d", ErrCorrupt, b.Hash, b.Offset, next)
 		}
+		// 溢出不等于"恰好等于 Size"：几个接近 MaxInt64 的块能把总长
+		// 绕回任意值，从而伪造出一张"总长匹配"的块表。这里显式拒绝，
+		// next 因此始终保持非负（初值 0 + 每步不超过 MaxInt64-next）。
+		if b.Length > math.MaxInt64-next {
+			return fmt.Errorf("%w: 块表总长在块 %s 处溢出 int64", ErrCorrupt, b.Hash)
+		}
 		next += b.Length
-		total += b.Length
 	}
-	if total != m.Size {
-		return fmt.Errorf("%w: 块总长 %d 与对象大小 %d 不符", ErrCorrupt, total, m.Size)
+	if next != m.Size {
+		return fmt.Errorf("%w: 块总长 %d 与对象大小 %d 不符", ErrCorrupt, next, m.Size)
 	}
 	if m.Size > 0 && len(m.Blocks) == 0 {
 		return fmt.Errorf("%w: 非空对象没有块表", ErrCorrupt)
@@ -378,6 +383,10 @@ func validateParts(m *ObjectMeta) error {
 		}
 		if p.Size < 0 {
 			return fmt.Errorf("%w: 分片 %d 长度 %d 为负", ErrCorrupt, p.Number, p.Size)
+		}
+		// 与块表同理：溢出能把总长绕回 Size，必须显式拒绝。
+		if p.Size > math.MaxInt64-total {
+			return fmt.Errorf("%w: 分片总长在分片 %d 处溢出 int64", ErrCorrupt, p.Number)
 		}
 		last = p.Number
 		total += p.Size

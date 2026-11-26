@@ -385,15 +385,25 @@ func (s *Store) readObjectMetaAt(path string) (*objectMeta, error) {
 	if err != nil {
 		return nil, err
 	}
+	return decodeObjectMeta(data, path)
+}
+
+// decodeObjectMeta 把 meta.json 的字节解析成结构自洽的元数据。
+//
+// 单独抽成纯函数是为了让模糊测试直接喂字节：盘上的 meta.json 同样不可信，
+// 每个分支都必须"拒绝而不崩溃"，fuzz 能把 panic 从进程崩溃降级成一次失败。
+//
+// name 只用于错误信息（文件路径或 fuzz 标记），不参与判断。
+func decodeObjectMeta(data []byte, name string) (*objectMeta, error) {
 	var m objectMeta
 	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, fmt.Errorf("%w: 对象元数据 %s 不是合法 JSON: %v", ErrCorrupt, path, err)
+		return nil, fmt.Errorf("%w: 对象元数据 %s 不是合法 JSON: %v", ErrCorrupt, name, err)
 	}
 	// 解析通过不代表结构自洽：块表被截断时 JSON 仍然合法，读路径却会按
 	// 留下的块少写一段后"正常"返回，HTTP 层只表现为连接被截断。在入口
 	// 拦住它，把静默短读变成可诊断的 ErrCorrupt（GC/巡检同样受益）。
 	if err := validateLocalMeta(&m); err != nil {
-		return nil, fmt.Errorf("%w: 对象元数据 %s 结构不自洽: %v", ErrCorrupt, path, err)
+		return nil, fmt.Errorf("%w: 对象元数据 %s 结构不自洽: %v", ErrCorrupt, name, err)
 	}
 	return &m, nil
 }
@@ -453,6 +463,10 @@ func mustJSON(v any) []byte {
 	return data
 }
 
+// maxMetaBytes 是元数据文件的读取上限。32 MiB 远超任何合法元数据，
+// 只用来拦住损坏盘上的超大文件，避免读完才发现异常。
+const maxMetaBytes = 32 << 20
+
 // readFile 是读取小文件的辅助函数（元数据都是小文件，一次性读入最简单）。
 func readFile(fsys FileSystem, path string) ([]byte, error) {
 	f, err := fsys.Open(path)
@@ -461,35 +475,14 @@ func readFile(fsys FileSystem, path string) ([]byte, error) {
 	}
 	defer f.Close()
 
-	// 元数据文件理论上很小，但损坏的盘上可能出现超大文件。
-	// 设上限避免读进内存后才发现异常 —— 32 MiB 远超任何合法元数据。
-	const maxMetaBytes = 32 << 20
-	r := &limitedReader{r: f, remaining: maxMetaBytes}
-	out, err := io.ReadAll(r)
+	// 多读 1 字节用来区分"恰好等于上限"与"超过上限"：判定超限必须
+	// 真的看到第 maxMetaBytes+1 个字节，否则边界上的文件会被误杀。
+	out, err := io.ReadAll(io.LimitReader(f, maxMetaBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if r.remaining == 0 {
+	if len(out) > maxMetaBytes {
 		return nil, fmt.Errorf("%w: 元数据文件 %s 超过 %d 字节上限", ErrCorrupt, path, maxMetaBytes)
 	}
 	return out, nil
-}
-
-// limitedReader 把读取量限制在 remaining 内；用尽即报错而不是返回 EOF ——
-// EOF 会被上层当成"文件正常结束"，从而把截断的元数据读成合法 JSON。
-type limitedReader struct {
-	r         io.Reader
-	remaining int
-}
-
-func (l *limitedReader) Read(p []byte) (int, error) {
-	if l.remaining <= 0 {
-		return 0, io.ErrNoProgress
-	}
-	if len(p) > l.remaining {
-		p = p[:l.remaining]
-	}
-	n, err := l.r.Read(p)
-	l.remaining -= n
-	return n, err
 }

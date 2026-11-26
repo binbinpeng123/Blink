@@ -570,6 +570,83 @@ func TestWriteFileAtomicOverwrite(t *testing.T) {
 	}
 }
 
+// patternFile 生成 size 字节可重复内容，不占内存也不落盘 ——
+// 用来测元数据读取上限的边界，避免真的写一个 32 MiB 的测试文件。
+type patternFile struct {
+	remaining int64
+	fill      []byte
+}
+
+func (p *patternFile) Read(b []byte) (int, error) {
+	if p.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(b)) > p.remaining {
+		b = b[:p.remaining]
+	}
+	for i := range b {
+		b[i] = p.fill[i%len(p.fill)]
+	}
+	p.remaining -= int64(len(b))
+	return len(b), nil
+}
+
+func (p *patternFile) Write([]byte) (int, error) { return 0, errors.New("测试文件不支持写入") }
+func (p *patternFile) Close() error              { return nil }
+
+// openOverrideFS 只替换指定路径的 Open，其余调用转给真实 FS。
+type openOverrideFS struct {
+	FileSystem
+	path string
+	file io.ReadWriteCloser
+}
+
+func (f *openOverrideFS) Open(path string) (io.ReadWriteCloser, error) {
+	if path == f.path {
+		return f.file, nil
+	}
+	return f.FileSystem.Open(path)
+}
+
+// TestReadFileSizeLimit 固定元数据读取上限的两侧边界：恰好 32 MiB 必须
+// 放行，多 1 字节必须报 ErrCorrupt。
+//
+// 旧实现用"缓冲用尽即报错"的 reader：恰好等于上限时 io.ReadAll 会先拿到
+// ErrNoProgress，错误既不是 ErrCorrupt、也指不到真正原因；而"超过上限"
+// 的报错永远走不到。边界必须按"看到第 size+1 个字节"判定。
+func TestReadFileSizeLimit(t *testing.T) {
+	const path = "/synthetic/meta.json"
+	for _, c := range []struct {
+		name    string
+		size    int64
+		wantErr bool
+	}{
+		{"恰好等于上限", maxMetaBytes, false},
+		{"超过上限 1 字节", maxMetaBytes + 1, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fsys := &openOverrideFS{
+				FileSystem: OSFS(),
+				path:       path,
+				file:       &patternFile{remaining: c.size, fill: []byte("{}\n")},
+			}
+			got, err := readFile(fsys, path)
+			if c.wantErr {
+				if !errors.Is(err, ErrCorrupt) {
+					t.Fatalf("超限读取 = %v，期望 ErrCorrupt", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("边界上的文件不应被拒绝: %v", err)
+			}
+			if int64(len(got)) != c.size {
+				t.Errorf("读到 %d 字节，期望 %d", len(got), c.size)
+			}
+		})
+	}
+}
+
 // failRenameFS 在第 failOn 次 Rename 上注入错误。
 //
 // 这是切片 8 故障注入的最小预演：writeFileAtomic 的正确性主张是
