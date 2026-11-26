@@ -47,6 +47,7 @@ ALL=(
   internal/sigv4:FuzzParseAuthorization
   internal/store:FuzzValidateBucketName
   internal/store:FuzzParsePartFileName
+  internal/store:FuzzDecodeObjectMeta
 )
 
 selected=()

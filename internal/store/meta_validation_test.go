@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"math"
+	"strings"
 	"testing"
 )
 
@@ -77,5 +79,35 @@ func TestOpenObjectRejectsStructurallyCorruptMeta(t *testing.T) {
 				t.Fatalf("CopyObject 错误 = %v，期望 ErrCorrupt", err)
 			}
 		})
+	}
+}
+
+// TestValidateBlockTableRejectsInt64Overflow 固定溢出防线。
+//
+// 4 个 2^62 的块让 int64 累加绕回 0：不加检查时偏移链与总长都会"恰好"
+// 自洽，一个 size=0 的对象就能带上一张指向 16 EiB 数据的块表。
+func TestValidateBlockTableRejectsInt64Overflow(t *testing.T) {
+	const len2_62 = math.MaxInt64/2 + 1
+	hash := strings.Repeat("a", 64)
+	m := &ObjectMeta{Size: 0, Blocks: []BlockDesc{
+		{Hash: hash, Offset: 0, Length: len2_62},
+		{Hash: hash, Offset: len2_62, Length: len2_62},
+		{Hash: hash, Offset: -(1 << 63), Length: len2_62},
+		{Hash: hash, Offset: -(1 << 63) + len2_62, Length: len2_62},
+	}}
+	if err := validateBlockTable(m); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("溢出块表 = %v，期望 ErrCorrupt", err)
+	}
+}
+
+// TestValidatePartsRejectsInt64Overflow 覆盖分片总长的同一类溢出。
+func TestValidatePartsRejectsInt64Overflow(t *testing.T) {
+	const len2_62 = math.MaxInt64/2 + 1
+	m := &ObjectMeta{Size: 0, Parts: []PartDesc{
+		{Number: 1, Size: len2_62},
+		{Number: 2, Size: len2_62},
+	}}
+	if err := validateParts(m); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("溢出分片表 = %v，期望 ErrCorrupt", err)
 	}
 }

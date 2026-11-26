@@ -55,6 +55,7 @@
 | `FuzzParsePostPolicy` | 成功时过期时刻非零、每条条件 `op ∈ {eq, starts-with, content-length-range}`，字段名已去 `$`/空白并小写，`content-length-range` 满足 `0 ≤ min ≤ max`；重复解析结果相等 |
 | `FuzzValidateBucketName` | 与**独立重写**的 AWS 规则做差分对照；失败必须是 `ErrInvalidBucketName`；确定性 |
 | `FuzzParsePartFileName` | 编号落在 `1..10000`；重写为规范文件名后解析一致 |
+| `FuzzDecodeObjectMeta` | **盘上 meta.json 同样不可信**：失败必须是 `ErrCorrupt`；成功时块表/分片总长用 `math/big` 独立复算且等于 `size`、块偏移连续、墓碑不带内容、内联内容长度一致；序列化往返后仍被接受 |
 
 运行方式：种子语料随 `go test ./...` 每次执行（毫秒级，充当回归）；有界随机探索用
 
@@ -87,6 +88,11 @@ scripts/fuzz.sh 20 FuzzParseRange FuzzParseChunkHeader
   XML 解码 + 一次重编码往返，单次成本高。它最初的 64 KiB 超限种子会让 fuzzer 反复最小化
   那个巨大输入（20 s 里有 9 s 是 `0 execs/sec`），种子已移出 fuzz 语料，超限行为改由
   确定性的 `TestBucketCORSValidationBodyLimit` 覆盖（同时验证"超限请求不破坏已有配置"）。
+
+- `FuzzDecodeObjectMeta` 30 s 运行 479 万次执行、约 16.8 万次/秒，无失败。种子覆盖合法副本、
+  墓碑、块表截断/空洞、块总长 `int64` 溢出伪造（4 个 2^62 的块绕回 `size=0`）、超出 `int64`
+  的 `size`、内联与 EC 布局、`null`/`[]`/空文档。溢出伪造在切片 54 之前能通过
+  `validateBlockTable`（偏移链与总长按 int64 环绕后"恰好"自洽），现已显式拒绝。
 
 ### HTTP handler 级 fuzz
 
