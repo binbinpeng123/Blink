@@ -48,6 +48,7 @@ ALL=(
   internal/store:FuzzValidateBucketName
   internal/store:FuzzParsePartFileName
   internal/store:FuzzDecodeObjectMeta
+  internal/store:FuzzDecodePartState
 )
 
 selected=()

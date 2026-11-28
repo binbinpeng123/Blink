@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
@@ -10,13 +12,14 @@ import (
 )
 
 // 本文件是存储层"外部输入"解析的模糊测试基线。桶名来自 URL 路径，
-// 分片文件名来自数据目录，meta.json 的内容在磁盘损坏或人为改动后同样
-// 不可信 —— 三者都必须做到"拒绝而不崩溃"。
+// 分片文件名来自数据目录，meta.json 与分片状态的内容在磁盘损坏或人为
+// 改动后同样不可信 —— 四者都必须做到"拒绝而不崩溃"。
 //
 // 有界 fuzz：
 //
 //	go test -run=^$ -fuzz=^FuzzValidateBucketName$ -fuzztime=20s ./internal/store
 //	go test -run=^$ -fuzz=^FuzzDecodeObjectMeta$ -fuzztime=20s ./internal/store
+//	go test -run=^$ -fuzz=^FuzzDecodePartState$ -fuzztime=20s ./internal/store
 func FuzzValidateBucketName(f *testing.F) {
 	for _, name := range []string{
 		"abc",
@@ -257,6 +260,111 @@ func checkDecodedMeta(m *ObjectMeta) error {
 		if int64(len(m.InlineData)) != m.Size {
 			return fmt.Errorf("内联内容 %d 字节，声明 %d", len(m.InlineData), m.Size)
 		}
+	}
+	return nil
+}
+
+// FuzzDecodePartState 把任意字节当作分片状态（part.json）喂给解析入口。
+//
+// 与 FuzzDecodeObjectMeta 的三条断言相同：不 panic、失败必须归类为
+// ErrCorrupt、成功必须按 math/big 独立复算仍然自洽。分片状态的块表
+// 偏移是"分片内偏移"，Complete 会把它们重排成对象的全局块表；这里
+// 放过一张越界块表，损坏就会被推迟到对象读路径。
+func FuzzDecodePartState(f *testing.F) {
+	const (
+		hashA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		hashB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		etag  = "d41d8cd98f00b204e9800998ecf8427e" // MD5("")，只要求格式合法
+	)
+	block := func(hash string, off, length int64) string {
+		return fmt.Sprintf(`{"hash":%q,"offset":%d,"length":%d}`, hash, off, length)
+	}
+	valid := fmt.Sprintf(`{"version":%d,"part_number":1,"etag":%q,"size":12,`+
+		`"modified":"2026-11-28T00:00:00Z","blocks":[%s,%s]}`,
+		formatVersion, etag, block(hashA, 0, 8), block(hashB, 8, 4))
+	for _, seed := range []string{
+		valid,
+		// 0 字节分片：没有块表也合法（Complete 时才校验非末片大小）。
+		fmt.Sprintf(`{"version":%d,"part_number":1,"etag":%q,"size":0}`, formatVersion, etag),
+		// 块表被截断：JSON 合法，但总长对不上。
+		fmt.Sprintf(`{"version":%d,"part_number":1,"etag":%q,"size":12,"blocks":[%s]}`,
+			formatVersion, etag, block(hashA, 0, 8)),
+		// 块表出现空洞。
+		fmt.Sprintf(`{"version":%d,"part_number":1,"etag":%q,"size":12,"blocks":[%s,%s]}`,
+			formatVersion, etag, block(hashA, 0, 8), block(hashB, 9, 4)),
+		// 溢出攻击：4 个 2^62 的块让 int64 累加绕回 0，恰好"等于" size=0。
+		fmt.Sprintf(`{"version":%d,"part_number":1,"etag":%q,"size":0,"blocks":[`+
+			block(hashA, 0, 1<<62)+`,`+
+			block(hashA, 1<<62, 1<<62)+`,`+
+			block(hashA, -(1<<63), 1<<62)+`,`+
+			block(hashA, -(1<<63)+(1<<62), 1<<62)+`]}`, formatVersion, etag),
+		fmt.Sprintf(`{"version":%d,"part_number":1,"etag":%q,"size":-1}`, formatVersion, etag),
+		// ETag 不是 MD5：后续 Complete 会把它当对象 ETag 沿用。
+		fmt.Sprintf(`{"version":%d,"part_number":1,"etag":"not-an-md5","size":0}`, formatVersion),
+		// deduped 超出块数：GC 引用集合会按它裁剪。
+		fmt.Sprintf(`{"version":%d,"part_number":1,"etag":%q,"size":12,"deduped":3,"blocks":[%s,%s]}`,
+			formatVersion, etag, block(hashA, 0, 8), block(hashB, 8, 4)),
+		// 版本与编号越界。
+		fmt.Sprintf(`{"version":%d,"part_number":1,"etag":%q,"size":0}`, formatVersion+1, etag),
+		fmt.Sprintf(`{"version":%d,"part_number":0,"etag":%q,"size":0}`, formatVersion, etag),
+		fmt.Sprintf(`{"version":%d,"part_number":10001,"etag":%q,"size":0}`, formatVersion, etag),
+		`{}`,
+		`null`,
+		`[]`,
+		``,
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, data string) {
+		ps, err := decodePartState([]byte(data), "分片状态 fuzz")
+		if err != nil {
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("解析失败必须归类为 ErrCorrupt：err=%v", err)
+			}
+			return
+		}
+		if err := checkDecodedPartState(ps); err != nil {
+			t.Fatalf("解析成功的分片状态不自洽：%v（输入 %q）", err, data)
+		}
+		// 合法状态序列化后必须仍能被接受，否则"写进去的读不回来"。
+		if _, err := decodePartState(mustJSON(ps), "分片状态 fuzz-roundtrip"); err != nil {
+			t.Fatalf("合法分片状态重新序列化后被拒绝：%v", err)
+		}
+	})
+}
+
+// checkDecodedPartState 用 math/big 独立复算分片状态的结构约束，
+// 与被测实现的 int64 累加走不同的数值路径。
+func checkDecodedPartState(ps *PartState) error {
+	if ps.Version != formatVersion {
+		return fmt.Errorf("版本 %d，期望 %d", ps.Version, formatVersion)
+	}
+	if ps.PartNumber < 1 || ps.PartNumber > maxPartNumber {
+		return fmt.Errorf("分片编号 %d 越界", ps.PartNumber)
+	}
+	if ps.Size < 0 {
+		return fmt.Errorf("size 为负：%d", ps.Size)
+	}
+	if raw, err := hex.DecodeString(ps.ETag); err != nil || len(raw) != md5.Size {
+		return fmt.Errorf("etag %q 不是 MD5", ps.ETag)
+	}
+	if ps.Deduped < 0 || ps.Deduped > len(ps.Blocks) {
+		return fmt.Errorf("deduped=%d 超出块数 %d", ps.Deduped, len(ps.Blocks))
+	}
+
+	var cursor big.Int
+	for i, b := range ps.Blocks {
+		if b.Length <= 0 {
+			return fmt.Errorf("块 %d 长度 %d 非正", i, b.Length)
+		}
+		if big.NewInt(b.Offset).Cmp(&cursor) != 0 {
+			return fmt.Errorf("块 %d 偏移 %d，期望 %s", i, b.Offset, cursor.String())
+		}
+		cursor.Add(&cursor, big.NewInt(b.Length))
+	}
+	if cursor.Cmp(big.NewInt(ps.Size)) != 0 {
+		return fmt.Errorf("块表总长 %s 与 size %d 不符", cursor.String(), ps.Size)
 	}
 	return nil
 }

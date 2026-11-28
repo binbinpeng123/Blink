@@ -1,7 +1,6 @@
 package store
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -498,11 +497,8 @@ func (s *Store) scanGarbageUploads(refs map[string]struct{}, tmpCutoff time.Time
 			if err != nil {
 				return fsErr("读取分片状态", p.Name(), err)
 			}
-			var ps PartState
-			if err := json.Unmarshal(data, &ps); err != nil {
-				return fmt.Errorf("%w: 分片状态 %s 不是合法 JSON: %v", ErrCorrupt, p.Name(), err)
-			}
-			if err := validatePartState(&ps); err != nil {
+			ps, err := decodePartState(data, "分片状态 "+p.Name())
+			if err != nil {
 				return err
 			}
 			// 文件名必须与状态内的编号一致，否则目录被手工改动过。
@@ -510,7 +506,7 @@ func (s *Store) scanGarbageUploads(refs map[string]struct{}, tmpCutoff time.Time
 				return fmt.Errorf("%w: 分片状态文件名 %s 与编号 %d 不一致",
 					ErrCorrupt, p.Name(), ps.PartNumber)
 			}
-			for _, h := range partHashes(&ps) {
+			for _, h := range partHashes(ps) {
 				refs[h] = struct{}{}
 			}
 		}
