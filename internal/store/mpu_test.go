@@ -303,6 +303,17 @@ func TestCompleteMultipartRejectsCorruptPartState(t *testing.T) {
 		{"block-offset-hole", func(ps *PartState) { ps.Blocks[0].Offset++ }},
 		{"bad-block-hash", func(ps *PartState) { ps.Blocks[0].Hash = "../escape" }},
 		{"bad-etag", func(ps *PartState) { ps.ETag = "not-an-md5" }},
+		// int64 累加绕回 0：偏移链与 size=0 全部"自洽"，必须由溢出检查拦下。
+		{"block-int64-overflow", func(ps *PartState) {
+			const len2_62 = 1 << 62 // == math.MaxInt64/2 + 1
+			ps.Size = 0
+			ps.Blocks = []BlockDesc{
+				{Hash: ps.Blocks[0].Hash, Offset: 0, Length: len2_62},
+				{Hash: ps.Blocks[0].Hash, Offset: len2_62, Length: len2_62},
+				{Hash: ps.Blocks[0].Hash, Offset: -(1 << 63), Length: len2_62},
+				{Hash: ps.Blocks[0].Hash, Offset: -(1 << 63) + len2_62, Length: len2_62},
+			}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

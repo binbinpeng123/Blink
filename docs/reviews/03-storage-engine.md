@@ -176,7 +176,7 @@
 
 解析内核 `decodeObjectMeta` 是纯函数，读路径与 fuzz 共用同一入口：任何"拒绝而不崩溃"的修复都同时覆盖生产路径与模糊测试。
 
-**分片状态校验**：`PartState`（`multipart/<id>/parts/<n>.json`）与对象元数据同样不可信。`loadPartState` 在 JSON 解析后调用 `validatePartState`：版本号、编号范围、`Size`、ETag 为 MD5 hex、块哈希合法且偏移从 0 连续、块总长等于 `Size`、`Deduped` 在块数范围内。不通过即 `ErrCorrupt`，`ListParts` 与 `Complete` 都在源头失败。否则 `Complete` 会把自相矛盾的分片块表照单串接进对象元数据并返回 200，之后每次 GET 才由 `validateParts` 拒绝——错误被推迟到读路径。校验失败**不消耗会话**：状态文件修复后同一 uploadId 仍可完成。该函数同时服务集群入站（`PutPartState`）与 GC，三处口径一致。
+**分片状态校验**：`PartState`（`multipart/<id>/parts/<n>.json`）与对象元数据同样不可信。`loadPartState` 与 GC 共用解析内核 `decodePartState`（JSON 解码 + `validatePartState`）：版本号、编号范围、`Size`、ETag 为 MD5 hex、块哈希合法且偏移从 0 连续、块总长等于 `Size` **且累加不溢出 `int64`**、`Deduped` 在块数范围内。溢出必须先于"相等"判定：4 个 2^62 的块能让总长绕回 0，偏移链与 `size=0` 按 int64 环绕后"恰好"自洽，伪造出指向 16 EiB 的分片状态（`FuzzDecodePartState` 用 `math/big` 独立复算来暴露这一类）。不通过即 `ErrCorrupt`，`ListParts` 与 `Complete` 都在源头失败。否则 `Complete` 会把自相矛盾的分片块表照单串接进对象元数据并返回 200，之后每次 GET 才由 `validateParts` 拒绝——错误被推迟到读路径。校验失败**不消耗会话**：状态文件修复后同一 uploadId 仍可完成。该函数同时服务集群入站（`PutPartState`）与 GC，三处口径一致。
 
 ## 崩溃恢复
 

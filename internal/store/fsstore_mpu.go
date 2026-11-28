@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -521,6 +522,13 @@ func validatePartState(ps *PartState) error {
 			return fmt.Errorf("%w: 分片 %d 的第 %d 块偏移 %d/长度 %d 与累计 %d 不符",
 				ErrCorrupt, ps.PartNumber, i, b.Offset, b.Length, total)
 		}
+		// 与对象元数据的块表同理：先判溢出再累加。否则 4 个 2^62 的块
+		// 能让总长绕回 0，偏移链与 size=0 "恰好"自洽，伪造出指向 16 EiB
+		// 数据的分片状态。
+		if b.Length > math.MaxInt64-total {
+			return fmt.Errorf("%w: 分片 %d 的块表总长在第 %d 块处溢出 int64",
+				ErrCorrupt, ps.PartNumber, i)
+		}
 		total += b.Length
 	}
 	if total != ps.Size {
@@ -827,6 +835,21 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, body io
 	}, nil
 }
 
+// decodePartState 是分片状态的解析内核：JSON 解码 + 结构校验。
+//
+// 与对象元数据一样，盘上文件不可信。抽成纯函数让读路径、GC 与模糊
+// 测试共用同一入口，避免几处各写一遍校验而慢慢漂移。
+func decodePartState(data []byte, name string) (*PartState, error) {
+	var ps PartState
+	if err := json.Unmarshal(data, &ps); err != nil {
+		return nil, fmt.Errorf("%w: %s 不是合法 JSON: %v", ErrCorrupt, name, err)
+	}
+	if err := validatePartState(&ps); err != nil {
+		return nil, fmt.Errorf("%w: %s 不自洽: %v", ErrCorrupt, name, err)
+	}
+	return &ps, nil
+}
+
 // loadPartState 读取分片状态；不存在时返回 ErrInvalidPart。
 func (s *Store) loadPartState(uploadID string, partNumber int) (*PartState, error) {
 	data, err := readFile(s.fs, s.multipartPartPath(uploadID, partNumber))
@@ -836,21 +859,18 @@ func (s *Store) loadPartState(uploadID string, partNumber int) (*PartState, erro
 	if err != nil {
 		return nil, fsErr("读取分片状态", uploadID, err)
 	}
-	var ps PartState
-	if err := json.Unmarshal(data, &ps); err != nil {
-		return nil, fmt.Errorf("%w: 分片 %d 状态损坏: %v", ErrCorrupt, partNumber, err)
+	// 与对象元数据的取舍相同：本地状态文件也不信任。块表长度/偏移/哈希
+	// 一旦被改坏，Complete 会照单全收并提交一份之后每次 GET 都报损坏的
+	// 对象——错误被推迟到读路径，而不是在源头响亮失败。
+	ps, err := decodePartState(data, fmt.Sprintf("分片 %d 状态", partNumber))
+	if err != nil {
+		return nil, err
 	}
 	if ps.PartNumber != partNumber {
 		return nil, fmt.Errorf("%w: 分片 %d 的状态文件声称为 %d",
 			ErrCorrupt, partNumber, ps.PartNumber)
 	}
-	// 与对象元数据的取舍相同：本地状态文件也不信任。块表长度/偏移/哈希
-	// 一旦被改坏，Complete 会照单全收并提交一份之后每次 GET 都报损坏的
-	// 对象——错误被推迟到读路径，而不是在源头响亮失败。
-	if err := validatePartState(&ps); err != nil {
-		return nil, fmt.Errorf("%w: 分片 %d 状态不自洽: %v", ErrCorrupt, partNumber, err)
-	}
-	return &ps, nil
+	return ps, nil
 }
 
 // CompleteMultipartUpload 把已上传的分片组装成对象。

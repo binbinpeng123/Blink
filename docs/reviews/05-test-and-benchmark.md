@@ -56,6 +56,7 @@
 | `FuzzValidateBucketName` | 与**独立重写**的 AWS 规则做差分对照；失败必须是 `ErrInvalidBucketName`；确定性 |
 | `FuzzParsePartFileName` | 编号落在 `1..10000`；重写为规范文件名后解析一致 |
 | `FuzzDecodeObjectMeta` | **盘上 meta.json 同样不可信**：失败必须是 `ErrCorrupt`；成功时块表/分片总长用 `math/big` 独立复算且等于 `size`、块偏移连续、墓碑不带内容、内联内容长度一致；序列化往返后仍被接受 |
+| `FuzzDecodePartState` | **盘上分片状态（part.json）同样不可信**：失败必须是 `ErrCorrupt`；成功时版本/编号/`size`/ETag/`deduped` 合法，块表总长与偏移用 `math/big` 独立复算且等于 `size`；序列化往返后仍被接受 |
 
 运行方式：种子语料随 `go test ./...` 每次执行（毫秒级，充当回归）；有界随机探索用
 
@@ -69,7 +70,7 @@ scripts/fuzz.sh 20 FuzzParseRange FuzzParseChunkHeader
 会自动把输入写入 `testdata/fuzz/<目标>/<哈希>`，此后 `go test` 会把它当回归用例执行。
 
 **实测（2026-11-25，Apple M4 / macOS 24.6.0 / Go 1.27.2，`scripts/fuzz.sh 10`，
-10 个 worker）**：19 个目标全部 PASS，合计约 **1 259 万次执行**；执行次数最高的为
+10 个 worker）**：当时登记的 19 个目标全部 PASS（现登记 23 个），合计约 **1 259 万次执行**；执行次数最高的为
 `FuzzParseChunkHeader`（139 万）、`FuzzParsePartFileName`（130 万）、`FuzzParseAuthorization`（130 万）。
 
 - 唯一被证伪的断言：`FuzzParseCopySource` 在 20 s 运行时约 2.5 s 找到 `%2F/0`
@@ -93,6 +94,12 @@ scripts/fuzz.sh 20 FuzzParseRange FuzzParseChunkHeader
   墓碑、块表截断/空洞、块总长 `int64` 溢出伪造（4 个 2^62 的块绕回 `size=0`）、超出 `int64`
   的 `size`、内联与 EC 布局、`null`/`[]`/空文档。溢出伪造在切片 54 之前能通过
   `validateBlockTable`（偏移链与总长按 int64 环绕后"恰好"自洽），现已显式拒绝。
+- `FuzzDecodePartState` 30 s 运行 214 万次执行、约 7.1 万次/秒，无失败。种子覆盖合法分片、
+  0 字节分片、块表截断/空洞、块总长 `int64` 溢出伪造（4 个 2^62 的块绕回 `size=0`）、
+  负 `size`、非 MD5 ETag、`deduped` 越界、版本与编号越界、`null`/`[]`/空文档。溢出伪造
+  在切片 55 之前能通过 `validatePartState`（独立于对象块表的实现，同样按 int64 环绕后自洽），
+  现已显式拒绝，并由 `TestCompleteMultipartRejectsCorruptPartState/block-int64-overflow`
+  固定"ListParts/Complete 拒绝且不提交对象、不消耗会话"的端到端行为。
 
 ### HTTP handler 级 fuzz
 

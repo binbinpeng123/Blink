@@ -111,3 +111,30 @@ func TestValidatePartsRejectsInt64Overflow(t *testing.T) {
 		t.Fatalf("溢出分片表 = %v，期望 ErrCorrupt", err)
 	}
 }
+
+// TestValidatePartStateRejectsInt64Overflow 覆盖分片状态块表的同类溢出。
+//
+// 分片状态的块表是独立实现（Complete 会把它重排成对象块表），
+// 4 个 2^62 的块同样能让总长绕回 0 而与 size=0 自洽。
+func TestValidatePartStateRejectsInt64Overflow(t *testing.T) {
+	const len2_62 = math.MaxInt64/2 + 1
+	hash := strings.Repeat("a", 64)
+	ps := &PartState{
+		Version:    formatVersion,
+		PartNumber: 1,
+		ETag:       "d41d8cd98f00b204e9800998ecf8427e",
+		Size:       0,
+		Blocks: []BlockDesc{
+			{Hash: hash, Offset: 0, Length: len2_62},
+			{Hash: hash, Offset: len2_62, Length: len2_62},
+			{Hash: hash, Offset: -(1 << 63), Length: len2_62},
+			{Hash: hash, Offset: -(1 << 63) + len2_62, Length: len2_62},
+		},
+	}
+	if err := validatePartState(ps); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("溢出分片状态 = %v，期望 ErrCorrupt", err)
+	}
+	if _, err := decodePartState(mustJSON(ps), "test"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("解析入口 = %v，期望 ErrCorrupt", err)
+	}
+}
